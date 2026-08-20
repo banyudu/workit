@@ -6,9 +6,18 @@ configured coding-agent session. It unifies the previous `linear-worktree` and
 
 ```sh
 workit 23              # infer GitHub issue #23
-workit #23             # infer GitHub issue #23
+workit '#23'           # infer GitHub issue #23; quote # in shells
 workit ENG-123         # infer Linear issue ENG-123
 workit ENG-123 24      # route each issue independently
+```
+
+## Install
+
+Install globally from npm; the package registers the `workit` executable:
+
+```sh
+npm install --global @banyudu/workit
+workit --help
 ```
 
 ## Configuration

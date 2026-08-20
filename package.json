@@ -1,10 +1,29 @@
 {
-  "name": "workit",
+  "name": "@banyudu/workit",
   "version": "0.1.0",
   "description": "Unified Linear and GitHub issue worktree launcher",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/banyudu/workit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/banyudu/workit/issues"
+  },
+  "homepage": "https://github.com/banyudu/workit#readme",
+  "keywords": [
+    "cli",
+    "worktree",
+    "linear",
+    "github",
+    "coding-agent"
+  ],
   "type": "module",
   "bin": {
     "workit": "dist/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",
@@ -16,7 +35,9 @@
     "dev": "tsx src/cli.ts",
     "test": "tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
   },
   "engines": {
     "node": ">=20"
