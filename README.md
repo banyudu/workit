@@ -78,7 +78,21 @@ kept as compatibility wrappers that delegate to this CLI.
 ## Automated npm publishing
 
 The repository publishes `@banyudu/workit` when a GitHub Release is published.
-Before using it, add an npm automation token as the repository Actions secret
-`NPM_TOKEN`. The release tag must match the package version, with an optional
-`v` prefix (`v0.1.0` for version `0.1.0`). The workflow can also be started
-manually from the Actions tab.
+Configure npm Trusted Publishing for this repository under the package's npm
+Settings → Trusted publishing:
+
+- Provider: GitHub Actions
+- Organization or user: `banyudu`
+- Repository: `workit`
+- Workflow filename: `npm-publish.yml`
+- Allowed action: `npm publish`
+
+No `NPM_TOKEN` secret is required. GitHub Actions supplies a short-lived OIDC
+credential, and npm generates provenance automatically. The release tag must
+match the package version, with an optional `v` prefix (`v0.1.0` for version
+`0.1.0`). The workflow can also be started manually from the Actions tab.
+
+For a brand-new npm package, npm requires the package to exist before its
+trusted publisher can be configured. Seed the first version once with an
+interactive local `npm publish --access public`, configure Trusted Publishing,
+and use the workflow for subsequent releases.
