@@ -1,0 +1,29 @@
+# Copy to .workit.yml for repository-specific settings.
+provider: auto
+
+# Optional when the repository has multiple GitHub remotes.
+# github:
+#   repo: banyudu/example
+
+worktree:
+  branchPrefix: yudu
+  baseBranch: auto
+  directory: .worktrees
+
+launch:
+  target: banyan
+  dependencies: symlink
+  review: true
+  handoff: true
+
+# These override the user-level agent configuration for this repository.
+# default: codex
+# agents:
+#   claude:
+#     provider: claude
+#     weight: 3
+#     command: claude --dangerously-skip-permissions
+#   codex:
+#     provider: codex
+#     weight: 2
+#     command: codex -p terra --dangerously-bypass-approvals-and-sandbox

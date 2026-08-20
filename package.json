@@ -1,0 +1,33 @@
+{
+  "name": "workit",
+  "version": "0.1.0",
+  "description": "Unified Linear and GitHub issue worktree launcher",
+  "type": "module",
+  "bin": {
+    "workit": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/cli.ts",
+    "test": "tsx --test src/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3"
+  }
+}
