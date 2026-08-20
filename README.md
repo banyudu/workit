@@ -6,9 +6,18 @@ configured coding-agent session. It unifies the previous `linear-worktree` and
 
 ```sh
 workit 23              # infer GitHub issue #23
-workit #23             # infer GitHub issue #23
+workit '#23'           # infer GitHub issue #23; quote # in shells
 workit ENG-123         # infer Linear issue ENG-123
 workit ENG-123 24      # route each issue independently
+```
+
+## Install
+
+Install globally from npm; the package registers the `workit` executable:
+
+```sh
+npm install --global @banyudu/workit
+workit --help
 ```
 
 ## Configuration
@@ -65,3 +74,25 @@ bun run build
 
 The old `linear-worktree`, `gh-worktree`, and `banyan-worktree` commands can be
 kept as compatibility wrappers that delegate to this CLI.
+
+## Automated npm publishing
+
+The repository publishes `@banyudu/workit` when a GitHub Release is published.
+Configure npm Trusted Publishing for this repository under the package's npm
+Settings → Trusted publishing:
+
+- Provider: GitHub Actions
+- Organization or user: `banyudu`
+- Repository: `workit`
+- Workflow filename: `npm-publish.yml`
+- Allowed action: `npm publish`
+
+No `NPM_TOKEN` secret is required. GitHub Actions supplies a short-lived OIDC
+credential, and npm generates provenance automatically. The release tag must
+match the package version, with an optional `v` prefix (`v0.1.0` for version
+`0.1.0`). The workflow can also be started manually from the Actions tab.
+
+For a brand-new npm package, npm requires the package to exist before its
+trusted publisher can be configured. Seed the first version once with an
+interactive local `npm publish --access public`, configure Trusted Publishing,
+and use the workflow for subsequent releases.
