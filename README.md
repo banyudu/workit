@@ -74,3 +74,11 @@ bun run build
 
 The old `linear-worktree`, `gh-worktree`, and `banyan-worktree` commands can be
 kept as compatibility wrappers that delegate to this CLI.
+
+## Automated npm publishing
+
+The repository publishes `@banyudu/workit` when a GitHub Release is published.
+Before using it, add an npm automation token as the repository Actions secret
+`NPM_TOKEN`. The release tag must match the package version, with an optional
+`v` prefix (`v0.1.0` for version `0.1.0`). The workflow can also be started
+manually from the Actions tab.
