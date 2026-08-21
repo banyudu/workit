@@ -6,7 +6,7 @@ import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } 
 import { launch } from "./launch.js";
 import type { CliOptions, DependencyMode, LaunchTarget, ProviderMode } from "./types.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.2";
 
 function help(): string {
   return `workit ${VERSION} — unified Linear and GitHub issue worktree launcher
