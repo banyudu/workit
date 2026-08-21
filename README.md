@@ -49,6 +49,43 @@ agents:
 Positive agent weights are sampled independently for every issue. If all
 weights are zero, `default` is used.
 
+### Built-in agents
+
+`workit` ships with defaults for common agents (see `src/config.ts:116`):
+
+| workit name | opencode agent | command | shortcut |
+|---|---|---|---|
+| `claude` | — | `claude --dangerously-skip-permissions ...` | `--claude` |
+| `codex` | — | `codex -p terra ...` | `--codex` |
+| `opencode` | default | `opencode` | `--opencode` |
+| `muse` / `muse-spark` | `muse-spark` | `opencode --agent muse-spark` | `--muse` |
+| `mimo` | `mimo` | `opencode --agent mimo` | `--mimo` |
+| `hy` / `hy3` | `hy3` | `opencode --agent hy3` | `--hy` |
+| `dpsk-flash` / `dpsk-v4-flash` | `dpsk-v4-flash` | `opencode --agent dpsk-v4-flash` | `--dpsk-flash` |
+| `dpsk-pro` / `dpsk-v4-pro` | `dpsk-v4-pro` | `opencode --agent dpsk-v4-pro` | `--dpsk-pro` |
+| `qwen` | `qwen` | `opencode --agent qwen` | `--qwen` |
+
+Override any agent via YAML, e.g.:
+
+```yaml
+agents:
+  muse:
+    provider: opencode
+    weight: 1
+    command: opencode --agent muse-spark
+```
+
+Explicit selection:
+
+```sh
+workit --muse ENG-123        # same as --agent muse
+workit --agent dpsk-pro 42   # any name in `agents`
+workit --mimo --here 23      # mimo agent, current terminal
+```
+
+OpenCode prompt handling injects `--prompt` automatically for `opencode` TUI commands
+(`opencode run` keeps positional message).
+
 Project-specific settings can be as small as:
 
 ```yaml

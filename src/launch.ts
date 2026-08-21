@@ -86,7 +86,18 @@ function commandWithPrompt(
     `${issue.backend}-${issue.identifier.replace(/[^a-zA-Z0-9_-]/g, "_")}.txt`,
   );
   writeFileSync(promptFile, promptFor(issue, worktree, options));
-  return `${agent.command} "$(cat ${shellQuote(promptFile)})"`;
+  const quotedPrompt = `"$(cat ${shellQuote(promptFile)})"`;
+  // OpenCode TUI expects --prompt for initial message; `opencode run` uses positional message.
+  // Detect opencode commands and inject --prompt correctly.
+  const trimmed = agent.command.trimStart();
+  if (trimmed.startsWith("opencode")) {
+    const isRun = /\bopencode\s+run\b/.test(agent.command);
+    if (isRun) return `${agent.command} ${quotedPrompt}`;
+    const hasPromptFlag = /(?:^|\s)--prompt(?:\s|=|$)/.test(` ${agent.command} `);
+    if (hasPromptFlag) return `${agent.command} ${quotedPrompt}`;
+    return `${agent.command} --prompt ${quotedPrompt}`;
+  }
+  return `${agent.command} ${quotedPrompt}`;
 }
 
 function runHere(command: string, cwd: string): void {

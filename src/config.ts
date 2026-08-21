@@ -116,6 +116,90 @@ function projectOverrides(config: WorkitConfig, keys: string[]): WorkitConfig {
 function defaultConfig(): WorkitConfig {
   return {
     provider: "auto",
+    default: "codex",
+    agents: {
+      claude: {
+        provider: "claude",
+        weight: 3,
+        command: "claude --dangerously-skip-permissions --model 'claude-opus-4-6[1m]' --effort xhigh",
+      },
+      codex: {
+        provider: "codex",
+        weight: 2,
+        command: "codex -p terra --dangerously-bypass-approvals-and-sandbox",
+      },
+      opencode: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode",
+      },
+      // OpenCode primary agents — short aliases + canonical names
+      muse: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent muse-spark",
+      },
+      "muse-spark": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent muse-spark",
+      },
+      mimo: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent mimo",
+      },
+      hy: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent hy3",
+      },
+      hy3: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent hy3",
+      },
+      "dpsk-flash": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent dpsk-v4-flash",
+      },
+      "dpsk-v4-flash": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent dpsk-v4-flash",
+      },
+      "dpsk-pro": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent dpsk-v4-pro",
+      },
+      "dpsk-v4-pro": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent dpsk-v4-pro",
+      },
+      qwen: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent qwen",
+      },
+      glm: {
+        provider: "claude",
+        weight: 0,
+        command: "CCP=glm claude --dangerously-skip-permissions --model 'glm-5.2[1m]'",
+      },
+      gly: {
+        provider: "claude",
+        weight: 0,
+        command: "CCP=glm CLAUDE_CODE_AUTO_COMPACT_WINDOW=256000 claude --dangerously-skip-permissions --model 'glm-5.2'",
+      },
+      deepseek: {
+        provider: "claude",
+        weight: 0,
+        command: "CCP=deepseek claude --dangerously-skip-permissions --model 'deepseek-v4-pro[1m]'",
+      },
+    },
     worktree: {
       directory: ".worktrees",
       branchPrefix: "yudu",

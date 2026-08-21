@@ -27,3 +27,28 @@ launch:
 #     provider: codex
 #     weight: 2
 #     command: codex -p terra --dangerously-bypass-approvals-and-sandbox
+#   # OpenCode agents — each maps to `opencode --agent <name>` (prompt via --prompt is handled automatically)
+#   muse:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent muse-spark
+#   mimo:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent mimo
+#   hy:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent hy3
+#   dpsk-flash:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent dpsk-v4-flash
+#   dpsk-pro:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent dpsk-v4-pro
+#   qwen:
+#     provider: opencode
+#     weight: 0
+#     command: opencode --agent qwen

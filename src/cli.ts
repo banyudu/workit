@@ -23,6 +23,10 @@ Options:
   --linear, --github, --provider <name>  Override automatic routing
   --repo <owner/name>                   GitHub repository override
   --agent <name>                        Explicit agent (otherwise weighted)
+                                        Shorthands: --codex, --claude, --opencode,
+                                          --muse (--muse-spark), --mimo, --hy (--hy3),
+                                          --dpsk-pro (--dpsk-v4-pro), --dpsk-flash (--dpsk-v4-flash),
+                                          --qwen, --glm, --gly, --deepseek
   --here                               Launch in the current terminal
   --banyan                             Launch a Banyan session (default)
   --iterm                              Launch an iTerm2 tab
@@ -104,6 +108,28 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--deepseek":
         options.agent = "deepseek";
+        break;
+      case "--muse":
+      case "--muse-spark":
+        options.agent = "muse";
+        break;
+      case "--mimo":
+        options.agent = "mimo";
+        break;
+      case "--hy":
+      case "--hy3":
+        options.agent = "hy";
+        break;
+      case "--dpsk-flash":
+      case "--dpsk-v4-flash":
+        options.agent = "dpsk-flash";
+        break;
+      case "--dpsk-pro":
+      case "--dpsk-v4-pro":
+        options.agent = "dpsk-pro";
+        break;
+      case "--qwen":
+        options.agent = "qwen";
         break;
       case "--here":
         options.target = "here";
