@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { chooseAgent } from "./agents.js";
 import { resolveConfig, resolveHomePath } from "./config.js";
@@ -6,7 +7,15 @@ import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } 
 import { launch } from "./launch.js";
 import type { CliOptions, DependencyMode, LaunchTarget, ProviderMode } from "./types.js";
 
-const VERSION = "0.1.2";
+const VERSION: string = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version?: string;
+    };
+    if (typeof pkg.version === "string" && pkg.version) return pkg.version;
+  } catch {}
+  return "0.0.0";
+})();
 
 function help(): string {
   return `workit ${VERSION} — unified Linear and GitHub issue worktree launcher
