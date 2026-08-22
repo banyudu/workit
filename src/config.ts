@@ -121,7 +121,7 @@ function defaultConfig(): WorkitConfig {
       claude: {
         provider: "claude",
         weight: 3,
-        command: "claude --dangerously-skip-permissions --model 'claude-opus-4-6[1m]' --effort xhigh",
+        command: "claude --dangerously-skip-permissions --model 'opus' --effort xhigh",
       },
       codex: {
         provider: "codex",
