@@ -131,9 +131,35 @@ function defaultConfig(): WorkitConfig {
       opencode: {
         provider: "opencode",
         weight: 0,
-        command: "opencode",
+        command: "opencode --agent ox-alpha",
       },
       // OpenCode primary agents — short aliases + canonical names
+      // Ox Alpha Free via OpenCode Go (opencode-go/ox-alpha-free) — free/near-unlimited this week
+      ox: {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent ox-alpha",
+      },
+      "0x": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent ox-alpha",
+      },
+      "ox-alpha": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent ox-alpha",
+      },
+      "0x-alpha": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent ox-alpha",
+      },
+      "ox-alpha-free": {
+        provider: "opencode",
+        weight: 0,
+        command: "opencode --agent ox-alpha",
+      },
       muse: {
         provider: "opencode",
         weight: 0,

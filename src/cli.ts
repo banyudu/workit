@@ -32,10 +32,10 @@ Options:
   --linear, --github, --provider <name>  Override automatic routing
   --repo <owner/name>                   GitHub repository override
   --agent <name>                        Explicit agent (otherwise weighted)
-                                        Shorthands: --codex, --claude, --opencode,
+                                        Shorthands: --codex, --claude, --opencode (ox-alpha),
                                           --muse (--muse-spark), --mimo, --hy (--hy3),
                                           --dpsk-pro (--dpsk-v4-pro), --dpsk-flash (--dpsk-v4-flash),
-                                          --qwen, --glm, --gly, --deepseek
+                                          --qwen, --glm, --gly, --deepseek, --ox (--0x/ox-alpha)
   --here                               Launch in the current terminal
   --banyan                             Launch a Banyan session (default)
   --iterm                              Launch an iTerm2 tab
@@ -112,6 +112,13 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--opencode":
         options.agent = "opencode";
+        break;
+      case "--ox":
+      case "--0x":
+      case "--ox-alpha":
+      case "--0x-alpha":
+      case "--ox-alpha-free":
+        options.agent = "ox";
         break;
       case "--deepseek":
         options.agent = "deepseek";
