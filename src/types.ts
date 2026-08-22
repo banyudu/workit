@@ -35,7 +35,6 @@ export interface WorkitConfig {
   launch?: {
     target?: LaunchTarget;
     review?: boolean;
-    handoff?: boolean;
     dependencies?: DependencyMode;
     logFile?: string;
   };
@@ -57,7 +56,6 @@ export interface CliOptions {
   prompt: boolean;
   agentLaunch: boolean;
   review: boolean;
-  handoff: boolean;
   dependencies?: DependencyMode;
   dryRun: boolean;
   verbose: boolean;

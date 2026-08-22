@@ -28,9 +28,6 @@ function promptFor(
   const review = options.review
     ? `\nFor non-trivial changes, do a short root-cause-first design pass before coding. Separate symptom from cause, consider alternatives, and commit to a recommendation.`
     : "";
-  const handoff = options.handoff
-    ? `\nWhen implementation and checks are complete, run the handoff command from the worktree root without asking for confirmation.`
-    : "";
   return [
     `Working on ${issue.backend === "github" ? "GitHub" : "Linear"} issue ${issue.identifier}. Branch: ${worktree.branch}.`,
     `Issue: ${issue.url}`,
@@ -40,7 +37,6 @@ function promptFor(
     issue.body,
     resume,
     review,
-    handoff,
     "",
     `Launcher provenance: workit backend=${issue.backend} issue=${issue.identifier} worktree=${worktree.path}`,
   ].filter(Boolean).join("\n");

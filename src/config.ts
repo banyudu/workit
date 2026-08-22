@@ -212,7 +212,6 @@ function defaultConfig(): WorkitConfig {
     launch: {
       target: "banyan",
       review: true,
-      handoff: true,
       dependencies: "symlink",
       logFile: "~/.agents/logs/workit-launches.log",
     },

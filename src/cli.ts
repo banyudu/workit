@@ -42,7 +42,6 @@ Options:
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --review / --no-review               Include/skip design guidance
-  --handoff / --no-handoff             Include/skip handoff instruction
   --symlink / --build / --install      Dependency preparation mode
   --dry-run                            Resolve and print without launching
   --config <path>                      Add/override the user config file
@@ -61,7 +60,6 @@ function parseArgs(argv: string[]): CliOptions {
     prompt: true,
     agentLaunch: true,
     review: true,
-    handoff: true,
     dryRun: false,
     verbose: false,
     identifiers: [],
@@ -161,12 +159,6 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--no-review":
         options.review = false;
-        break;
-      case "--handoff":
-        options.handoff = true;
-        break;
-      case "--no-handoff":
-        options.handoff = false;
         break;
       case "--symlink":
         options.dependencies = "symlink";
