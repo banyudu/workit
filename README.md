@@ -57,8 +57,7 @@ weights are zero, `default` is used.
 |---|---|---|---|
 | `claude` | — | `claude --dangerously-skip-permissions ...` | `--claude` |
 | `codex` | — | `codex -p terra ...` | `--codex` |
-| `opencode` | `ox-alpha` | `opencode --agent ox-alpha` | `--opencode` |
-| `ox` / `0x` / `ox-alpha` / `0x-alpha` / `ox-alpha-free` | `ox-alpha` | `opencode --agent ox-alpha` | `--ox` (`--0x`, `--ox-alpha`) |
+| `opencode` | default | `opencode` | `--opencode` |
 | `muse` / `muse-spark` | `muse-spark` | `opencode --agent muse-spark` | `--muse` |
 | `mimo` | `mimo` | `opencode --agent mimo` | `--mimo` |
 | `hy` / `hy3` | `hy3` | `opencode --agent hy3` | `--hy` |
