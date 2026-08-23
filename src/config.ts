@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type {
   AgentDefinition,
+  CodingAgentEntry,
   CodingAgentsConfig,
   ResolvedConfig,
   WorkitConfig,
@@ -101,24 +102,35 @@ function parseConfigFile(file: string, home = homedir()): WorkitConfig {
 /** Expand agents[*].aliases into a lookup index (alias -> canonical name). */
 function buildAliasIndex(config: WorkitConfig): Record<string, string> {
   const index: Record<string, string> = {};
-  for (const [name, definition] of Object.entries(config.agents ?? {})) {
-    for (const alias of definition.aliases ?? []) {
+  // Alias sources in precedence order: the launchable agent map first, then
+  // every registry entry so --agent resolves names outside the "coding" pool.
+  const agentMap = config.agents ?? {};
+  const registry = config.codingAgents?.agents ?? {};
+  for (const [name, definition] of [...Object.entries(agentMap), ...Object.entries(registry)]) {
+    for (const alias of definition?.aliases ?? []) {
       if (!alias || alias === name) continue;
+      if (index[alias]) continue;
       index[alias] = name;
     }
   }
   return index;
 }
 
+/** Agent keys shipped as built-in defaults; a loaded registry supersedes them. */
+const DEFAULT_AGENT_KEYS = Object.keys(defaultConfig().agents ?? {});
+
 /**
- * Project launchable registry entries into workit's agent map:
- * entries tagged "coding" with a non-empty command and workit !== false
+ * Project launchable registry entries into workit's agent map. When a
+ * registry file was loaded it is authoritative: built-in default agents are
+ * dropped unless the registry (or a later user config) redefines them.
+ * Entries tagged "coding" with a non-empty command and workit !== false
  * become AgentDefinitions.
  */
 function projectRegistryIntoAgents(config: WorkitConfig): void {
   const registryAgents = config.codingAgents?.agents;
   if (!registryAgents) return;
   const agents: Record<string, AgentDefinition> = { ...config.agents };
+  for (const key of DEFAULT_AGENT_KEYS) delete agents[key];
   for (const [name, entry] of Object.entries(registryAgents)) {
     if (!entry || typeof entry !== "object") continue;
     if (entry.workit === false) continue;
@@ -132,6 +144,44 @@ function projectRegistryIntoAgents(config: WorkitConfig): void {
     };
   }
   config.agents = agents;
+}
+
+/**
+ * Project registry entries tagged `tag` into launchable AgentDefinitions,
+ * bypassing the default "coding"-only projection so consumers can weight
+ * over any scenario pool (e.g. "review", "daily").
+ */
+export function agentDefinitionsByTag(
+  config: WorkitConfig,
+  tag: string,
+): Record<string, AgentDefinition> {
+  return projectRegistry(config, (entry) => entry.tags?.includes(tag) === true);
+}
+
+/** Every launchable registry entry as an AgentDefinition map (tag-agnostic). */
+export function allLaunchableRegistryAgents(config: WorkitConfig): Record<string, AgentDefinition> {
+  return projectRegistry(config, () => true);
+}
+
+function projectRegistry(
+  config: WorkitConfig,
+  matches: (entry: CodingAgentEntry) => boolean,
+): Record<string, AgentDefinition> {
+  const registryAgents = config.codingAgents?.agents ?? {};
+  const agents: Record<string, AgentDefinition> = {};
+  for (const [name, entry] of Object.entries(registryAgents)) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.workit === false) continue;
+    if (!entry.command?.trim()) continue;
+    if (!matches(entry)) continue;
+    agents[name] = {
+      command: entry.command,
+      provider: entry.provider,
+      weight: entry.weight ?? 0,
+      aliases: entry.aliases,
+    };
+  }
+  return agents;
 }
 
 function uniqueExisting(files: string[]): string[] {

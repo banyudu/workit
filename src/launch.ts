@@ -96,7 +96,34 @@ function commandWithPrompt(
   return `${agent.command} ${quotedPrompt}`;
 }
 
-function runHere(command: string, cwd: string): void {
+/**
+ * Build a non-interactive command that runs the agent with the given prompt:
+ *   opencode --agent X  -> opencode run --agent X '<prompt>'
+ *   claude [flags]      -> claude -p [flags] '<prompt>'
+ *   codex [flags]       -> codex exec [flags] '<prompt>'
+ * Anything else gets the prompt appended as the final argument.
+ */
+export function headlessPromptCommand(agentCommand: string, prompt: string): string {
+  const quotedPrompt = shellQuote(prompt);
+  const trimmed = agentCommand.trimStart();
+  if (trimmed.startsWith("opencode")) {
+    if (/^opencode\s+run\b/.test(trimmed)) return `${agentCommand} ${quotedPrompt}`;
+    return `${agentCommand.replace(/^opencode\b/, "opencode run")} ${quotedPrompt}`;
+  }
+  if (trimmed.startsWith("codex")) {
+    let base = /\bexec\b/.test(trimmed) ? agentCommand : agentCommand.replace(/^codex\b/, "codex exec");
+    // codex exec refuses to run outside git repos unless the check is skipped.
+    if (!/--skip-git-repo-check\b/.test(base)) base += " --skip-git-repo-check";
+    return `${base} ${quotedPrompt}`;
+  }
+  if (trimmed.startsWith("claude")) {
+    if (/(?:^|\s)-p(?:\s|=|$)/.test(` ${agentCommand}`)) return `${agentCommand} ${quotedPrompt}`;
+    return `${agentCommand.replace(/^claude\b/, "claude -p")} ${quotedPrompt}`;
+  }
+  return `${agentCommand} ${quotedPrompt}`;
+}
+
+export function runHere(command: string, cwd: string): void {
   const shell = process.env.SHELL || "/bin/sh";
   const args = shell.endsWith("zsh") ? ["-ilc", command] : ["-lc", command];
   const result = spawnSync(shell, args, { cwd, stdio: "inherit" });

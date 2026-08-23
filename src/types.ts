@@ -41,6 +41,7 @@ export interface CodingAgentEntry {
   /**
    * Scenario whitelist; consumers only see entries carrying their tag.
    * Known tags: "banyan" (picker), "coding" (workit pool), "review".
+   * Custom tags are allowed and selectable via `--tag` (e.g. "daily").
    * Absent or empty tags mean the entry surfaces nowhere (default disallowed).
    */
   tags?: string[];
@@ -112,6 +113,8 @@ export interface CliOptions {
   provider?: ProviderMode;
   repo?: string;
   agent?: string;
+  /** Registry tag used to scope the weighted selection pool (e.g. "coding", "daily"). */
+  tag?: string;
   target?: LaunchTarget;
   prompt: boolean;
   agentLaunch: boolean;

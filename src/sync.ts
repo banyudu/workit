@@ -48,6 +48,34 @@ interface BanyanProfile {
   command: string;
 }
 
+export interface AgentListEntry {
+  name: string;
+  label: string;
+  command: string;
+  aliases: string[];
+}
+
+/**
+ * Launchable registry entries in registry order. With `tag`, only entries
+ * carrying that tag are returned (e.g. `workit agents --tag review`).
+ */
+export function listAgents(resolved: ResolvedConfig, tag?: string): AgentListEntry[] {
+  const registryAgents = resolved.config.codingAgents?.agents ?? {};
+  const entries: AgentListEntry[] = [];
+  for (const [name, entry] of Object.entries(registryAgents)) {
+    if (!isEntry(entry)) continue;
+    if (!entry.command?.trim()) continue;
+    if (tag && !entry.tags?.includes(tag)) continue;
+    entries.push({
+      name,
+      label: entry.label ?? name,
+      command: entry.command,
+      aliases: entry.aliases ?? [],
+    });
+  }
+  return entries;
+}
+
 /** Entries that surface in banyan's model picker, in registry order. */
 export function banyanProfiles(resolved: ResolvedConfig): BanyanProfile[] {
   const registryAgents = resolved.config.codingAgents?.agents ?? {};
