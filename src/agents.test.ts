@@ -21,3 +21,16 @@ test("weighted selection is independent of the previous choice", () => {
   assert.equal(chooseAgent(config, undefined, () => 3).name, "codex");
   assert.equal(chooseAgent(config, undefined, () => 4).name, "codex");
 });
+
+test("explicit selection resolves aliases to the canonical agent", () => {
+  const aliased = {
+    default: "codex",
+    agents: {
+      hy3: { command: "opencode --agent hy3", weight: 0, aliases: ["hy", "hunyuan"] },
+    },
+  };
+  const selected = chooseAgent(aliased, "hy", undefined as never, { hy: "hy3" });
+  assert.equal(selected.name, "hy3");
+  assert.equal(selected.definition.command, "opencode --agent hy3");
+  assert.throws(() => chooseAgent(aliased, "unknown", undefined as never));
+});

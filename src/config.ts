@@ -2,10 +2,46 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
-import type { ResolvedConfig, WorkitConfig } from "./types.js";
+import type {
+  AgentDefinition,
+  CodingAgentsConfig,
+  ResolvedConfig,
+  WorkitConfig,
+} from "./types.js";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Canonical agent registry: ~/.agents/agents.yml. */
+export const AGENTS_FILE = join(homedir(), ".agents", "agents.yml");
+
+/** Legacy registry path kept as a fallback for older setups. */
+export const CODING_AGENTS_FILE = join(
+  homedir(),
+  ".agents",
+  "coding-agents.yml",
+);
+
+/** True when `file` is one of the canonical/legacy registry paths in `home`. */
+export function isRegistryFile(file: string, home = homedir()): boolean {
+  return (
+    file === join(home, ".agents", "agents.yml") ||
+    file === join(home, ".agents", "coding-agents.yml")
+  );
+}
+
+/**
+ * Pick the registry file to load: prefer ~/.agents/agents.yml, fall back to
+ * the legacy ~/.agents/coding-agents.yml. Only one path is ever returned so
+ * the same registry is never merged twice.
+ */
+export function resolveRegistryFile(home = homedir()): string | undefined {
+  const canonical = join(home, ".agents", "agents.yml");
+  if (existsSync(canonical)) return canonical;
+  const legacy = join(home, ".agents", "coding-agents.yml");
+  if (existsSync(legacy)) return legacy;
+  return undefined;
+}
 
 export function deepMerge<T>(
   base: T,
@@ -29,7 +65,7 @@ export function deepMerge<T>(
   return result as T;
 }
 
-function parseConfigFile(file: string): WorkitConfig {
+function parseConfigFile(file: string, home = homedir()): WorkitConfig {
   let parsed: unknown;
   try {
     parsed = parseYaml(readFileSync(file, "utf8"));
@@ -44,20 +80,71 @@ function parseConfigFile(file: string): WorkitConfig {
     throw new Error(`Config ${file} must contain a YAML/JSON object`);
   }
 
+  // The canonical coding-agent registry has its own schema; nest it so the
+  // generic deep-merge keeps registry entries separate from workit's agents.
+  if (isRegistryFile(file, home)) {
+    const { default: defaultAgent, opencode, agents } = parsed as Record<string, unknown>;
+    const codingAgents: CodingAgentsConfig = {};
+    if (agents !== undefined) codingAgents.agents = agents as CodingAgentsConfig["agents"];
+    if (isRecord(opencode)) {
+      codingAgents.opencode = opencode as CodingAgentsConfig["opencode"];
+    }
+    return {
+      ...(defaultAgent !== undefined ? { default: defaultAgent as WorkitConfig["default"] } : {}),
+      ...(Object.keys(codingAgents).length ? { codingAgents } : {}),
+    } as WorkitConfig;
+  }
+
   return parsed as WorkitConfig;
+}
+
+/** Expand agents[*].aliases into a lookup index (alias -> canonical name). */
+function buildAliasIndex(config: WorkitConfig): Record<string, string> {
+  const index: Record<string, string> = {};
+  for (const [name, definition] of Object.entries(config.agents ?? {})) {
+    for (const alias of definition.aliases ?? []) {
+      if (!alias || alias === name) continue;
+      index[alias] = name;
+    }
+  }
+  return index;
+}
+
+/**
+ * Project launchable registry entries into workit's agent map:
+ * entries tagged "coding" with a non-empty command and workit !== false
+ * become AgentDefinitions.
+ */
+function projectRegistryIntoAgents(config: WorkitConfig): void {
+  const registryAgents = config.codingAgents?.agents;
+  if (!registryAgents) return;
+  const agents: Record<string, AgentDefinition> = { ...config.agents };
+  for (const [name, entry] of Object.entries(registryAgents)) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.workit === false) continue;
+    if (!entry.tags?.includes("coding")) continue;
+    if (!entry.command?.trim()) continue;
+    agents[name] = {
+      command: entry.command,
+      provider: entry.provider,
+      weight: entry.weight,
+      aliases: entry.aliases,
+    };
+  }
+  config.agents = agents;
 }
 
 function uniqueExisting(files: string[]): string[] {
   return [...new Set(files)].filter((file) => existsSync(file));
 }
 
-function userConfigCandidates(explicit?: string): string[] {
-  const home = homedir();
+function userConfigCandidates(explicit?: string, home = homedir()): string[] {
   return [
     join(home, ".agents", "worktree-agents.yml"),
     join(home, ".config", "workit", "config.yml"),
     join(home, ".config", "workit", "config.yaml"),
     join(home, ".config", "workit", "config.json"),
+    resolveRegistryFile(home),
     join(home, ".workit.yml"),
     join(home, ".workit.yaml"),
     process.env.WORKIT_CONFIG,
@@ -133,16 +220,11 @@ function defaultConfig(): WorkitConfig {
         weight: 0,
         command: "opencode",
       },
-      // OpenCode primary agents — short aliases + canonical names
       muse: {
         provider: "opencode",
         weight: 0,
         command: "opencode --agent muse-spark",
-      },
-      "muse-spark": {
-        provider: "opencode",
-        weight: 0,
-        command: "opencode --agent muse-spark",
+        aliases: ["muse-spark"],
       },
       mimo: {
         provider: "opencode",
@@ -153,31 +235,19 @@ function defaultConfig(): WorkitConfig {
         provider: "opencode",
         weight: 0,
         command: "opencode --agent hy3",
-      },
-      hy3: {
-        provider: "opencode",
-        weight: 0,
-        command: "opencode --agent hy3",
+        aliases: ["hy3"],
       },
       "dpsk-flash": {
         provider: "opencode",
         weight: 0,
         command: "opencode --agent dpsk-v4-flash",
-      },
-      "dpsk-v4-flash": {
-        provider: "opencode",
-        weight: 0,
-        command: "opencode --agent dpsk-v4-flash",
+        aliases: ["dpsk-v4-flash"],
       },
       "dpsk-pro": {
         provider: "opencode",
         weight: 0,
         command: "opencode --agent dpsk-v4-pro",
-      },
-      "dpsk-v4-pro": {
-        provider: "opencode",
-        weight: 0,
-        command: "opencode --agent dpsk-v4-pro",
+        aliases: ["dpsk-v4-pro"],
       },
       qwen: {
         provider: "opencode",
@@ -226,15 +296,17 @@ export function resolveHomePath(value: string, base = homedir()): string {
 
 export function resolveConfig(
   root: string,
-  options: { explicitPath?: string; remote?: string } = {},
+  options: { explicitPath?: string; remote?: string; homeDirectory?: string } = {},
 ): ResolvedConfig {
-  const userFiles = uniqueExisting(userConfigCandidates(options.explicitPath));
+  const home = options.homeDirectory ?? homedir();
+  const userFiles = uniqueExisting(userConfigCandidates(options.explicitPath, home));
   const projectFiles = uniqueExisting(projectConfigCandidates(root));
   const configFiles = [...userFiles, ...projectFiles];
+  const registryFile = resolveRegistryFile(home);
 
   let config = defaultConfig();
   for (const file of userFiles) {
-    config = deepMerge(config, parseConfigFile(file) as Record<string, unknown>);
+    config = deepMerge(config, parseConfigFile(file, home) as Record<string, unknown>);
   }
 
   const remoteKey = options.remote ? normalizeRemote(options.remote) : undefined;
@@ -243,12 +315,20 @@ export function resolveConfig(
   config = deepMerge(config, userProject as Record<string, unknown>);
 
   for (const file of projectFiles) {
-    config = deepMerge(config, parseConfigFile(file) as Record<string, unknown>);
+    config = deepMerge(config, parseConfigFile(file, home) as Record<string, unknown>);
   }
 
+  projectRegistryIntoAgents(config);
   validateConfig(config);
 
-  return { config, root, configFiles, projectKey: remoteKey };
+  return {
+    config,
+    root,
+    configFiles,
+    registryFile,
+    projectKey: remoteKey,
+    aliasIndex: buildAliasIndex(config),
+  };
 }
 
 export function configBaseDirectory(file: string): string {

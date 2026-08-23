@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { chooseAgent } from "./agents.js";
@@ -5,6 +6,7 @@ import { resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, repositoryRoot } from "./git.js";
 import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
 import { launch } from "./launch.js";
+import { syncDerivedConfigs, type SyncResult } from "./sync.js";
 import type { CliOptions, DependencyMode, LaunchTarget, ProviderMode } from "./types.js";
 
 const VERSION: string = (() => {
@@ -22,11 +24,21 @@ function help(): string {
 
 Usage:
   workit [options] <issue> [issue ...]
+  workit sync [--check]
 
 Issue routing:
   workit 23             GitHub issue #23
   workit #23            GitHub issue #23
   workit ENG-123        Linear issue ENG-123
+
+Agent registry:
+  Agents are defined once in ~/.agents/agents.yml. Entries need a "coding"
+  tag to enter workit's pool and a "banyan" tag to appear in banyan's picker.
+  Every workit run regenerates ~/.banyan/config.yml and the agent section of
+  ~/.config/opencode/opencode.jsonc when they are stale.
+
+Sync options:
+  --check               Exit non-zero if derived configs are stale; write nothing
 
 Options:
   --linear, --github, --provider <name>  Override automatic routing
@@ -50,6 +62,7 @@ Options:
 Config precedence (later wins):
   ~/.agents/worktree-agents.yml (legacy agent defaults)
   ~/.config/workit/config.yml (user defaults)
+  ~/.agents/agents.yml (canonical agent registry; legacy: coding-agents.yml)
   user-config.projects[repo-or-root] (project override)
   <git-root>/.workit.yml (project override)
 `;
@@ -193,12 +206,65 @@ function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
+interface Invocation {
+  mode: "launch" | "sync";
+  check: boolean;
+  options?: CliOptions;
+}
+
+function parseInvocation(argv: string[]): Invocation {
+  if (argv[0] === "sync") {
+    let check = false;
+    for (const arg of argv.slice(1)) {
+      switch (arg) {
+        case "--check":
+          check = true;
+          break;
+        case "-h":
+        case "--help":
+          console.log(help());
+          process.exit(0);
+          break;
+        default:
+          throw new Error(`Unknown sync option '${arg}'`);
+      }
+    }
+    return { mode: "sync", check };
+  }
+  return { mode: "launch", check: false, options: parseArgs(argv) };
+}
+
+function describeSync(result: SyncResult): string {
+  const lines: string[] = [];
+  for (const target of result.targets) {
+    lines.push(
+      `${target.changed ? "updated" : "up to date"}  ${target.path}` +
+        (target.backupPath && target.changed ? ` (backup: ${target.backupPath})` : ""),
+    );
+  }
+  return lines.join("\n");
+}
+
 function configProvider(options: CliOptions, configured: ProviderMode | undefined): ProviderMode {
   return options.provider ?? configured ?? "auto";
 }
 
 async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2));
+  const invocation = parseInvocation(process.argv.slice(2));
+  const options = invocation.options;
+  if (!options) {
+    // sync mode does not require an issue identifier or a git repository.
+    try {
+      const resolved = resolveConfig(resolveHomePath("~"));
+      const result = await syncDerivedConfigs(resolved, { check: invocation.check });
+      console.log(describeSync(result));
+      if (invocation.check && result.changed) process.exitCode = 1;
+    } catch (error) {
+      console.error(`workit: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   const root = repositoryRoot();
   const remote = originRemote(root);
   const resolved = resolveConfig(root, {
@@ -217,6 +283,17 @@ async function main(): Promise<void> {
 
   if (options.verbose && resolved.configFiles.length) {
     console.log(`Config: ${resolved.configFiles.join(", ")}`);
+  }
+
+  if (!options.dryRun) {
+    try {
+      const syncResult = await syncDerivedConfigs(resolved);
+      if (options.verbose && syncResult.changed) console.log(describeSync(syncResult));
+    } catch (error) {
+      console.warn(
+        `workit: registry sync skipped (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
   }
 
   for (const identifier of options.identifiers) {
@@ -244,7 +321,7 @@ async function main(): Promise<void> {
       : createOrResumeWorktree({ ...resolved, config }, branch);
     if (!options.dryRun) prepareDependencies(root, worktree.path, dependencyMode);
     const selected = options.agentLaunch
-      ? chooseAgent(config, options.agent)
+      ? chooseAgent(config, options.agent, randomInt, resolved.aliasIndex)
       : { name: "none", definition: { command: "" } };
     launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, options);
   }

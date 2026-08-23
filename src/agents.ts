@@ -20,17 +20,19 @@ export function chooseAgent(
   config: WorkitConfig,
   explicit?: string,
   random: (max: number) => number = randomInt,
+  aliasIndex: Record<string, string> = {},
 ): { name: string; definition: AgentDefinition } {
   const agents = config.agents ?? {};
   validateAgents(config);
 
   const requested = explicit ?? undefined;
   if (requested) {
-    const definition = agents[requested];
+    const name = aliasIndex[requested] ?? requested;
+    const definition = agents[name];
     if (!definition) {
       throw new Error(`Agent '${requested}' is not configured`);
     }
-    return { name: requested, definition };
+    return { name, definition };
   }
 
   const weighted = Object.entries(agents).filter(

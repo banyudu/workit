@@ -26,8 +26,9 @@ Configuration is merged in this order:
 
 1. `~/.agents/worktree-agents.yml` (legacy agent configuration)
 2. `~/.config/workit/config.yml` or `~/.workit.yml` (user defaults)
-3. `projects.<repository-or-root>` in a user config (optional project override)
-4. `.workit.yml` in the current repository (project override)
+3. `~/.agents/agents.yml` (canonical coding-agent registry — see below)
+4. `projects.<repository-or-root>` in a user config (optional project override)
+5. `.workit.yml` in the current repository (project override)
 
 The project file wins. YAML and JSON are supported. A minimal user
 configuration is:
@@ -49,9 +50,68 @@ agents:
 Positive agent weights are sampled independently for every issue. If all
 weights are zero, `default` is used.
 
+### Coding-agent registry (single source of truth)
+
+`~/.agents/agents.yml` defines every coding agent once and drives all
+surfaces that need them:
+
+- **workit** reads it directly for weighted issue launching.
+- **banyan** model picker (`~/.banyan/config.yml`) is generated from it.
+- **opencode** (`~/.config/opencode/opencode.jsonc`) is generated from it.
+
+Every `workit` run quietly regenerates the derived files when they differ
+(backups of the last hand-written versions are kept as `<file>.orig`), or run
+`workit sync` explicitly (`--check` exits non-zero when stale).
+
+Each registry entry can drive up to three surfaces:
+
+| field | workit | banyan | opencode |
+|---|---|---|---|
+| `command` + `weight` + `aliases` | ✓ launch pool | — | — |
+| `label` + `provider` + `icon` + `banyanCommand` | — | ✓ session launch | — |
+| `opencodeName` + `opencode` | — | — | ✓ agent definition |
+
+Rules: an entry only surfaces on a surface whose tag it carries — `tags` is a
+whitelist and entries without tags appear nowhere. Concretely: entries tagged
+`coding` with a non-empty `command` join the workit pool; entries tagged
+`banyan` with a defined `command` (empty string allowed, e.g. zsh) appear in
+banyan's picker; entries with an `opencode` block land in opencode.jsonc.
+
+```yaml
+default: codex
+
+agents:
+  claude:
+    label: Claude
+    provider: claude
+    weight: 3
+    tags: [banyan, coding, review] # banyan picker + workit pool + review-linear
+    command: claude --dangerously-skip-permissions --model 'opus' --effort xhigh
+    banyanCommand: claude          # optional picker-specific command
+
+  muse:
+    label: Muse Spark
+    provider: muse
+    weight: 0
+    tags: [banyan, coding]
+    aliases: [muse-spark]          # extra --agent names for workit
+    command: opencode --agent muse-spark
+    opencodeName: muse-spark       # key inside opencode.jsonc
+    opencode:                      # raw block written into opencode.jsonc
+      mode: primary
+      model: opencode-go/muse-spark-1.2-contributor
+      reasoningEffort: xhigh
+      permission: allow
+
+opencode:                          # non-agent passthrough into opencode.jsonc
+  default_agent: ox-alpha
+  provider: {}
+```
+
 ### Built-in agents
 
-`workit` ships with defaults for common agents (see `src/config.ts:116`):
+`workit` ships with fallback defaults used when no registry exists (see
+`src/config.ts:116`):
 
 | workit name | opencode agent | command | shortcut |
 |---|---|---|---|
