@@ -92,3 +92,24 @@ test("only registry entries tagged coding join workit's agent pool", () => {
   assert.equal(agents.untagged, undefined);
   assert.equal(agents.notag, undefined);
 });
+
+test("a loaded registry supersedes workit's built-in default agents", () => {
+  const home = mkdtempSync(join(tmpdir(), "workit-auth-"));
+  const root = mkdtempSync(join(tmpdir(), "workit-root-"));
+  writeHomeRegistry(
+    home,
+    "agents.yml",
+    [
+      "default: codex",
+      "agents:",
+      "  codex:",
+      "    command: registry-codex",
+      "    weight: 7",
+      "    tags: [banyan, coding]",
+    ].join("\n"),
+  );
+
+  const resolved = resolveConfig(root, { homeDirectory: home });
+  assert.deepEqual(Object.keys(resolved.config.agents ?? {}), ["codex"]);
+  assert.equal(resolved.config.agents?.codex?.weight, 7);
+});

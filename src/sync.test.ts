@@ -8,6 +8,7 @@ import {
   banyanProfiles,
   generateBanyanYaml,
   generateOpencodeJsonc,
+  listAgents,
   syncDerivedConfigs,
 } from "./sync.js";
 import type { ResolvedConfig } from "./types.js";
@@ -146,4 +147,18 @@ test("syncDerivedConfigs refuses to run without a registry", () => {
       ),
     /coding-agent registry/,
   );
+});
+
+test("listAgents returns launchable entries, optionally filtered by tag", () => {
+  const resolved = { config: registry, root: "", configFiles: [], aliasIndex: {} };
+  assert.deepEqual(
+    listAgents(resolved).map((entry) => entry.name),
+    ["codex", "hy3", "ghost"],
+  );
+  const review = listAgents(resolved, "review");
+  assert.deepEqual(review, []);
+  listAgents(resolved, "banyan").forEach((entry) => {
+    assert.notEqual(entry.command, "");
+  });
+  assert.deepEqual(listAgents(resolved, "coding").map((entry) => entry.name), ["codex"]);
 });
