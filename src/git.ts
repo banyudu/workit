@@ -1,5 +1,14 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { DependencyMode, ResolvedConfig, WorkitConfig, WorktreeResult } from "./types.js";
@@ -15,6 +24,18 @@ function git(args: string[], cwd: string, allowFailure = false): string {
 }
 
 export function repositoryRoot(cwd = process.cwd()): string {
+  // Inside a worktree `git rev-parse --show-toplevel` returns the worktree
+  // path itself, so resolving `.worktrees/<branch>` against it would nest
+  // new worktrees under the current worktree (e.g. `.worktrees/A/.worktrees/B`).
+  // `git rev-parse --git-common-dir` always points at the main repo's `.git`
+  // (absolute by default, or resolvable relative to cwd), so its parent is
+  // the true repository root regardless of where workit is invoked.
+  const commonDir =
+    git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, true) ||
+    git(["rev-parse", "--git-common-dir"], cwd, true);
+  if (commonDir) {
+    return dirname(resolve(cwd, commonDir));
+  }
   const root = git(["rev-parse", "--show-toplevel"], cwd, true);
   if (!root) throw new Error("workit must be run inside a Git repository");
   return root;
@@ -164,15 +185,104 @@ function packageManager(root: string): string | undefined {
   return undefined;
 }
 
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function directoryExists(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function workspacePatterns(root: string): string[] {
+  const packagePath = join(root, "package.json");
+  if (!existsSync(packagePath)) return [];
+
+  try {
+    const packageJson = JSON.parse(readFileSync(packagePath, "utf8")) as {
+      workspaces?: unknown;
+    };
+    if (Array.isArray(packageJson.workspaces)) {
+      return packageJson.workspaces.filter((pattern): pattern is string => typeof pattern === "string");
+    }
+    if (packageJson.workspaces && typeof packageJson.workspaces === "object") {
+      const packages = (packageJson.workspaces as { packages?: unknown }).packages;
+      if (Array.isArray(packages)) {
+        return packages.filter((pattern): pattern is string => typeof pattern === "string");
+      }
+    }
+  } catch {
+    // A malformed or non-workspace package manifest should not make the
+    // best-effort dependency preparation fail before the package manager can
+    // report the real problem.
+  }
+  return [];
+}
+
+function expandWorkspacePattern(root: string, pattern: string): string[] {
+  if (pattern.startsWith("!")) return [];
+
+  let candidates = [root];
+  for (const segment of pattern.split("/").filter(Boolean)) {
+    if (segment.includes("*")) {
+      const matcher = new RegExp(`^${segment.split("*").map(escapeRegExp).join(".*")}$`);
+      candidates = candidates.flatMap((parent) => {
+        if (!directoryExists(parent)) return [];
+        try {
+          return readdirSync(parent, { withFileTypes: true })
+            .filter((entry) => matcher.test(entry.name) && directoryExists(join(parent, entry.name)))
+            .map((entry) => join(parent, entry.name));
+        } catch {
+          return [];
+        }
+      });
+    } else {
+      candidates = candidates
+        .map((parent) => join(parent, segment))
+        .filter(directoryExists);
+    }
+  }
+
+  return candidates.filter((directory) => existsSync(join(directory, "package.json")));
+}
+
+function workspaceDirectories(root: string): string[] {
+  const directories = new Set<string>();
+  for (const pattern of workspacePatterns(root)) {
+    for (const directory of expandWorkspacePattern(root, pattern)) directories.add(directory);
+  }
+  return [...directories];
+}
+
 function linkWorkspaceNodeModules(root: string, target: string): void {
-  if (!existsSync(join(root, "node_modules"))) return;
+  const source = join(root, "node_modules");
+  if (!existsSync(source)) return;
   const rootTarget = join(target, "node_modules");
-  if (!existsSync(rootTarget)) symlinkSync(join(root, "node_modules"), rootTarget, "dir");
-  for (const entry of ["packages", "apps", "src"]) {
-    const directory = join(root, entry);
-    if (!existsSync(directory)) continue;
-    // Workspace-specific links are intentionally conservative; the root link
-    // handles the common case without copying generated or ignored files.
+  if (!pathExists(rootTarget)) symlinkSync(source, rootTarget, "dir");
+
+  // Bun keeps dependencies that are not hoisted in each workspace's own
+  // node_modules. A root link alone therefore makes `target/node_modules`
+  // visible but leaves e.g. `target/infra/d1-backup/node_modules` absent.
+  // Resolve the target manifest so branch-specific workspace additions are
+  // handled, then link only workspace-local dependency directories that are
+  // already installed in the source checkout.
+  for (const workspaceDirectory of workspaceDirectories(target)) {
+    const relativeWorkspace = relative(target, workspaceDirectory);
+    if (!relativeWorkspace || relativeWorkspace.startsWith("..")) continue;
+    const sourceWorkspaceNodeModules = join(root, relativeWorkspace, "node_modules");
+    if (!existsSync(sourceWorkspaceNodeModules)) continue;
+    const targetWorkspaceNodeModules = join(workspaceDirectory, "node_modules");
+    if (pathExists(targetWorkspaceNodeModules)) continue;
+    mkdirSync(dirname(targetWorkspaceNodeModules), { recursive: true });
+    symlinkSync(sourceWorkspaceNodeModules, targetWorkspaceNodeModules, "dir");
   }
 }
 
@@ -194,12 +304,12 @@ export function prepareDependencies(
   mode: DependencyMode,
 ): void {
   if (mode === "none") return;
-  if (existsSync(join(target, "node_modules"))) return;
   const source = join(root, "node_modules");
   if (mode === "symlink" && existsSync(source)) {
     linkWorkspaceNodeModules(root, target);
     return;
   }
+  if (pathExists(join(target, "node_modules"))) return;
   if (mode === "clone" && existsSync(source)) {
     const result = spawnSync("cp", ["-cR", source, join(target, "node_modules")], {
       cwd: target,
