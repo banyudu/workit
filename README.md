@@ -50,6 +50,56 @@ agents:
 Positive agent weights are sampled independently for every issue. If all
 weights are zero, `default` is used.
 
+### Time-sensitive weights
+
+Models with peak/off-peak pricing can carry `timeWeights`, a list of windows
+whose `weight` replaces the static one while the window is in force. Windows
+are read in their own `tz`, so the weekday boundary follows the vendor's
+calendar rather than UTC's:
+
+```yaml
+agents:
+  dpsk-flash:
+    weight: 4          # off-peak: half price, so preferred
+    horizon: 60m       # expected session length
+    tags: [coding]
+    command: opencode --agent dpsk-v4-flash
+    timeWeights:
+      - tz: Asia/Shanghai
+        weekdays: [mon, tue, wed, thu, fri]
+        ranges: ["09:00-12:00", "14:00-18:00"]
+        weight: 1      # peak: 2x price, so avoided
+        bufferBefore: 0m
+```
+
+A rule applies when `[now, now + horizon + bufferBefore]` **overlaps** one of
+its ranges — not merely when `now` falls inside one. Sessions run for many
+rounds, so one started at 13:59 bleeds into the 14:00 peak and is billed at
+peak rates; with a 60m horizon it is priced as peak from 13:00 onward. The
+expansion is deliberately one-sided: starting at 11:59, inside a peak tail,
+stays peak-weighted even though most of the session lands off-peak.
+
+| field | default | meaning |
+|---|---|---|
+| `tz` | `UTC` | IANA zone the ranges and weekdays are read in |
+| `weekdays` | every day | whitelist of `mon`..`sun` |
+| `ranges` | all day | `HH:MM-HH:MM`; an end at or before the start wraps past midnight |
+| `weight` | — | required; weight used while the rule is in force |
+| `bufferBefore` | `0m` | extra lookahead on top of `horizon` |
+| `horizon` (on the entry) | `60m` | expected session length |
+
+Ranges are half-open, so a `09:00-12:00` window has already closed at `12:00`.
+The first matching rule wins, letting specific windows precede general ones.
+An effective weight of `0` drops the agent from the pool entirely.
+
+Entries without `timeWeights` are sampled on their static `weight` exactly as
+before. Preview the arithmetic without launching anything:
+
+```sh
+workit agents --at 2026-09-14T05:59:00Z   # Beijing Mon 13:59 -> weight 4→1
+workit --dry-run --verbose 23             # effective weights + the rule that fired
+```
+
 ### Coding-agent registry (single source of truth)
 
 `~/.agents/agents.yml` defines every coding agent once and drives all
@@ -67,7 +117,7 @@ Each registry entry can drive up to three surfaces:
 
 | field | workit | banyan | opencode |
 |---|---|---|---|
-| `command` + `weight` + `aliases` | ✓ launch pool | — | — |
+| `command` + `weight` + `aliases` + `horizon` + `timeWeights` | ✓ launch pool | — | — |
 | `label` + `provider` + `icon` + `banyanCommand` | — | ✓ session launch | — |
 | `opencodeName` + `opencode` | — | — | ✓ agent definition |
 

@@ -3,10 +3,37 @@ export type ProviderMode = Backend | "auto";
 export type LaunchTarget = "banyan" | "here" | "iterm";
 export type DependencyMode = "symlink" | "clone" | "install" | "none";
 
-export interface AgentDefinition {
+/**
+ * A window in which an agent's weight differs from its static one, e.g. a
+ * vendor's peak-pricing hours. Windows are read in `tz` wall-clock time, so
+ * the weekday boundary follows the vendor's calendar, not UTC's.
+ */
+export interface TimeWeightRule {
+  /** IANA zone the ranges and weekdays are read in. Defaults to "UTC". */
+  tz?: string;
+  /** Weekday whitelist (mon..sun, any capitalisation). Absent means every day. */
+  weekdays?: string[];
+  /** "HH:MM-HH:MM" windows; end <= start wraps past midnight. Absent means all day. */
+  ranges?: string[];
+  /** Weight used while the rule is in force. */
+  weight: number;
+  /** Extra lookahead beyond `horizon` for this rule, e.g. "15m". Defaults to 0. */
+  bufferBefore?: string | number;
+}
+
+/** The weight fields shared by launchable agents and raw registry entries. */
+export interface WeightedDefinition {
+  /** Static weight, also the fallback when no time rule is in force. */
+  weight?: number;
+  /** Expected session length, e.g. "60m". Defaults to DEFAULT_HORIZON when time rules exist. */
+  horizon?: string | number;
+  /** Time-dependent weight overrides; the first matching rule wins. */
+  timeWeights?: TimeWeightRule[];
+}
+
+export interface AgentDefinition extends WeightedDefinition {
   command: string;
   provider?: string;
-  weight?: number;
   /** Extra names that resolve to this agent via --agent (workit only). */
   aliases?: string[];
 }
@@ -19,13 +46,20 @@ export interface AgentDefinition {
  *   - banyan model picker: needs a `command` defined ("" ok, e.g. zsh) and picker !== false
  *   - opencode.jsonc agent map: present iff an `opencode` block is defined
  */
-export interface CodingAgentEntry {
+export interface CodingAgentEntry extends WeightedDefinition {
   /** Display label for the banyan picker (defaults to the registry key). */
   label?: string;
   /** Provider key used for banyan icon mapping and workit metadata. */
   provider?: string;
   /** workit weight; positive integers enter weighted selection. Defaults to 0. */
   weight?: number;
+  /** Expected session length used when evaluating `timeWeights`, e.g. "60m". */
+  horizon?: string | number;
+  /**
+   * Weight overrides for vendor peak/off-peak windows. A session that would
+   * bleed into a window within `horizon` is already treated as inside it.
+   */
+  timeWeights?: TimeWeightRule[];
   /** Launch command shared by workit and the banyan picker. */
   command?: string;
   /** Override command used only for the banyan picker entry (defaults to command). */
@@ -123,6 +157,8 @@ export interface CliOptions {
   dryRun: boolean;
   verbose: boolean;
   configPath?: string;
+  /** Evaluate time-dependent weights at this instant instead of now (--at). */
+  at?: Date;
   identifiers: string[];
 }
 

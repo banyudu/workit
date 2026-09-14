@@ -1,7 +1,7 @@
 import { randomInt } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { chooseAgent } from "./agents.js";
+import { chooseAgent, describeEffectiveWeights } from "./agents.js";
 import { allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, repositoryRoot } from "./git.js";
 import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
@@ -26,7 +26,7 @@ Usage:
   workit [options] <issue> [issue ...]
   workit run [--tag <tag>] [--agent <name>] [--workdir <dir>] [--here] <prompt words...>
   workit sync [--check]
-  workit agents [--tag <tag>] [--format json|table]
+  workit agents [--tag <tag>] [--format json|table] [--at <iso>]
 
 Issue routing:
   workit 23             GitHub issue #23
@@ -47,7 +47,15 @@ Agent registry:
   ~/.config/opencode/opencode.jsonc when they are stale.
 
   workit agents [--tag review] lists launchable registry agents; --format json
-  emits {name, label, command, aliases} objects for scripts.
+  emits {name, label, command, aliases, weight, effectiveWeight} objects.
+
+Time-sensitive weights:
+  An entry may carry timeWeights rules that override "weight" inside vendor
+  windows (e.g. peak pricing), plus a "horizon" for the expected session
+  length. A rule applies when [now, now + horizon + bufferBefore] overlaps one
+  of its ranges in its own tz, so a session started at 13:59 that would bleed
+  into a 14:00 peak is already priced as peak. Use --at <iso> to evaluate the
+  weights at another instant and --verbose to see the reasoning.
 
 Sync options:
   --check               Exit non-zero if derived configs are stale; write nothing
@@ -68,6 +76,7 @@ Options:
   --no-agent                           Create/prepare worktree only
   --review / --no-review               Include/skip design guidance
   --symlink / --build / --install      Dependency preparation mode
+  --at <iso>                            Evaluate time-dependent weights at this instant
   --dry-run                            Resolve and print without launching
   --config <path>                      Add/override the user config file
   -h, --help                          Show this help
@@ -79,6 +88,15 @@ Config precedence (later wins):
   user-config.projects[repo-or-root] (project override)
   <git-root>/.workit.yml (project override)
 `;
+}
+
+/** Parse an --at value into the instant time-dependent weights are read at. */
+function parseAt(value: string): Date {
+  const at = new Date(value);
+  if (Number.isNaN(at.getTime())) {
+    throw new Error(`--at requires an ISO timestamp, got '${value}'`);
+  }
+  return at;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -201,6 +219,9 @@ function parseArgs(argv: string[]): CliOptions {
       case "--none":
         options.dependencies = "none";
         break;
+      case "--at":
+        options.at = parseAt(next());
+        break;
       case "--dry-run":
         options.dryRun = true;
         break;
@@ -231,6 +252,7 @@ interface Invocation {
   agent?: string;
   workdir?: string;
   dryRun?: boolean;
+  at?: Date;
   promptArgs: string[];
 }
 
@@ -258,6 +280,9 @@ function parseRunInvocation(argv: string[]): Invocation {
         break;
       case "--workdir":
         invocation.workdir = next();
+        break;
+      case "--at":
+        invocation.at = parseAt(next());
         break;
       case "--here":
       case "--banyan":
@@ -319,6 +344,9 @@ function parseInvocation(argv: string[]): Invocation {
         case "--tag":
           invocation.tag = next();
           break;
+        case "--at":
+          invocation.at = parseAt(next());
+          break;
         case "--format":
           invocation.format = next() as "json" | "table";
           if (!["json", "table"].includes(invocation.format)) {
@@ -374,17 +402,21 @@ async function main(): Promise<void> {
       explicitName && !runPool[explicitName]
         ? { ...runPool, ...allLaunchableRegistryAgents(resolved.config) }
         : runPool;
+    const now = invocation.at ?? new Date();
     const selected = chooseAgent(
       { ...resolved.config, agents: pickPool },
       invocation.agent,
       randomInt,
       resolved.aliasIndex,
+      now,
     );
     const prompt = invocation.promptArgs.join(" ");
     const command = headlessPromptCommand(selected.definition.command, prompt);
     const workdir = invocation.workdir ? resolveHomePath(invocation.workdir) : process.cwd();
     if (invocation.dryRun) {
       console.log(`agent=${selected.name}`);
+      console.log(`weights at ${now.toISOString()}:`);
+      for (const line of describeEffectiveWeights(pickPool, now)) console.log(line);
       console.log(command);
       return;
     }
@@ -396,23 +428,30 @@ async function main(): Promise<void> {
   }
   if (invocation.mode === "agents") {
     const resolved = resolveConfig(resolveHomePath("~"));
-    const entries = listAgents(resolved, invocation.tag);
+    const now = invocation.at ?? new Date();
+    const entries = listAgents(resolved, invocation.tag, now);
     if (invocation.format === "json") {
       console.log(JSON.stringify(entries, null, 2));
       return;
     }
+    // Show `base→effective` only where a time rule actually moved the weight.
+    const weightOf = (entry: (typeof entries)[number]): string =>
+      entry.effectiveWeight === entry.weight
+        ? String(entry.weight)
+        : `${entry.weight}→${entry.effectiveWeight}`;
     const nameWidth = Math.max("name".length, ...entries.map((entry) => entry.name.length));
     const labelWidth = Math.max(
       "label".length,
       ...entries.map((entry) => entry.label.length),
     );
+    const weightWidth = Math.max("weight".length, ...entries.map((entry) => weightOf(entry).length));
     console.log(
-      `${"name".padEnd(nameWidth)}  ${"label".padEnd(labelWidth)}  aliases  command`,
+      `${"name".padEnd(nameWidth)}  ${"label".padEnd(labelWidth)}  ${"weight".padEnd(weightWidth)}  aliases  command`,
     );
     for (const entry of entries) {
       const aliases = entry.aliases.join(",");
       console.log(
-        `${entry.name.padEnd(nameWidth)}  ${entry.label.padEnd(labelWidth)}  ${aliases.padEnd("aliases".length)}  ${entry.command}`,
+        `${entry.name.padEnd(nameWidth)}  ${entry.label.padEnd(labelWidth)}  ${weightOf(entry).padEnd(weightWidth)}  ${aliases.padEnd("aliases".length)}  ${entry.command}`,
       );
     }
     return;
@@ -491,8 +530,13 @@ async function main(): Promise<void> {
     if (options.tag && Object.keys(pickPool).length === 0) {
       throw new Error(`No agents carry the tag '${options.tag}'`);
     }
+    const now = options.at ?? new Date();
+    if (options.verbose && options.agentLaunch && !options.agent) {
+      console.log(`Weights at ${now.toISOString()}:`);
+      for (const line of describeEffectiveWeights(pickPool, now)) console.log(line);
+    }
     const selected = options.agentLaunch
-      ? chooseAgent({ ...config, agents: pickPool }, options.agent, randomInt, resolved.aliasIndex)
+      ? chooseAgent({ ...config, agents: pickPool }, options.agent, randomInt, resolved.aliasIndex, now)
       : { name: "none", definition: { command: "" } };
     launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, options);
   }

@@ -41,8 +41,15 @@ launch:
 #     command: opencode --agent hy3
 #   dpsk-flash:
 #     provider: opencode
-#     weight: 0
+#     weight: 4                    # off-peak weight (half price)
+#     horizon: 60m                 # expected session length
 #     command: opencode --agent dpsk-v4-flash
+#     timeWeights:                 # peak pricing, read in the vendor's tz
+#       - tz: Asia/Shanghai
+#         weekdays: [mon, tue, wed, thu, fri]
+#         ranges: ["09:00-12:00", "14:00-18:00"]
+#         weight: 1                # 2x price, so avoided
+#         bufferBefore: 0m
 #   dpsk-pro:
 #     provider: opencode
 #     weight: 0
