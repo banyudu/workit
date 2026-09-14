@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { explainWeight } from "./agents.js";
 import { AGENTS_FILE, resolveHomePath } from "./config.js";
 import type { CodingAgentEntry, ResolvedConfig } from "./types.js";
 
@@ -53,26 +54,39 @@ export interface AgentListEntry {
   label: string;
   command: string;
   aliases: string[];
+  /** Static weight as configured. */
   weight: number;
+  /** Weight the picker would sample on at the evaluated instant. */
+  effectiveWeight: number;
+  /** Why the effective weight differs from (or matches) the static one. */
+  weightReason: string;
 }
 
 /**
  * Launchable registry entries in registry order. With `tag`, only entries
  * carrying that tag are returned (e.g. `workit agents --tag review`).
+ * Time-dependent weights are resolved at `now` (see `workit agents --at`).
  */
-export function listAgents(resolved: ResolvedConfig, tag?: string): AgentListEntry[] {
+export function listAgents(
+  resolved: ResolvedConfig,
+  tag?: string,
+  now: Date = new Date(),
+): AgentListEntry[] {
   const registryAgents = resolved.config.codingAgents?.agents ?? {};
   const entries: AgentListEntry[] = [];
   for (const [name, entry] of Object.entries(registryAgents)) {
     if (!isEntry(entry)) continue;
     if (!entry.command?.trim()) continue;
     if (tag && !entry.tags?.includes(tag)) continue;
+    const { base, weight, reason } = explainWeight(entry, now, name);
     entries.push({
       name,
       label: entry.label ?? name,
       command: entry.command,
       aliases: entry.aliases ?? [],
-      weight: entry.weight ?? 0,
+      weight: base,
+      effectiveWeight: weight,
+      weightReason: reason,
     });
   }
   return entries;

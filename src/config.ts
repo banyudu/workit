@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { validateTimeWeights } from "./agents.js";
 import type {
   AgentDefinition,
   CodingAgentEntry,
@@ -141,6 +142,8 @@ function projectRegistryIntoAgents(config: WorkitConfig): void {
       provider: entry.provider,
       weight: entry.weight,
       aliases: entry.aliases,
+      ...(entry.horizon !== undefined ? { horizon: entry.horizon } : {}),
+      ...(entry.timeWeights !== undefined ? { timeWeights: entry.timeWeights } : {}),
     };
   }
   config.agents = agents;
@@ -179,6 +182,8 @@ function projectRegistry(
       provider: entry.provider,
       weight: entry.weight ?? 0,
       aliases: entry.aliases,
+      ...(entry.horizon !== undefined ? { horizon: entry.horizon } : {}),
+      ...(entry.timeWeights !== undefined ? { timeWeights: entry.timeWeights } : {}),
     };
   }
   return agents;
@@ -221,6 +226,11 @@ function validateConfig(config: WorkitConfig): void {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
       throw new Error(`worktree.${name} must be a positive integer`);
     }
+  }
+  // Time rules are only read at selection time, so reject malformed zones and
+  // ranges here rather than mid-launch.
+  for (const [name, definition] of Object.entries(config.agents ?? {})) {
+    if (definition && typeof definition === "object") validateTimeWeights(name, definition);
   }
 }
 
