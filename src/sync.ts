@@ -93,6 +93,21 @@ export function listAgents(
 }
 
 /** Entries that surface in banyan's model picker, in registry order. */
+export function resolveBanyanIcon(value: string): string {
+  // Banyan treats bare names as SF Symbols; only resolve path-like values.
+  if (
+    value.startsWith("file://") ||
+    value.startsWith("~/") ||
+    value.startsWith("/") ||
+    value === "~" ||
+    value.includes("/")
+  ) {
+    return resolveHomePath(value);
+  }
+  return value;
+}
+
+/** Entries that surface in banyan's model picker, in registry order. */
 export function banyanProfiles(resolved: ResolvedConfig): BanyanProfile[] {
   const registryAgents = resolved.config.codingAgents?.agents ?? {};
   const profiles: BanyanProfile[] = [];
@@ -105,7 +120,7 @@ export function banyanProfiles(resolved: ResolvedConfig): BanyanProfile[] {
       id: name,
       label: entry.label ?? name,
       ...(entry.provider !== undefined ? { provider: entry.provider } : {}),
-      ...(entry.icon !== undefined ? { icon: resolveHomePath(entry.icon) } : {}),
+      ...(entry.icon !== undefined ? { icon: resolveBanyanIcon(entry.icon) } : {}),
       command: entry.banyanCommand ?? entry.command,
     });
   }
