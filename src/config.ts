@@ -117,6 +117,19 @@ function buildAliasIndex(config: WorkitConfig): Record<string, string> {
   return index;
 }
 
+/**
+ * Guidance appended to every issue prompt unless the repository overrides
+ * `launch.instructions`. It makes the finish line explicit: ship the branch as
+ * a PR, then fold review feedback back in, which is what most issue sessions
+ * are expected to do anyway. Declared above DEFAULT_AGENT_KEYS because that
+ * evaluates defaultConfig() at module load.
+ */
+export const DEFAULT_LAUNCH_INSTRUCTIONS: string[] = [
+  "Delivery: when the implementation is complete and tests pass, commit and push your work, then open a pull request (not draft) that describes the change and links this issue.",
+  "If a pull request already exists for this branch, do not open a new one: fetch its review comments, address every unresolved one including automated/bot and CI feedback, push follow-up commits, and re-request review.",
+  "Stay within the scope of the issue and the review feedback; do not expand into unrelated refactors.",
+];
+
 /** Agent keys shipped as built-in defaults; a loaded registry supersedes them. */
 const DEFAULT_AGENT_KEYS = Object.keys(defaultConfig().agents ?? {});
 
@@ -342,6 +355,7 @@ function defaultConfig(): WorkitConfig {
     launch: {
       target: "banyan",
       review: true,
+      instructions: [...DEFAULT_LAUNCH_INSTRUCTIONS],
       dependencies: "symlink",
       logFile: "~/.agents/logs/workit-launches.log",
     },

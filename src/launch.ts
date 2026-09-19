@@ -17,7 +17,7 @@ function findBanyanctl(): string {
   }
 }
 
-function promptFor(
+export function promptFor(
   issue: IssueDetails,
   worktree: WorktreeResult,
   options: CliOptions,
@@ -28,6 +28,9 @@ function promptFor(
   const review = options.review
     ? `\nFor non-trivial changes, do a short root-cause-first design pass before coding. Separate symptom from cause, consider alternatives, and commit to a recommendation.`
     : "";
+  const instructions = options.instructions?.length
+    ? `\n${options.instructions.map((line) => line.trim()).filter(Boolean).join("\n")}`
+    : "";
   return [
     `Working on ${issue.backend === "github" ? "GitHub" : "Linear"} issue ${issue.identifier}. Branch: ${worktree.branch}.`,
     `Issue: ${issue.url}`,
@@ -37,6 +40,7 @@ function promptFor(
     issue.body,
     resume,
     review,
+    instructions,
     "",
     `Launcher provenance: workit backend=${issue.backend} issue=${issue.identifier} worktree=${worktree.path}`,
   ].filter(Boolean).join("\n");

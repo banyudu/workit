@@ -125,6 +125,11 @@ export interface WorkitConfig {
   launch?: {
     target?: LaunchTarget;
     review?: boolean;
+    /**
+     * Guidance appended to every issue prompt. Replaces the built-in
+     * DEFAULT_LAUNCH_INSTRUCTIONS list, so `[]` disables it.
+     */
+    instructions?: string[];
     dependencies?: DependencyMode;
     logFile?: string;
   };
@@ -153,6 +158,10 @@ export interface CliOptions {
   prompt: boolean;
   agentLaunch: boolean;
   review: boolean;
+  /** Extra guidance from --instructions, appended to the configured list. */
+  instructions?: string[];
+  /** --no-instructions: drop the configured guidance entirely. */
+  noInstructions?: boolean;
   dependencies?: DependencyMode;
   dryRun: boolean;
   verbose: boolean;

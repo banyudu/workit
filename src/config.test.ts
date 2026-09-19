@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deepMerge, resolveConfig } from "./config.js";
+import { DEFAULT_LAUNCH_INSTRUCTIONS, deepMerge, resolveConfig } from "./config.js";
 
 test("deepMerge preserves nested defaults and lets project values win", () => {
   const merged = deepMerge(
@@ -112,4 +112,30 @@ test("a loaded registry supersedes workit's built-in default agents", () => {
   const resolved = resolveConfig(root, { homeDirectory: home });
   assert.deepEqual(Object.keys(resolved.config.agents ?? {}), ["codex"]);
   assert.equal(resolved.config.agents?.codex?.weight, 7);
+});
+
+test("launch instructions default to the delivery + review block", () => {
+  const root = mkdtempSync(join(tmpdir(), "workit-instr-default-"));
+  const resolved = resolveConfig(root, { homeDirectory: mkdtempSync(join(tmpdir(), "workit-home-")) });
+  assert.deepEqual(resolved.config.launch?.instructions, DEFAULT_LAUNCH_INSTRUCTIONS);
+});
+
+test("project launch.instructions replaces the default block", () => {
+  const root = mkdtempSync(join(tmpdir(), "workit-instr-override-"));
+  writeFileSync(join(root, ".workit.yml"), [
+    "launch:",
+    "  instructions:",
+    "    - Use the repo ship skill.",
+  ].join("\n"));
+
+  const resolved = resolveConfig(root, { homeDirectory: mkdtempSync(join(tmpdir(), "workit-home-")) });
+  assert.deepEqual(resolved.config.launch?.instructions, ["Use the repo ship skill."]);
+});
+
+test("project launch.instructions: [] disables prompt guidance", () => {
+  const root = mkdtempSync(join(tmpdir(), "workit-instr-off-"));
+  writeFileSync(join(root, ".workit.yml"), "launch:\n  instructions: []\n");
+
+  const resolved = resolveConfig(root, { homeDirectory: mkdtempSync(join(tmpdir(), "workit-home-")) });
+  assert.deepEqual(resolved.config.launch?.instructions, []);
 });

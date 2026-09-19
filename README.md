@@ -196,6 +196,37 @@ workit --mimo --here 23      # mimo agent, current terminal
 OpenCode prompt handling injects `--prompt` automatically for `opencode` TUI commands
 (`opencode run` keeps positional message).
 
+### Prompt guidance
+
+Every issue prompt ends with `launch.instructions`, a list of guidance lines
+appended after the issue body. The built-in default (`DEFAULT_LAUNCH_INSTRUCTIONS`
+in `src/config.ts`) states the finish line explicitly:
+
+```text
+Delivery: when the implementation is complete and tests pass, commit and push your
+work, then open a pull request (not draft) that describes the change and links this issue.
+If a pull request already exists for this branch, do not open a new one: fetch its
+review comments, address every unresolved one including automated/bot and CI feedback,
+push follow-up commits, and re-request review.
+Stay within the scope of the issue and the review feedback; do not expand into
+unrelated refactors.
+```
+
+The wording is conditional on purpose: a fresh worktree opens the PR, while a
+resumed worktree reuses the same prompt and fixes the review comments on it.
+
+Override it per repository — the list replaces the default, so `[]` disables it:
+
+```yaml
+launch:
+  instructions:
+    - Use the repo ship skill to open the pull request.
+    - Then address any review comments.
+```
+
+For a single run, `--instructions <text>` appends one line (repeatable) and
+`--no-instructions` drops the guidance entirely.
+
 Project-specific settings can be as small as:
 
 ```yaml

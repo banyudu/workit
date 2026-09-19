@@ -75,6 +75,8 @@ Options:
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --review / --no-review               Include/skip design guidance
+  --instructions <text>                Append guidance to the issue prompt (repeatable)
+  --no-instructions                    Drop the prompt guidance (auto-PR + review block)
   --symlink / --build / --install      Dependency preparation mode
   --at <iso>                            Evaluate time-dependent weights at this instant
   --dry-run                            Resolve and print without launching
@@ -206,6 +208,12 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--no-review":
         options.review = false;
+        break;
+      case "--instructions":
+        options.instructions = [...(options.instructions ?? []), next()];
+        break;
+      case "--no-instructions":
+        options.noInstructions = true;
         break;
       case "--symlink":
         options.dependencies = "symlink";
@@ -480,6 +488,11 @@ async function main(): Promise<void> {
     ? { ...resolved.config, repo: options.repo, github: { ...resolved.config.github, repo: options.repo } }
     : resolved.config;
   const dependencyMode = options.dependencies ?? config.launch?.dependencies ?? "symlink";
+  // Prompt guidance: the configured list plus any --instructions text, or
+  // nothing at all when --no-instructions wins.
+  const instructions = options.noInstructions
+    ? []
+    : [...(config.launch?.instructions ?? []), ...(options.instructions ?? [])];
 
   if (options.target === "here" && options.identifiers.length > 1) {
     throw new Error("--here can only be used with one issue identifier");
@@ -538,7 +551,10 @@ async function main(): Promise<void> {
     const selected = options.agentLaunch
       ? chooseAgent({ ...config, agents: pickPool }, options.agent, randomInt, resolved.aliasIndex, now)
       : { name: "none", definition: { command: "" } };
-    launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, options);
+    launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, {
+      ...options,
+      instructions,
+    });
   }
 }
 
