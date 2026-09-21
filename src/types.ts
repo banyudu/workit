@@ -113,6 +113,14 @@ export interface WorkitConfig {
     baseUrl?: string;
     apiUrl?: string;
   };
+  resolve?: {
+    /** Static project->repo map file (default ~/.config/workit/map.yml). */
+    map?: string;
+    /** Roots scanned for .agents/context.md declarations (default ~/dev). */
+    roots?: string;
+    /** Set false to disable Linear project->repo auto-resolution. */
+    auto?: boolean;
+  };
   worktree?: {
     directory?: string;
     branchPrefix?: string;
@@ -151,6 +159,14 @@ export interface ResolvedConfig {
 export interface CliOptions {
   provider?: ProviderMode;
   repo?: string;
+  /** Explicit local repo path override (--repo-path, or path-like --repo). */
+  repoPath?: string;
+  /** Static project->repo map file override (--map). */
+  mapFile?: string;
+  /** Colon-separated roots scanned for .agents/context.md (--roots). */
+  roots?: string;
+  /** Disable Linear project->repo auto-resolution (--no-resolve). */
+  noResolve?: boolean;
   agent?: string;
   /** Registry tag used to scope the weighted selection pool (e.g. "coding", "daily"). */
   tag?: string;
@@ -179,6 +195,8 @@ export interface IssueDetails {
   labels: string[];
   url: string;
   number?: number;
+  /** Linear project name (e.g. "Rene"); absent for GitHub issues. */
+  project?: string;
 }
 
 export interface WorktreeResult {

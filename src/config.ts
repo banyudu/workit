@@ -232,6 +232,9 @@ function validateConfig(config: WorkitConfig): void {
   if (dependencies && !["symlink", "clone", "install", "none"].includes(dependencies)) {
     throw new Error(`Unsupported dependency mode '${dependencies}' in workit config`);
   }
+  if (config.resolve?.auto !== undefined && typeof config.resolve.auto !== "boolean") {
+    throw new Error("resolve.auto must be a boolean");
+  }
   for (const [name, value] of [
     ["portBase", config.worktree?.portBase],
     ["portStep", config.worktree?.portStep],

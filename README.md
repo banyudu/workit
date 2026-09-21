@@ -7,9 +7,34 @@ configured coding-agent session. It unifies the previous `linear-worktree` and
 ```sh
 workit 23              # infer GitHub issue #23
 workit '#23'           # infer GitHub issue #23; quote # in shells
-workit ENG-123         # infer Linear issue ENG-123
-workit ENG-123 24      # route each issue independently
+workit ENG-123         # infer Linear issue ENG-123 (auto-resolves repo from project)
+workit ENG-123 24      # route each issue independently (Linear ids may land in different repos)
 ```
+
+## Linear project resolution
+
+`workit ENG-123` works from anywhere. Each Linear id resolves its local repo
+independently:
+
+1. explicit `--repo-path <path>` (or path-like `--repo <path>`)
+2. current repo, when its `.agents/context.md` declares the same `linear.project`
+3. static map(s): `$WORKIT_MAP` > `~/.config/workit/map.yml` >
+   `$REVIEW_LINEAR_MAP` > `~/.config/review-linear/map.yml`
+4. dynamic scan of `.agents/context.md` (`linear.project`) under the roots
+   (`--roots` > `$WORKIT_ROOTS` > `$REVIEW_LINEAR_ROOTS` > `~/dev`)
+5. current git repo fallback (or an error outside a repo)
+
+Maps share the neutral `project: repo-path` format, so workit's map and
+review-linear's map are symlink-compatible. Regenerate workit's map with:
+
+```sh
+workit sync-map [--map <path>] [--roots <dirs>]
+```
+
+Smart `--repo`: path-like values (`~/`, `/`, `./`, `../`, or an existing
+directory) switch the worktree root; otherwise the value is a GitHub
+`owner/name` override. `--no-resolve` disables auto-switching. Per-repo
+`.workit.yml` may set `resolve: {map, roots, auto}`.
 
 ## Install
 

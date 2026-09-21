@@ -1,11 +1,19 @@
 import { randomInt } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
 import { allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, repositoryRoot } from "./git.js";
 import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
 import { headlessPromptCommand, launch, runHere } from "./launch.js";
+import {
+  DEFAULT_WORKIT_MAP,
+  defaultMapFiles,
+  defaultRoots,
+  resolveRepoForProject,
+  splitSmartRepo,
+  syncMapFile,
+} from "./project.js";
 import { listAgents, syncDerivedConfigs, type SyncResult } from "./sync.js";
 import type { CliOptions, DependencyMode, LaunchTarget, ProviderMode } from "./types.js";
 
@@ -26,12 +34,26 @@ Usage:
   workit [options] <issue> [issue ...]
   workit run [--tag <tag>] [--agent <name>] [--workdir <dir>] [--here] <prompt words...>
   workit sync [--check]
+  workit sync-map [--map <path>] [--roots <dirs>]
   workit agents [--tag <tag>] [--format json|table] [--at <iso>]
 
 Issue routing:
   workit 23             GitHub issue #23
   workit #23            GitHub issue #23
-  workit ENG-123        Linear issue ENG-123
+  workit ENG-123        Linear issue ENG-123 (auto-resolves repo from project)
+
+Linear project resolution (per issue):
+  workit finds the local repo from the issue's Linear project, so it works
+  from anywhere: explicit --repo path > current repo (when it declares the
+  same project) > static map > dynamic scan of .agents/context.md under
+  the roots (default ~/dev). Falls back to the current git repo when the
+  project is unknown. Use --no-resolve to disable switching.
+
+  Maps share the neutral "project: repo-path" format; workit's map and
+  review-linear's map are symlink-compatible. Lookup order:
+  $WORKIT_MAP > ~/.config/workit/map.yml > $REVIEW_LINEAR_MAP >
+  ~/.config/review-linear/map.yml. Roots: --roots > $WORKIT_ROOTS >
+  $REVIEW_LINEAR_ROOTS > ~/dev.
 
 Prompt-only runs (no issue, no worktree):
   workit run --here --tag daily "summarize my day"
@@ -62,7 +84,12 @@ Sync options:
 
 Options:
   --linear, --github, --provider <name>  Override automatic routing
-  --repo <owner/name>                   GitHub repository override
+  --repo <owner/name|path>              GitHub repo (owner/name) or local repo path
+                                        (path-like values switch the worktree root)
+  --repo-path <path>                    Explicit local repo path (alias for path-like --repo)
+  --map <path>                          Static project->repo map file
+  --roots <dirs>                        Colon-separated scan roots (default ~/dev)
+  --no-resolve                          Disable Linear project->repo auto-resolution
   --agent <name>                        Explicit agent (otherwise weighted)
                                         Shorthands: --codex, --claude, --opencode,
                                           --muse (--muse-spark), --mimo, --hy (--hy3),
@@ -138,8 +165,24 @@ function parseArgs(argv: string[]): CliOptions {
           throw new Error(`Unsupported provider '${options.provider}'`);
         }
         break;
-      case "--repo":
-        options.repo = next();
+      case "--repo": {
+        const value = next();
+        const split = splitSmartRepo(value);
+        if (split.repoPath) options.repoPath = split.repoPath;
+        else options.repo = split.githubRepo;
+        break;
+      }
+      case "--repo-path":
+        options.repoPath = next();
+        break;
+      case "--map":
+        options.mapFile = next();
+        break;
+      case "--roots":
+        options.roots = next();
+        break;
+      case "--no-resolve":
+        options.noResolve = true;
         break;
       case "--agent":
         options.agent = next();
@@ -252,7 +295,7 @@ function parseArgs(argv: string[]): CliOptions {
 }
 
 interface Invocation {
-  mode: "launch" | "sync" | "agents" | "run";
+  mode: "launch" | "sync" | "sync-map" | "agents" | "run";
   check: boolean;
   tag?: string;
   format?: "json" | "table";
@@ -261,6 +304,8 @@ interface Invocation {
   workdir?: string;
   dryRun?: boolean;
   at?: Date;
+  mapFile?: string;
+  roots?: string;
   promptArgs: string[];
 }
 
@@ -319,6 +364,34 @@ function parseRunInvocation(argv: string[]): Invocation {
 function parseInvocation(argv: string[]): Invocation {
   if (argv[0] === "run") {
     return parseRunInvocation(argv);
+  }
+  if (argv[0] === "sync-map" || argv[0] === "sync_map") {
+    const invocation: Invocation = { mode: "sync-map", check: false, promptArgs: [] };
+    const args = argv.slice(1);
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      const next = () => {
+        const value = args[++index];
+        if (!value) throw new Error(`${arg} requires a value`);
+        return value;
+      };
+      switch (arg) {
+        case "--map":
+          invocation.mapFile = next();
+          break;
+        case "--roots":
+          invocation.roots = next();
+          break;
+        case "-h":
+        case "--help":
+          console.log(help());
+          process.exit(0);
+          break;
+        default:
+          throw new Error(`Unknown sync-map option '${arg}'`);
+      }
+    }
+    return invocation;
   }
   if (argv[0] === "sync") {
     let check = false;
@@ -465,6 +538,22 @@ async function main(): Promise<void> {
     return;
   }
   if (!options) {
+    if (invocation.mode === "sync-map") {
+      try {
+        const mapFile = invocation.mapFile ?? process.env.WORKIT_MAP ?? DEFAULT_WORKIT_MAP;
+        const roots = defaultRoots(invocation.roots);
+        const { path, entries } = syncMapFile(mapFile, roots);
+        console.log(`✦ workit sync-map`);
+        console.log(`  Map:      ${path}`);
+        console.log(`  Scanned:  ${roots.join(" ")}`);
+        console.log(`  Entries:`);
+        for (const entry of entries) console.log(`    ${entry.name}: ${entry.path}`);
+      } catch (error) {
+        console.error(`workit: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+      return;
+    }
     // sync mode does not require an issue identifier or a git repository.
     try {
       const resolved = resolveConfig(resolveHomePath("~"));
@@ -477,35 +566,50 @@ async function main(): Promise<void> {
     }
     return;
   }
-  const root = repositoryRoot();
-  const remote = originRemote(root);
-  const resolved = resolveConfig(root, {
-    explicitPath: options.configPath ? resolveHomePath(options.configPath, root) : undefined,
-    remote,
-  });
-  const provider = configProvider(options, resolved.config.provider);
-  const config = options.repo
-    ? { ...resolved.config, repo: options.repo, github: { ...resolved.config.github, repo: options.repo } }
-    : resolved.config;
-  const dependencyMode = options.dependencies ?? config.launch?.dependencies ?? "symlink";
-  // Prompt guidance: the configured list plus any --instructions text, or
-  // nothing at all when --no-instructions wins.
-  const instructions = options.noInstructions
-    ? []
-    : [...(config.launch?.instructions ?? []), ...(options.instructions ?? [])];
 
   if (options.target === "here" && options.identifiers.length > 1) {
     throw new Error("--here can only be used with one issue identifier");
   }
 
-  if (options.verbose && resolved.configFiles.length) {
-    console.log(`Config: ${resolved.configFiles.join(", ")}`);
+  // The starting repo (when invoked inside one). Linear issues may switch
+  // away from it via project resolution; GitHub issues always stay here.
+  let initialRoot: string | undefined;
+  try {
+    initialRoot = repositoryRoot();
+  } catch {
+    initialRoot = undefined;
   }
 
-  if (!options.dryRun) {
+  const provisionalRoot = initialRoot ?? resolveHomePath("~");
+  const provisionalResolved = resolveConfig(provisionalRoot, {
+    explicitPath: options.configPath ? resolveHomePath(options.configPath, provisionalRoot) : undefined,
+    remote: initialRoot ? originRemote(initialRoot) : undefined,
+  });
+  const autoEnabled = !options.noResolve && (provisionalResolved.config.resolve?.auto ?? true);
+  const mapFiles = defaultMapFiles(options.mapFile ?? provisionalResolved.config.resolve?.map);
+  const scanRoots = defaultRoots(options.roots ?? provisionalResolved.config.resolve?.roots);
+  const provisionalProvider = configProvider(options, provisionalResolved.config.provider);
+
+  // Explicit local repo override wins for every issue (--repo-path or path-like --repo).
+  let explicitLocalRoot: string | undefined;
+  if (options.repoPath) {
+    const expanded = resolveHomePath(options.repoPath);
+    if (!existsSync(`${expanded}/.git`)) {
+      throw new Error(`--repo ${options.repoPath} is not a git repository`);
+    }
+    explicitLocalRoot = expanded;
+  }
+
+  const syncedRoots = new Set<string>();
+  async function ensureSynced(
+    resolved: Parameters<typeof syncDerivedConfigs>[0],
+    verbose: boolean,
+  ): Promise<void> {
+    if (syncedRoots.has(resolved.root) || options!.dryRun) return;
+    syncedRoots.add(resolved.root);
     try {
       const syncResult = await syncDerivedConfigs(resolved);
-      if (options.verbose && syncResult.changed) console.log(describeSync(syncResult));
+      if (verbose && syncResult.changed) console.log(describeSync(syncResult));
     } catch (error) {
       console.warn(
         `workit: registry sync skipped (${error instanceof Error ? error.message : String(error)})`,
@@ -514,17 +618,103 @@ async function main(): Promise<void> {
   }
 
   for (const identifier of options.identifiers) {
+    const initialBackend = inferBackend(identifier, provisionalProvider);
+    const wantsResolve = initialBackend === "linear" && autoEnabled && !explicitLocalRoot;
+
+    // Provisional fetch (best-effort in dry-run) to learn the Linear
+    // project before committing to a repo root.
+    let prefetched: import("./types.js").IssueDetails | undefined;
+    let resolveSource = "";
+    let root: string | undefined = explicitLocalRoot ?? initialRoot;
+    if (wantsResolve) {
+      if (options.dryRun) {
+        try {
+          prefetched = await fetchIssue(
+            "linear",
+            identifier,
+            provisionalResolved.config,
+            provisionalRoot,
+          );
+        } catch {
+          prefetched = undefined;
+        }
+      } else {
+        prefetched = await fetchIssue(
+          "linear",
+          identifier,
+          provisionalResolved.config,
+          provisionalRoot,
+        );
+      }
+      const project = prefetched?.project ?? "";
+      if (project) {
+        try {
+          const settled = resolveRepoForProject(project, {
+            currentRoot: initialRoot,
+            mapFiles,
+            roots: scanRoots,
+          });
+          root = settled.repo;
+          resolveSource = settled.source;
+        } catch (error) {
+          if (!options.dryRun) throw error;
+          // dry-run stays on the current repo when resolution fails.
+          if (options.verbose) {
+            console.warn(
+              `workit: project resolution skipped (${error instanceof Error ? error.message : String(error)})`,
+            );
+          }
+        }
+      }
+      if (!root) {
+        throw new Error(
+          `workit must resolve a repo for ${identifier}: no project mapping found and not inside a git repository. Add it to ${mapFiles[0]} or pass --repo <path>`,
+        );
+      }
+    } else if (!root) {
+      throw new Error("workit must be run inside a Git repository");
+    }
+
+    const remote = originRemote(root);
+    const resolved = resolveConfig(root, {
+      explicitPath: options.configPath ? resolveHomePath(options.configPath, root) : undefined,
+      remote,
+    });
+    const provider = configProvider(options, resolved.config.provider);
     const backend = inferBackend(identifier, provider);
+    const config = options.repo
+      ? { ...resolved.config, repo: options.repo, github: { ...resolved.config.github, repo: options.repo } }
+      : resolved.config;
+    const dependencyMode = options.dependencies ?? config.launch?.dependencies ?? "symlink";
+    const instructions = options.noInstructions
+      ? []
+      : [...(config.launch?.instructions ?? []), ...(options.instructions ?? [])];
+
+    if (options.verbose && resolved.configFiles.length) {
+      console.log(`Config: ${resolved.configFiles.join(", ")}`);
+    }
+    if (resolveSource && (options.verbose || root !== initialRoot)) {
+      console.log(`Repo: ${root} (${resolveSource})`);
+    }
+    await ensureSynced(resolved, options.verbose);
+
     const issue = options.dryRun
       ? {
           backend,
           identifier,
-          title: backend === "github" ? `GitHub issue #${identifier}` : identifier,
-          body: "",
-          labels: [],
-          url: backend === "github" ? "" : `${config.linear?.baseUrl ?? "https://linear.app/2en/issue"}/${identifier}`,
+          title: backend === "github" ? `GitHub issue #${identifier}` : (prefetched?.title ?? identifier),
+          body: prefetched?.body ?? "",
+          labels: prefetched?.labels ?? [],
+          url:
+            prefetched?.url ??
+            (backend === "github"
+              ? ""
+              : `${config.linear?.baseUrl ?? "https://linear.app/2en/issue"}/${identifier}`),
+          ...(prefetched?.project ? { project: prefetched.project } : {}),
         }
-      : await fetchIssue(backend, identifier, config, root);
+      : (prefetched && backend === "linear"
+          ? prefetched
+          : await fetchIssue(backend, identifier, config, root));
     if (!options.dryRun) await transitionLinearIssue(issue, config);
 
     const branch = branchForIssue(issue.backend, issue.identifier, issue.title, config);

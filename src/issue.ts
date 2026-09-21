@@ -120,6 +120,16 @@ async function linearApi(
   return payload.data;
 }
 
+function linearProject(value: any): string {
+  const issue = value?.issue ?? value;
+  const project = issue?.project;
+  if (typeof project === "string") return project;
+  if (project && typeof project === "object" && typeof project.name === "string") {
+    return project.name;
+  }
+  return "";
+}
+
 export async function fetchLinearIssue(
   identifier: string,
   config: WorkitConfig,
@@ -136,7 +146,7 @@ export async function fetchLinearIssue(
   } catch {
     const data = await linearApi(
       config,
-      `query Issue($id: String!) { issue(id: $id) { identifier title description url } }`,
+      `query Issue($id: String!) { issue(id: $id) { identifier title description url project { name } } }`,
       { id: normalized },
     );
     value = data?.issue;
@@ -146,6 +156,7 @@ export async function fetchLinearIssue(
   if (!issue?.title) {
     throw new Error(`Unable to fetch Linear issue ${normalized}`);
   }
+  const project = linearProject(value);
   return {
     backend: "linear",
     identifier: issue.identifier ?? normalized,
@@ -155,6 +166,7 @@ export async function fetchLinearIssue(
     url:
       issue.url ??
       `${(config.linear?.baseUrl ?? `https://linear.app/${config.linear?.org ?? "2en"}/issue`).replace(/\/$/, "")}/${normalized}`,
+    ...(project ? { project } : {}),
   };
 }
 
