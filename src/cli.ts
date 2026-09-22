@@ -95,6 +95,7 @@ Options:
                                           --muse (--muse-spark), --mimo, --hy (--hy3),
                                           --dpsk-pro (--dpsk-v4-pro), --dpsk-flash (--dpsk-v4-flash),
                                           --qwen, --glm, --gly, --deepseek
+  --allow-fallback                       Unknown --agent falls back to weighted selection
   --tag <tag>                           Scope weighted selection to agents carrying this tag
   --here                               Launch in the current terminal
   --banyan                             Launch a Banyan session (default)
@@ -186,6 +187,9 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--agent":
         options.agent = next();
+        break;
+      case "--allow-fallback":
+        options.allowFallback = true;
         break;
       case "--tag":
         options.tag = next();
@@ -301,6 +305,7 @@ interface Invocation {
   format?: "json" | "table";
   options?: CliOptions;
   agent?: string;
+  allowFallback?: boolean;
   workdir?: string;
   dryRun?: boolean;
   at?: Date;
@@ -330,6 +335,9 @@ function parseRunInvocation(argv: string[]): Invocation {
         break;
       case "--agent":
         invocation.agent = next();
+        break;
+      case "--allow-fallback":
+        invocation.allowFallback = true;
         break;
       case "--workdir":
         invocation.workdir = next();
@@ -490,6 +498,7 @@ async function main(): Promise<void> {
       randomInt,
       resolved.aliasIndex,
       now,
+      invocation.allowFallback,
     );
     const prompt = invocation.promptArgs.join(" ");
     const command = headlessPromptCommand(selected.definition.command, prompt);
@@ -739,7 +748,14 @@ async function main(): Promise<void> {
       for (const line of describeEffectiveWeights(pickPool, now)) console.log(line);
     }
     const selected = options.agentLaunch
-      ? chooseAgent({ ...config, agents: pickPool }, options.agent, randomInt, resolved.aliasIndex, now)
+      ? chooseAgent(
+          { ...config, agents: pickPool },
+          options.agent,
+          randomInt,
+          resolved.aliasIndex,
+          now,
+          options.allowFallback,
+        )
       : { name: "none", definition: { command: "" } };
     launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, {
       ...options,

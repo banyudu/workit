@@ -168,6 +168,8 @@ export interface CliOptions {
   /** Disable Linear project->repo auto-resolution (--no-resolve). */
   noResolve?: boolean;
   agent?: string;
+  /** Unknown --agent falls back to weighted selection instead of failing. */
+  allowFallback?: boolean;
   /** Registry tag used to scope the weighted selection pool (e.g. "coding", "daily"). */
   tag?: string;
   target?: LaunchTarget;

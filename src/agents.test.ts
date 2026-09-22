@@ -38,7 +38,13 @@ test("explicit selection resolves aliases to the canonical agent", () => {
   const selected = chooseAgent(aliased, "hy", undefined as never, { hy: "hy3" });
   assert.equal(selected.name, "hy3");
   assert.equal(selected.definition.command, "opencode --agent hy3");
-  assert.throws(() => chooseAgent(aliased, "unknown", undefined as never));
+  assert.throws(() => chooseAgent(aliased, "unknown", undefined as never), /not configured/);
+});
+
+test("unknown explicit agent falls back only with allowFallback", () => {
+  assert.throws(() => chooseAgent(config, "unknown", () => 0), /not configured/);
+  assert.equal(chooseAgent(config, "unknown", () => 0, {}, new Date(), true).name, "claude");
+  assert.equal(chooseAgent(config, "unknown", () => 3, {}, new Date(), true).name, "codex");
 });
 
 

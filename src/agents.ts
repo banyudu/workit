@@ -284,6 +284,7 @@ export function chooseAgent(
   random: (max: number) => number = randomInt,
   aliasIndex: Record<string, string> = {},
   now: Date = new Date(),
+  allowFallback = false,
 ): { name: string; definition: AgentDefinition } {
   const agents = config.agents ?? {};
   validateAgents(config);
@@ -292,10 +293,13 @@ export function chooseAgent(
   if (requested) {
     const name = aliasIndex[requested] ?? requested;
     const definition = agents[name];
-    if (!definition) {
+    if (definition) return { name, definition };
+    if (!allowFallback) {
       throw new Error(`Agent '${requested}' is not configured`);
     }
-    return { name, definition };
+    // --allow-fallback: treat the unusable name as no input and fall
+    // through to the weighted pool.
+    console.error(`workit: agent '${requested}' is not configured; ignoring and selecting from the weighted pool`);
   }
 
   const weighted = Object.entries(agents)
