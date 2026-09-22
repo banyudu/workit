@@ -138,6 +138,40 @@ function copyEnvFiles(root: string, target: string, config: WorkitConfig): void 
   }
 }
 
+function allowDirenv(target: string): void {
+  // Best-effort: direnv has no wildcard allow, so each new worktree (its own
+  // git toplevel with its own .envrc) must be allowed individually. The .envrc
+  // is tracked from a trusted base branch, same trust as the main checkout.
+  // Never fail worktree creation because direnv is missing or denies.
+  try {
+    if (!existsSync(join(target, ".envrc"))) return;
+    spawnSync("direnv", ["allow", target], { stdio: "ignore" });
+    // Nested .envrc files that chain via `source_up` (e.g. apps/mobile/.envrc)
+    // need their own allow. Walk depth <= 2, skipping heavy/irrelevant dirs.
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: target, depth: 0 }];
+    while (queue.length) {
+      const { dir, depth } = queue.pop()!;
+      if (depth > 0 && existsSync(join(dir, ".envrc"))) {
+        spawnSync("direnv", ["allow", dir], { stdio: "ignore" });
+      }
+      if (depth >= 2) continue;
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name === ".git" || entry.name === "node_modules" || entry.name === ".direnv") continue;
+        queue.push({ dir: join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+  } catch {
+    // ignore: worktree is usable without direnv, tools just won't be on PATH
+  }
+}
+
 export function createOrResumeWorktree(
   resolved: ResolvedConfig,
   branch: string,
@@ -147,6 +181,7 @@ export function createOrResumeWorktree(
     (record) => record.branch === branch || record.branch?.match(new RegExp(`^${escapeRegExp(branch)}-[0-9a-f]{6}$`)),
   );
   if (existing?.branch) {
+    allowDirenv(existing.path);
     return {
       path: existing.path,
       branch: existing.branch,
@@ -174,6 +209,7 @@ export function createOrResumeWorktree(
     const withoutPort = existingEnv.replace(/^PORT=.*(?:\n|$)/gm, "");
     writeFileSync(envFile, `${withoutPort}${withoutPort.endsWith("\n") || !withoutPort ? "" : "\n"}PORT=${port}\n`);
   }
+  allowDirenv(target);
   return { path: target, branch: tempBranch, sourceBranch: branch, port, resumed: false };
 }
 
