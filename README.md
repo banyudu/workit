@@ -144,6 +144,7 @@ Each registry entry can drive up to three surfaces:
 |---|---|---|---|
 | `command` + `weight` + `aliases` + `horizon` + `timeWeights` | ✓ launch pool | — | — |
 | `label` + `provider` + `icon` + `banyanCommand` | — | ✓ session launch | — |
+| `puckProvider` + `puckModel` + `puckAccount` | — | ✓ puckd session route | — |
 | `opencodeName` + `opencode` | — | — | ✓ agent definition |
 
 Rules: an entry only surfaces on a surface whose tag it carries — `tags` is a
@@ -171,6 +172,9 @@ agents:
     tags: [banyan, coding]
     aliases: [muse-spark]          # extra --agent names for workit
     command: opencode --agent muse-spark
+    puckProvider: opencode-go       # Banyan uses puckd; workit keeps its CLI command
+    puckModel: muse-spark-1.2-contributor
+    puckAccount: personal
     opencodeName: muse-spark       # key inside opencode.jsonc
     opencode:                      # raw block written into opencode.jsonc
       mode: primary
