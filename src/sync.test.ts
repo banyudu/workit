@@ -26,6 +26,8 @@ const registry = {
         tags: ["banyan", "coding"],
         command: "codex -p terra --dangerously-bypass-approvals-and-sandbox",
         banyanCommand: "codex",
+        puckProvider: "codex",
+        puckModel: "gpt-6-sol",
       },
       hy3: {
         label: "Hunyuan",
@@ -35,6 +37,9 @@ const registry = {
         aliases: ["hy"],
         opencodeName: "hy3",
         opencode: { mode: "primary", model: "opencode-go/hy3" },
+        puckProvider: "opencode-go",
+        puckModel: "hy3",
+        puckAccount: "personal",
       },
       ghost: {
         label: "Ghost",
@@ -71,6 +76,7 @@ test("banyan profiles include picker entries in registry order and skip opencode
   const profiles = banyanProfiles({ config: registry, root: "", configFiles: [], aliasIndex: {} });
   assert.deepEqual(profiles.map((profile) => profile.id), ["zsh", "codex", "hy3"]);
   assert.equal(profiles[1]!.command, "codex");
+  assert.equal(profiles[1]!.puckProvider, "codex");
 });
 
 test("generated banyan yaml round-trips through a YAML parser with quoted scalars", () => {
@@ -86,7 +92,21 @@ test("generated banyan yaml round-trips through a YAML parser with quoted scalar
   const hunyuan = parsed.session_launches[2]!;
   assert.equal(hunyuan.label, "Hunyuan");
   assert.equal(hunyuan.command, "opencode --agent hy3");
+  assert.equal(hunyuan.puck_provider, "opencode-go");
+  assert.equal(hunyuan.puck_model, "hy3");
+  assert.equal(hunyuan.puck_account, "personal");
+  assert.equal(parsed.session_launches[1]!.puck_provider, "codex");
+  assert.equal(parsed.session_launches[1]!.puck_model, "gpt-6-sol");
   assert.equal(parsed.session_launches[0]!.command, "");
+});
+
+test("banyan puck profiles reject incomplete billed routes", () => {
+  const config = structuredClone(registry);
+  config.codingAgents.agents.codex.puckProvider = "anthropic";
+  assert.throws(
+    () => banyanProfiles({ config, root: "", configFiles: [], aliasIndex: {} }),
+    /requires puckModel and puckAccount/,
+  );
 });
 
 test("opencode jsonc keeps schema first, passthrough settings, and generated agent map", () => {

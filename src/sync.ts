@@ -47,6 +47,9 @@ interface BanyanProfile {
   provider?: string;
   icon?: string;
   command: string;
+  puckProvider?: string;
+  puckModel?: string;
+  puckAccount?: string;
 }
 
 export interface AgentListEntry {
@@ -116,12 +119,27 @@ export function banyanProfiles(resolved: ResolvedConfig): BanyanProfile[] {
     if (!entry.tags?.includes("banyan")) continue;
     if (entry.picker === false) continue;
     if (entry.command === undefined) continue;
+    const puckFields = [entry.puckProvider, entry.puckModel, entry.puckAccount];
+    if (puckFields.some((value) => value !== undefined)) {
+      if (!entry.puckProvider || !["codex", "opencode-go", "anthropic", "gemini"].includes(entry.puckProvider)) {
+        throw new Error(`Invalid puckProvider for Banyan profile ${name}`);
+      }
+      if (puckFields.some((value) => value !== undefined && (typeof value !== "string" || !value.trim()))) {
+        throw new Error(`Empty puck field for Banyan profile ${name}`);
+      }
+      if (["anthropic", "gemini"].includes(entry.puckProvider) && (!entry.puckModel || !entry.puckAccount)) {
+        throw new Error(`${entry.puckProvider} Banyan profile ${name} requires puckModel and puckAccount`);
+      }
+    }
     profiles.push({
       id: name,
       label: entry.label ?? name,
       ...(entry.provider !== undefined ? { provider: entry.provider } : {}),
       ...(entry.icon !== undefined ? { icon: resolveBanyanIcon(entry.icon) } : {}),
       command: entry.banyanCommand ?? entry.command,
+      ...(entry.puckProvider !== undefined ? { puckProvider: entry.puckProvider } : {}),
+      ...(entry.puckModel !== undefined ? { puckModel: entry.puckModel } : {}),
+      ...(entry.puckAccount !== undefined ? { puckAccount: entry.puckAccount } : {}),
     });
   }
   return profiles;
@@ -149,6 +167,9 @@ export function generateBanyanYaml(resolved: ResolvedConfig): string {
     if (profile.provider !== undefined) lines.push(`    provider: ${yamlScalar(profile.provider)}`);
     if (profile.icon !== undefined) lines.push(`    icon: ${yamlScalar(profile.icon)}`);
     lines.push(`    command: ${yamlScalar(profile.command)}`);
+    if (profile.puckProvider !== undefined) lines.push(`    puck_provider: ${yamlScalar(profile.puckProvider)}`);
+    if (profile.puckModel !== undefined) lines.push(`    puck_model: ${yamlScalar(profile.puckModel)}`);
+    if (profile.puckAccount !== undefined) lines.push(`    puck_account: ${yamlScalar(profile.puckAccount)}`);
   }
   return lines.join("\n") + "\n";
 }

@@ -64,6 +64,12 @@ export interface CodingAgentEntry extends WeightedDefinition {
   command?: string;
   /** Override command used only for the banyan picker entry (defaults to command). */
   banyanCommand?: string;
+  /** Route the Banyan picker entry to a puckd session instead of its CLI command. */
+  puckProvider?: string;
+  /** Model ID for the puckd route; required for Anthropic and Gemini. */
+  puckModel?: string;
+  /** Puck-owned account label; required for Anthropic and Gemini. */
+  puckAccount?: string;
   /** Extra names usable with --agent / shorthand flags in workit. */
   aliases?: string[];
   /** Optional banyan icon override: file path or SF Symbol name. */
