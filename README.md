@@ -229,20 +229,30 @@ OpenCode prompt handling injects `--prompt` automatically for `opencode` TUI com
 
 Every issue prompt ends with `launch.instructions`, a list of guidance lines
 appended after the issue body. The built-in default (`DEFAULT_LAUNCH_INSTRUCTIONS`
-in `src/config.ts`) states the finish line explicitly:
+in `src/config.ts`) asks the agent to:
 
-```text
-Delivery: when the implementation is complete and tests pass, commit and push your
-work, then open a pull request (not draft) that describes the change and links this issue.
-If a pull request already exists for this branch, do not open a new one: fetch its
-review comments, address every unresolved one including automated/bot and CI feedback,
-push follow-up commits, and re-request review.
-Stay within the scope of the issue and the review feedback; do not expand into
-unrelated refactors.
-```
+- Implement, test, commit, push, and open a ready-for-review PR, or reuse the
+  branch's existing PR.
+- Wait for Superdog's review, address actionable review and CI feedback, test,
+  and push fixes. Repeat until Superdog scores the **current PR head commit
+  5/5**, actionable feedback is addressed, and required checks pass.
+- Verify the reviewed commit SHA using review/check metadata. Older scores and
+  missing or pending reviews do not satisfy completion. Report unavailable
+  reviewers or other external blockers with evidence.
+- Stay within the issue and review scope.
 
-The wording is conditional on purpose: a fresh worktree opens the PR, while a
-resumed worktree reuses the same prompt and fixes the review comments on it.
+For Codex, the prompt explicitly requests `get_goal` and `create_goal` before
+starting, so the delivery and review objective can persist across turns. It
+reuses a matching active goal and reports unrelated unfinished or inactive
+goals instead of replacing or resuming them automatically. If native goal tools
+are unavailable, the agent is asked to disclose that limitation and continue
+the review loop. Other agents receive the review-loop instructions without a
+request to use Codex's goal tools.
+
+This is prompt guidance; workit does not send follow-up terminal input or run a
+background review watcher. Persistent continuation depends on the selected
+agent's support for native goals. Repositories without Superdog can replace
+the guidance below with their own review policy.
 
 Override it per repository — the list replaces the default, so `[]` disables it:
 

@@ -15,7 +15,8 @@ launch:
   dependencies: symlink
   review: true
   # Guidance appended to every issue prompt. Omit to keep the built-in
-  # auto-PR + review-comment block; set to [] to disable it; or list your own.
+  # auto-PR + Superdog 5/5 review loop (native goal for Codex); set to [] to
+  # disable it; or list your own.
   # instructions:
   #   - Use the repo ship skill to open the pull request.
 

@@ -119,14 +119,18 @@ function buildAliasIndex(config: WorkitConfig): Record<string, string> {
 
 /**
  * Guidance appended to every issue prompt unless the repository overrides
- * `launch.instructions`. It makes the finish line explicit: ship the branch as
- * a PR, then fold review feedback back in, which is what most issue sessions
- * are expected to do anyway. Declared above DEFAULT_AGENT_KEYS because that
- * evaluates defaultConfig() at module load.
+ * `launch.instructions`. Delivery includes repeated review repairs until the
+ * current PR head receives Superdog 5/5. Codex is explicitly asked to create a
+ * native goal so the objective persists across turns. Declared above
+ * DEFAULT_AGENT_KEYS because that evaluates defaultConfig() at module load.
  */
 export const DEFAULT_LAUNCH_INSTRUCTIONS: string[] = [
+  "Persistent goal (Codex only): before starting, call get_goal. If no goal exists or the previous goal is complete, explicitly call create_goal with this objective: implement this issue, open or update its PR, address actionable review feedback, and obtain a Superdog score of 5/5 for the PR's current head commit with required checks passing. Reuse a matching active goal; report an unrelated unfinished or inactive goal instead of replacing or resuming it automatically. If native goal tools are unavailable, state that limitation and continue the review loop without claiming a native goal exists.",
   "Delivery: when the implementation is complete and tests pass, commit and push your work, then open a pull request (not draft) that describes the change and links this issue.",
-  "If a pull request already exists for this branch, do not open a new one: fetch its review comments, address every unresolved one including automated/bot and CI feedback, push follow-up commits, and re-request review.",
+  "If a pull request already exists for this branch, reuse it instead of opening a new one.",
+  "Review loop: for both new and existing PRs, wait for Superdog to review the current head commit. Fetch unresolved review comments, including automated/bot and CI feedback, address actionable feedback, run relevant checks, commit and push fixes, and request another review when needed. Repeat this wait/fix/test/push cycle until Superdog scores the current head 5/5, actionable review feedback is addressed, and required checks pass.",
+  "Verify the Superdog score against the reviewed commit SHA using review/check metadata. An older commit's score, missing review, or pending review is not success. Mark the work and any native goal complete only after verifying the current head meets all completion criteria.",
+  "Wait for pending reviews. If Superdog is not configured, the review service is unavailable, or another external blocker prevents verification or repair, report the blocker and evidence instead of claiming 5/5 or completion.",
   "Stay within the scope of the issue and the review feedback; do not expand into unrelated refactors.",
 ];
 
