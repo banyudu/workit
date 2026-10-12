@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -9,6 +10,7 @@ function shellQuote(value: string): string {
 }
 
 function findBanyanctl(): string {
+  if (process.env.WORKIT_BANYANCTL) return process.env.WORKIT_BANYANCTL;
   try {
     return execFileSync("sh", ["-lc", "command -v banyanctl"], { encoding: "utf8" }).trim();
   } catch {
@@ -80,12 +82,12 @@ function commandWithPrompt(
 ): string {
   if (!options.prompt) return agent.command;
   const promptDirectory = join(tmpdir(), "workit");
-  mkdirSync(promptDirectory, { recursive: true });
+  mkdirSync(promptDirectory, { recursive: true, mode: 0o700 });
   const promptFile = join(
     promptDirectory,
-    `${issue.backend}-${issue.identifier.replace(/[^a-zA-Z0-9_-]/g, "_")}.txt`,
+    `${issue.backend}-${issue.identifier.replace(/[^a-zA-Z0-9_-]/g, "_")}-${randomUUID()}.txt`,
   );
-  writeFileSync(promptFile, promptFor(issue, worktree, options));
+  writeFileSync(promptFile, promptFor(issue, worktree, options), { mode: 0o600 });
   const quotedPrompt = `"$(cat ${shellQuote(promptFile)})"`;
   // OpenCode TUI expects --prompt for initial message; `opencode run` uses positional message.
   // Detect opencode commands and inject --prompt correctly.
@@ -138,11 +140,12 @@ function runBanyan(
   command: string | undefined,
   issue: IssueDetails,
   worktree: WorktreeResult,
+  sessionID?: string,
 ): void {
   const banyanctl = findBanyanctl();
   const args = [
     "session", "new",
-    "--id", issue.identifier,
+    "--id", sessionID ?? issue.identifier,
     "--title", `${issue.identifier} ${issue.title}`,
     "--title-url", issue.url,
     "--cwd", worktree.path,
@@ -207,6 +210,6 @@ export function launch(
   } else if (target === "iterm") {
     runIterm(command, worktree);
   } else {
-    runBanyan(command, issue, worktree);
+    runBanyan(command, issue, worktree, options.sessionID);
   }
 }
