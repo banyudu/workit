@@ -104,6 +104,7 @@ export interface CodingAgentsConfig {
 }
 
 export interface WorkitConfig {
+  lifecycle?: import("./lifecycle.js").LifecycleConfig;
   provider?: ProviderMode;
   repo?: string;
   default?: string;
@@ -163,6 +164,8 @@ export interface ResolvedConfig {
 }
 
 export interface CliOptions {
+  managed?: boolean;
+  sessionID?: string;
   provider?: ProviderMode;
   repo?: string;
   /** Explicit local repo path override (--repo-path, or path-like --repo). */
@@ -196,6 +199,8 @@ export interface CliOptions {
 }
 
 export interface IssueDetails {
+  state?: string;
+  stateType?: string;
   backend: Backend;
   identifier: string;
   title: string;

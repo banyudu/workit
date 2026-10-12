@@ -55,7 +55,10 @@ function commandJson(
   cwd: string,
 ): unknown {
   try {
+    const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", CLICOLOR: "0" };
+    delete env.CLICOLOR_FORCE; delete env.FORCE_COLOR; delete env.GH_FORCE_TTY;
     const output = execFileSync(command, args, {
+      env,
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -73,10 +76,11 @@ export function fetchGithubIssue(
   cwd: string,
 ): IssueDetails {
   const number = issueNumber(identifier);
-  const args = ["issue", "view", String(number), "--json", "title,body,labels,url"];
+  const args = ["issue", "view", String(number), "--json", "title,body,labels,url,state"];
   const repo = config.repo ?? config.github?.repo;
   if (repo) args.push("--repo", repo);
   const value = commandJson("gh", args, cwd) as {
+    state?: string;
     title?: string;
     body?: string;
     labels?: Array<{ name?: string }>;
@@ -89,6 +93,7 @@ export function fetchGithubIssue(
     backend: "github",
     identifier: String(number),
     number,
+    ...(value.state ? { state: value.state } : {}),
     title: value.title,
     body: value.body || "No description provided.",
     labels: (value.labels ?? []).map((label) => label.name).filter(Boolean) as string[],
@@ -146,7 +151,7 @@ export async function fetchLinearIssue(
   } catch {
     const data = await linearApi(
       config,
-      `query Issue($id: String!) { issue(id: $id) { identifier title description url project { name } } }`,
+      `query Issue($id: String!) { issue(id: $id) { identifier title description url state { name type } project { name } } }`,
       { id: normalized },
     );
     value = data?.issue;
@@ -160,6 +165,8 @@ export async function fetchLinearIssue(
   return {
     backend: "linear",
     identifier: issue.identifier ?? normalized,
+    state: typeof issue.state === "string" ? issue.state : issue.state?.name ?? issue.status?.name,
+    stateType: issue.state?.type ?? issue.status?.type,
     title: issue.title,
     body: issue.description ?? issue.body ?? "No description provided.",
     labels: (issue.labels ?? []).map((label: { name?: string }) => label.name).filter(Boolean),

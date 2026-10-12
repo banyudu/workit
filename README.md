@@ -249,9 +249,10 @@ are unavailable, the agent is asked to disclose that limitation and continue
 the review loop. Other agents receive the review-loop instructions without a
 request to use Codex's goal tools.
 
-This is prompt guidance; workit does not send follow-up terminal input or run a
-background review watcher. Persistent continuation depends on the selected
-agent's support for native goals. Repositories without Superdog can replace
+For unmanaged launches this is prompt guidance; continuation depends on the
+selected agent. [Managed issue delivery](docs/managed-delivery.md) uses workit's
+durable heartbeat and guarded Banyan continuation instead of the built-in native
+goal instruction. Repositories without Superdog can replace
 the guidance below with their own review policy.
 
 Override it per repository — the list replaces the default, so `[]` disables it:

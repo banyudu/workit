@@ -1,6 +1,9 @@
 import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
+import { JobStore, createJob } from "./lifecycle.js";
+import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
 import { allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, repositoryRoot } from "./git.js";
@@ -34,6 +37,9 @@ Usage:
   workit [options] <issue> [issue ...]
   workit run [--tag <tag>] [--agent <name>] [--workdir <dir>] [--here] <prompt words...>
   workit sync [--check]
+  workit tick [--job ID]
+  workit job list|status|checkpoint|pause|resume|cancel|verify (see workit job --help)
+  workit heartbeat install|uninstall|status
   workit sync-map [--map <path>] [--roots <dirs>]
   workit agents [--tag <tag>] [--format json|table] [--at <iso>]
 
@@ -102,6 +108,7 @@ Options:
   --iterm                              Launch an iTerm2 tab
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
+  --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
   --review / --no-review               Include/skip design guidance
   --instructions <text>                Append guidance to the issue prompt (repeatable)
   --no-instructions                    Drop the prompt guidance (auto-PR + review block)
@@ -155,6 +162,12 @@ function parseArgs(argv: string[]): CliOptions {
         process.exit(0);
       case "--linear":
         options.provider = "linear";
+        break;
+      case "--managed":
+        options.managed = true;
+        break;
+      case "--unmanaged":
+        options.managed = false;
         break;
       case "--github":
       case "--gh":
@@ -472,6 +485,10 @@ function configProvider(options: CliOptions, configured: ProviderMode | undefine
 }
 
 async function main(): Promise<void> {
+  if (["tick", "job", "heartbeat"].includes(process.argv[2])) {
+    await lifecycleCLI(process.argv.slice(2));
+    return;
+  }
   const invocation = parseInvocation(process.argv.slice(2));
   const options = invocation.options;
   if (invocation.mode === "run") {
@@ -757,10 +774,48 @@ async function main(): Promise<void> {
           options.allowFallback,
         )
       : { name: "none", definition: { command: "" } };
-    launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, {
-      ...options,
-      instructions,
-    });
+    const managed = options.managed ?? (config.lifecycle?.enabled === true && options.agentLaunch && options.prompt &&
+      (options.target ?? config.launch?.target ?? "banyan") === "banyan");
+    if (managed && (!options.agentLaunch || !options.prompt ||
+        (options.target ?? config.launch?.target ?? "banyan") !== "banyan")) {
+      throw new Error("Managed jobs require a prompted agent in Banyan");
+    }
+    let job: ReturnType<typeof createJob> | undefined;
+    let jobStore: JobStore | undefined;
+    if (managed && !options.dryRun) {
+      await new BanyanLifecycleAdapter().requireWorkflowSupport(root);
+      jobStore = new JobStore();
+      job = createJob({ issue, repoRoot: root, worktree: worktree.path,
+        githubRepo: githubRepository(remote), agent: selected.name, config: config.lifecycle });
+      job.controlCommand = [process.execPath, resolve(process.argv[1])];
+      job.stateDirectory = dirname(jobStore.path);
+      if (jobStore.list().some(existing => existing.id === job!.id)) {
+        throw new Error(`Managed job ${job.id} already exists; use workit job status/resume instead of replaying the launch`);
+      }
+      jobStore.insert(job);
+      console.log(`  Managed job: ${job.id}`);
+    }
+    try {
+      launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, {
+        ...options,
+        instructions: job ? [...instructions.filter(line => !line.startsWith("Persistent goal (Codex only):")), ...managedInstructions(job)] : instructions,
+        sessionID: job?.sessionID,
+      });
+    } catch (error) {
+      if (job && jobStore) jobStore.update(job.id, current => {
+        current.stage = "needs-you"; current.detail = "Launch failed; inspect Banyan before recovering to avoid replaying an uncertain launch";
+        delete current.nextWakeAt;
+      });
+      throw error;
+    }
+    if (job && jobStore) {
+      try {
+        await new BanyanLifecycleAdapter().project(job);
+        jobStore.acknowledgeProjection(job);
+      } catch {
+        console.warn("workit: managed job saved; heartbeat will retry its Banyan projection");
+      }
+    }
   }
 }
 
