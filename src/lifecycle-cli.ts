@@ -133,7 +133,7 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       const outcome = values["--delivery"];
       if (!["paused", "needs-you"].includes(expected.stage) || !expected.wake ||
           !["delivered", "not-delivered"].includes(outcome) || !values["--detail"]?.trim()) {
-        throw new Error("Inspect the original conversation first; reconcile requires a human-blocked pending wake, --delivery and --detail");
+        throw new Error("Inspect the original conversation first; reconcile requires a paused/human-blocked pending wake, --delivery and --detail");
       }
       await adapter.project(expected);
       await adapter.reconcile(expected, outcome, values["--detail"]);

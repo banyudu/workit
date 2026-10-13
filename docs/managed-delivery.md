@@ -235,6 +235,9 @@ and session from the displayed job:
 workit job pause JOB_ID --detail TEXT --expected-revision N --expected-session-id SESSION_ID
 ```
 
+Configure Banyan's trusted invocation and owning state directory for **Pause and
+Close** in `~/.banyan/workit.json`.
+
 Both expected fields remain optional for older CLI callers. Workit checks them
 in the atomic revision update. Either mismatch fails without changing the job
 or projecting anything. Success returns the resulting job as JSON, including
