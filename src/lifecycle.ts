@@ -69,6 +69,10 @@ export const digest = (value: string): string => createHash("sha256").update(val
 export const terminalStage = (stage: Stage): boolean => ["verified", "cancelled"].includes(stage);
 export const runnableStage = (stage: Stage): boolean => !terminalStage(stage) && !["paused", "needs-you"].includes(stage);
 export const sha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{40}$/i.test(value);
+export function dependencyIdentity(job: Job, kind: "deployment" | "provenance"): string | undefined {
+  const key = job.config.deploymentDependency;
+  return typeof key === "string" && key.trim() ? digest(kind + "\n" + key).slice(0, 20) : undefined;
+}
 export function sanitizedDetail(value: string): string {
   return value.replace(/https?:\/\/[^\s]+/gi, "[URL]")
     .replace(/(?:bearer\s+|(?:token|secret|password|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, "[credential]")
@@ -78,8 +82,27 @@ export function sanitizedDetail(value: string): string {
 
 export function acceptanceCriteria(body: string): string[] {
   const section = body.split(/^##\s+Acceptance Criteria\s*$/im)[1]?.split(/^##\s+/m)[0] ?? "";
-  return [...section.matchAll(/^\s*-\s+\[[ xX]\]\s+(.+(?:\n(?!\s*-\s+\[[ xX]\]|\s*$)[ \t]+.+)*)/gm)]
-    .map(match => match[1].trim());
+  const criteria: string[] = [];
+  let current: string[] | undefined;
+  let indentation = 0;
+  const finish = () => {
+    if (current) criteria.push(current.join("\n").trim());
+    current = undefined;
+  };
+  for (const line of section.split(/\r?\n/)) {
+    const checkbox = line.match(/^([ \t]*)-\s+\[[ xX]\]\s+(.+)$/);
+    if (checkbox) {
+      finish(); current = [checkbox[2]]; indentation = checkbox[1].length;
+    } else if (current) {
+      // Markdown list items may contain multiple paragraphs. Keep all indented
+      // requirements in both the scope check and AC binding across blank lines.
+      if (!line.trim()) current.push("");
+      else if (line.match(/^[ \t]*/)![0].length > indentation) current.push(line);
+      else finish();
+    }
+  }
+  finish();
+  return criteria;
 }
 export function acceptance(body: string): { acHash: string; acLabels: string[] } {
   const lines = acceptanceCriteria(body);
@@ -268,7 +291,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.facts;
       }
       job.pr = patch.pr;
     }
@@ -499,7 +522,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           current.detail = sanitizedDetail(error instanceof Error ? error.message : "Heartbeat failed");
           current.blocker = { reason: error instanceof SourceProvenanceError ? "source-provenance" : /uncertain/.test(current.detail) ? "uncertain-delivery" : "runner-error",
             owner: error instanceof SourceProvenanceError ? "external" : /uncertain/.test(current.detail) ? "owner" : "system",
-            dependency: error instanceof SourceProvenanceError ? digest("provenance\n" + (current.config.deploymentDependency ?? current.repoRoot)).slice(0, 20) : undefined,
+            dependency: error instanceof SourceProvenanceError ? dependencyIdentity(current, "provenance") : undefined,
             observedAt: now.toISOString(), recheckTrigger: error instanceof SourceProvenanceError ? "serving-provenance-repaired" : "tool-repaired-or-inspected-recovery",
             nextAction: error instanceof SourceProvenanceError ? "Repair the runtime's actual serving source/version probe; health alone cannot establish acceptance" : "Inspect tool authentication, local logs and delivery receipts before retrying" };
           if (error instanceof WorkflowRefusedError) {

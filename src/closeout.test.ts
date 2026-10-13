@@ -353,3 +353,52 @@ test("local fixture/documentation contracts can describe deployed and human gate
     "`[code:owner]` Documentation describes the flow; human acceptance is required.",
   ]) assert.throws(() => assertLocalAcceptance(`## Acceptance Criteria\n- [ ] ${requirement}\n- [ ] \`[code:types]\` Types exist.`), /cannot bypass/);
 });
+
+test("acceptance-scope-preserved: separated AC paragraphs stay bound and cannot hide runtime or human obligations", t => {
+  const { store, job } = fixture(t, "deployed");
+  for (const obligation of ["Run the deployed journey.", "Obtain owner acceptance."]) {
+    const changed = { ...issue, body: `## Acceptance Criteria\n- [ ] \`[test:cli]\` The CLI fixture passes.\n\n  ${obligation}\n- [ ] \`[code:types]\` Types exist.` };
+    const binding = acceptance(changed.body);
+    assert.notEqual(binding.acHash, acceptance(changed.body.replace(obligation, "The isolated fixture passes.")).acHash);
+    assert.throws(() => correctAcceptance(store, job.id, { profile: "local", reason: "Local checks", expectedRevision: job.revision,
+      expectedAcHash: binding.acHash }, changed, at), /cannot bypass/);
+    assert.deepEqual(store.get(job.id), job);
+  }
+});
+
+test("follow-up PR checkpoints discard readiness and merge facts from the previous PR", t => {
+  const { store, job } = fixture(t);
+  store.update(job.id, current => {
+    current.facts = { pr: { fingerprint: "previous", merged: true, mergeSha, ready: false }, observedAt: at.toISOString(), nextCheckAt: at.toISOString() };
+  }, at);
+  const next = checkpoint(store, job.id, { stage: "waiting-ci", pr: "https://github.com/example/project/pull/43", detail: "Follow-up repair" }, at);
+  assert.equal(next.facts, undefined);
+  assert.equal(next.mergeSha, undefined);
+  assert.doesNotMatch(readableAttention(attention([next])), /PR merged/);
+});
+
+test("blocker-grouping: unconfigured dependencies in one repository remain separate until explicitly shared", t => {
+  const { job } = fixture(t, "deployed");
+  const first = { ...job, deployment: undefined, stage: "waiting-deploy" as const };
+  const second = { ...structuredClone(first), id: "second" };
+  const view = attention([first, second]);
+  assert.equal(view.items.filter(item => item.reason === "external-wait").length, 2);
+  first.config.deploymentDependency = "shared-fixture-runtime";
+  second.config.deploymentDependency = "shared-fixture-runtime";
+  const shared = attention([first, second]);
+  assert.equal(shared.items.filter(item => item.reason === "external-wait").length, 1);
+});
+
+test("blocker-grouping: stale serving bindings use the configured shared provenance dependency", async t => {
+  const { store, job, adapter, run } = fixture(t, "deployed");
+  store.update(job.id, current => { current.config.deploymentDependency = "shared-fixture-runtime"; }, at);
+  const second = { ...structuredClone(store.get(job.id)), id: "second", sessionID: "second-implementer" };
+  store.insert(second);
+  adapter.deploy = { ...deployment, version: "serving-2" };
+  await run();
+  const view = attention(store.list());
+  assert.equal(view.items.filter(item => item.reason === "source-provenance").length, 1);
+  assert.deepEqual(view.items[0].jobIDs.sort(), [job.id, second.id].sort());
+  assert.equal(adapter.launches.length, 0);
+  assert.equal(adapter.wakes.length, 0);
+});

@@ -148,10 +148,11 @@ readiness as current. Paused jobs receive only observation/projection work.
 Set the same trusted `lifecycle.deploymentDependency` key on jobs that genuinely
 share a deployment/provenance dependency. Workit groups matching blocker types
 using a digest of that key; attention does not expose the configured key, probe
-argv, deployment targets or credentials. Unconfigured dependencies default to
-repository scope. Unrelated configured keys remain separate. A healthy runtime
-without its built source/version is an external repair dependency, never an
-accepted journey. This workflow does not modify downstream deployment code.
+argv, deployment targets or credentials. Unconfigured dependencies remain
+separate per job until explicitly configured as shared. Unrelated configured
+keys remain separate. A healthy runtime without its built source/version is an
+external repair dependency, never an accepted journey. This workflow does not
+modify downstream deployment code.
 
 ## Optional independent verifier dispatch
 
@@ -344,7 +345,8 @@ Example report (labels and hashes must match job status):
 
 AC labels use `[test:journey-contract]`-style tags. Unlabeled checkboxes receive
 stable content hashes shown in job status. Checked/unchecked changes preserve
-the AC hash; contract edits invalidate it. Every AC must occur exactly once with
+the AC hash; contract edits invalidate it, including indented requirements in
+separate paragraphs within a criterion. Every AC must occur exactly once with
 passing evidence. Deployed acceptance needs applicable journey evidence bound to
 the observed target/version. Completion rechecks the merged PR, current ACs,
 tracker completion and serving deployment. A changed serving version requires

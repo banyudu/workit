@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { acceptance, acceptanceCriteria, assertLocalAcceptance, digest, issueFinished, requiresHuman, runnableStage, sha, terminalStage, validateReport,
+import { acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, requiresHuman, runnableStage, sha, terminalStage, validateReport,
   type Blocker, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
@@ -87,7 +87,7 @@ export function jobBlockers(job: Job): Blocker[] {
   else if (job.mergeSha) {
     if (job.config.verification !== "local" && !job.deployment) result.push(blocker(job, "external-wait", "external",
       "Wait for the authorized deployment and its serving source/version probe", "deployment-probe-change",
-      digest("deployment\n" + (job.config.deploymentDependency ?? job.repoRoot)).slice(0, 20)));
+      dependencyIdentity(job, "deployment")));
     else result.push(blocker(job, "missing-verifier", "verifier", "Submit an independent complete report with job verify, or opt in to trusted verifier dispatch", "independent-report"));
   } else if (job.facts?.pr && !job.facts.pr.merged) {
     result.push(blocker(job, job.facts.pr.ready ? "acceptance-decision" : "external-wait", job.facts.pr.ready ? "owner" : "external",
@@ -164,7 +164,8 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   };
   const wait = (reason: Blocker["reason"], owner: Blocker["owner"], nextAction: string, trigger: string, result: string) => {
     save(current => {
-      current.blocker = { reason, owner, nextAction, recheckTrigger: trigger, observedAt: now.toISOString() };
+      current.blocker = { reason, owner, nextAction, recheckTrigger: trigger, observedAt: now.toISOString(),
+        dependency: reason === "source-provenance" ? dependencyIdentity(current, "provenance") : undefined };
       current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
     });
     return result;
