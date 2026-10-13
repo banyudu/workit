@@ -87,6 +87,31 @@ goal instruction and asks agents not to add native goals or schedules. Handle an
 already-active unrelated goal explicitly before onboarding that conversation.
 Workit does not pick additional backlog issues.
 
+## Owner pause bridge
+
+Banyan's owner-pause action must use this exact contract, supplying the revision
+and session from the displayed job:
+
+```text
+workit job pause JOB_ID --detail TEXT --expected-revision N --expected-session-id SESSION_ID
+```
+
+Both expected fields remain optional for older CLI callers. Workit checks them
+in the atomic revision update. Either mismatch fails without changing the job
+or projecting anything. Success returns the resulting job as JSON, including
+`projection: {status, sessionID, revision}`. `status` is `confirmed` when the
+Banyan projection command succeeds and `pending` when the durable pause saved
+but projection failed. The heartbeat retries projection even for held jobs.
+The UI must keep the terminal open until it observes the matching job/session,
+revision and paused workflow in Banyan; a durable pause alone is insufficient.
+
+Pause removes future continuation scheduling and preserves the issue, acceptance
+history and pending wake audit. It does not verify or cancel the issue, interrupt
+an active turn or close a process. If a pending wake exists, inspect the original
+conversation and run `job reconcile` before explicitly resuming. Reconciliation
+also supports paused jobs and leaves the hold in place. Workit never treats an
+uncertain delivery as permission to dispatch a fresh conversation.
+
 ## Checkpoints and recovery
 
 The prompt includes the exact initiating CLI/state-directory invocation; use it

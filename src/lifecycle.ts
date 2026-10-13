@@ -168,12 +168,17 @@ export function processIsAlive(identity: string): boolean {
 
 export function checkpoint(store: JobStore, id: string, patch: {
   stage: Stage; detail: string; after?: number; pr?: string; mergeSha?: string;
+  expectedRevision?: number; expectedSessionID?: string;
 }, now = new Date()): Job {
   if (!stages.includes(patch.stage)) throw new Error("Unknown lifecycle stage");
   if (patch.stage === "verified") throw new Error("Use job verify with a verification report");
   if (patch.after !== undefined && (!Number.isSafeInteger(patch.after) || patch.after < 1)) throw new Error("--after must be positive seconds");
   if (patch.mergeSha !== undefined && !sha(patch.mergeSha)) throw new Error("--merge-sha must be a full commit SHA");
+  if (patch.expectedRevision !== undefined && (!Number.isSafeInteger(patch.expectedRevision) || patch.expectedRevision < 0)) throw new Error("--expected-revision must be a non-negative integer");
+  if (patch.expectedSessionID !== undefined && !patch.expectedSessionID.trim()) throw new Error("--expected-session-id must be non-empty");
   return store.update(id, job => {
+    if (patch.expectedRevision !== undefined && job.revision !== patch.expectedRevision) throw new Error("Job revision mismatch; reread before pausing");
+    if (patch.expectedSessionID !== undefined && job.sessionID !== patch.expectedSessionID) throw new Error("Job session binding mismatch; reread before pausing");
     if (terminalStage(job.stage)) throw new Error("Finished jobs cannot be restarted or rewritten");
     if (["paused", "needs-you"].includes(job.stage) && !["paused", "needs-you", "cancelled"].includes(patch.stage)) {
       throw new Error("Use job resume to release a pause or human gate");
@@ -195,7 +200,9 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
-    delete job.fingerprint; delete job.claim; delete job.wake;
+    delete job.fingerprint; delete job.claim;
+    // A hold must retain pending delivery evidence for inspected recovery.
+    if (runnableStage(job.stage)) delete job.wake;
     if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? 60) * 1000).toISOString();
     else delete job.nextWakeAt;
   }, now);

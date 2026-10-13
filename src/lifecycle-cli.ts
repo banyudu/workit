@@ -16,9 +16,9 @@ function options(args: string[]): Record<string, string> {
 function only(values: Record<string, string>, allowed: string[]): void {
   for (const key of Object.keys(values)) if (!allowed.includes(key)) throw new Error("Unknown option " + key);
 }
-async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<void> {
-  try { await adapter.project(job); store.acknowledgeProjection(job); }
-  catch { console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); }
+async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<"confirmed" | "pending"> {
+  try { await adapter.project(job); store.acknowledgeProjection(job); return "confirmed"; }
+  catch { console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); return "pending"; }
 }
 export async function lifecycleCLI(args: string[]): Promise<void> {
   if (args[0] === "heartbeat") { heartbeatCLI(args.slice(1)); return; }
@@ -27,7 +27,8 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
 workit job list
 workit job status ID
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS]
-workit job pause|cancel ID --detail TEXT
+workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
+workit job cancel ID --detail TEXT
 workit job resume ID [--detail TEXT]
 workit job reconcile ID --delivery delivered|not-delivered --detail TEXT
 workit job verify ID --report PATH
@@ -56,6 +57,7 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
   if (!id) throw new Error("workit job requires an action and job ID; see workit job --help");
   const values = options(rest);
   let job: Job;
+  let projection: "confirmed" | "pending" | undefined;
   switch (action) {
     case "status":
       only(values, []); job = store.get(id); break;
@@ -68,14 +70,18 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       await project(store, adapter, job); break;
     case "pause":
     case "cancel":
-      only(values, ["--detail"]);
+      only(values, action === "pause" ? ["--detail", "--expected-revision", "--expected-session-id"] : ["--detail"]);
       if (!values["--detail"]?.trim()) throw new Error("--detail is required for pause/cancel");
-      job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"] });
-      await project(store, adapter, job); break;
+      if (values["--expected-revision"] !== undefined && !/^\d+$/.test(values["--expected-revision"])) throw new Error("--expected-revision must be a non-negative integer");
+      job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"],
+        expectedRevision: values["--expected-revision"] === undefined ? undefined : Number(values["--expected-revision"]),
+        expectedSessionID: values["--expected-session-id"] });
+      projection = await project(store, adapter, job); break;
     case "resume":
       only(values, ["--detail"]);
       job = store.update(id, current => {
         if (!["paused", "needs-you"].includes(current.stage)) throw new Error("Only paused/human-blocked jobs can be resumed");
+        if (current.wake) throw new Error("Pending wake requires inspected job reconcile before resume");
         current.stage = current.deployment || (current.mergeSha && current.config.verification === "local") ? "verifying"
           : current.mergeSha ? "waiting-deploy" : current.pr ? "waiting-ci" : "implementing";
         current.detail = values["--detail"] ?? "Explicitly resumed";
@@ -87,7 +93,7 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       only(values, ["--delivery", "--detail"]);
       const expected = store.get(id);
       const outcome = values["--delivery"];
-      if (expected.stage !== "needs-you" || !expected.wake ||
+      if (!["paused", "needs-you"].includes(expected.stage) || !expected.wake ||
           !["delivered", "not-delivered"].includes(outcome) || !values["--detail"]?.trim()) {
         throw new Error("Inspect the original conversation first; reconcile requires a human-blocked pending wake, --delivery and --detail");
       }
@@ -129,7 +135,7 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
     }
     default: throw new Error("Unknown job action; see workit job --help");
   }
-  console.log(JSON.stringify(job, null, 2));
+  console.log(JSON.stringify(projection ? { ...job, projection: { status: projection, sessionID: job.sessionID, revision: job.revision } } : job, null, 2));
 }
 
 export function managedInstructions(job: Job): string[] {
