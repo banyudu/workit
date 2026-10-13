@@ -107,6 +107,14 @@ checkpoints cannot bypass pause/human gates. Pause/cancel stop future automatic
 continuations; use Banyan's interrupt control to stop an active turn. They do not
 roll back completed effects.
 
+Banyan's **Pause and Close** uses `workit job pause JOB_ID --detail TEXT
+--expected-revision N --expected-session-id SESSION_ID`. Both optional guards
+are checked inside the atomic job update; stale revisions or session bindings
+leave the job unchanged. The JSON acknowledgement identifies the paused job,
+session and newer revision. Configure Banyan's trusted invocation and owning
+state directory in `~/.banyan/workit.json`. A pause retains pending wake
+evidence; inspect and reconcile that delivery before explicitly resuming.
+
 Jobs live in private `~/.local/state/workit/lifecycle.sqlite`, independently of
 worktree GC. `WORKIT_STATE_DIR` selects an alternative. SQLite transactions and
 revisions prevent competing ticks from claiming a job. Claims include process

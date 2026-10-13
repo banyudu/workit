@@ -27,7 +27,8 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
 workit job list
 workit job status ID
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS]
-workit job pause|cancel ID --detail TEXT
+workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
+workit job cancel ID --detail TEXT
 workit job resume ID [--detail TEXT]
 workit job reconcile ID --delivery delivered|not-delivered --detail TEXT
 workit job verify ID --report PATH
@@ -68,14 +69,18 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       await project(store, adapter, job); break;
     case "pause":
     case "cancel":
-      only(values, ["--detail"]);
+      only(values, action === "pause" ? ["--detail", "--expected-revision", "--expected-session-id"] : ["--detail"]);
       if (!values["--detail"]?.trim()) throw new Error("--detail is required for pause/cancel");
-      job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"] });
+      if (values["--expected-revision"] !== undefined && !/^\d+$/.test(values["--expected-revision"])) throw new Error("--expected-revision must be a non-negative integer");
+      job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"],
+        expectedRevision: values["--expected-revision"] === undefined ? undefined : Number(values["--expected-revision"]),
+        expectedSessionID: values["--expected-session-id"] });
       await project(store, adapter, job); break;
     case "resume":
       only(values, ["--detail"]);
       job = store.update(id, current => {
         if (!["paused", "needs-you"].includes(current.stage)) throw new Error("Only paused/human-blocked jobs can be resumed");
+        if (current.wake) throw new Error("Pending wake requires inspected job reconcile before resume");
         current.stage = current.deployment || (current.mergeSha && current.config.verification === "local") ? "verifying"
           : current.mergeSha ? "waiting-deploy" : current.pr ? "waiting-ci" : "implementing";
         current.detail = values["--detail"] ?? "Explicitly resumed";
@@ -87,9 +92,9 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       only(values, ["--delivery", "--detail"]);
       const expected = store.get(id);
       const outcome = values["--delivery"];
-      if (expected.stage !== "needs-you" || !expected.wake ||
+      if (!["paused", "needs-you"].includes(expected.stage) || !expected.wake ||
           !["delivered", "not-delivered"].includes(outcome) || !values["--detail"]?.trim()) {
-        throw new Error("Inspect the original conversation first; reconcile requires a human-blocked pending wake, --delivery and --detail");
+        throw new Error("Inspect the original conversation first; reconcile requires a paused/human-blocked pending wake, --delivery and --detail");
       }
       await adapter.project(expected);
       await adapter.reconcile(expected, outcome, values["--detail"]);
