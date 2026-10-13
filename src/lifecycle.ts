@@ -30,7 +30,8 @@ export interface Job {
   pr?: string; mergeSha?: string; deployment?: Deployment;
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
-  wake?: { id: string; reason: string; revision: number };
+  // Older pending wakes already charged wakeups when they were reserved.
+  wake?: { id: string; reason: string; revision: number; counted?: boolean };
   verification?: VerificationReport;
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
 }
@@ -241,6 +242,10 @@ export interface Session {
   workflow?: { owner: string; jobID: string; revision: number; state: string; wake?: { id: string; status: string } };
 }
 export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean }
+export class WorkflowRefusedError extends Error {
+  readonly code = "workflow_refused";
+  override name = "WorkflowRefusedError";
+}
 export interface LifecycleAdapter {
   session(job: Job): Promise<Session | undefined>;
   project(job: Job): Promise<void>;
@@ -279,11 +284,11 @@ function prompt(job: Job, reason: string): string {
 /** A heartbeat inspects due jobs; only actionable changes spend an agent turn. */
 export async function tick(store: JobStore, adapter: LifecycleAdapter, options: {
   now?: Date; process?: string; alive?: (identity: string) => boolean; jobID?: string;
-} = {}): Promise<Array<{ id: string; result: string }>> {
+} = {}): Promise<Array<{ id: string; result: string; detail?: string }>> {
   const now = options.now ?? new Date();
   const owner = options.process ?? processIdentity();
   const alive = options.alive ?? processIsAlive;
-  const results: Array<{ id: string; result: string }> = [];
+  const results: Array<{ id: string; result: string; detail?: string }> = [];
   for (const candidate of store.list()) {
     if (options.jobID && candidate.id !== options.jobID) continue;
     // Project pause/cancel/completion too; it must survive an app outage.
@@ -327,7 +332,10 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       if (job.wake) {
         const receipt = session.workflow?.wake;
         if (receipt?.id === job.wake.id && receipt.status === "delivered") {
-          save(current => { delete current.wake; current.errors = 0; });
+          save(current => {
+            if (current.wake?.counted === false) current.wakeups++;
+            delete current.wake; current.errors = 0;
+          });
           results.push({ id: job.id, result: "wake-reconciled" }); continue;
         }
         if (receipt?.id === job.wake.id && receipt.status !== "not-delivered") {
@@ -362,11 +370,12 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         save(current => { current.errors = 0; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
         results.push({ id: job.id, result: "unchanged" }); continue;
       }
-      if (job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
-      if (!job.wake) save(current => { current.wake = { id: randomUUID(), reason, revision: current.revision + 1 }; current.wakeups++; });
+      if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
+      if (!job.wake) save(current => { current.wake = { id: randomUUID(), reason, revision: current.revision + 1, counted: false }; });
       await adapter.project(job);
       await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
+        if (current.wake?.counted === false) current.wakeups++;
         delete current.wake; current.errors = 0;
         current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
       });
@@ -374,13 +383,19 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
     } catch (error) {
       try {
         save(current => {
-          current.errors++;
           current.detail = error instanceof Error ? error.message : "Heartbeat failed";
+          if (error instanceof WorkflowRefusedError) {
+            current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+            return;
+          }
+          current.errors++;
           if (current.errors >= (current.config.maxErrors ?? 5) || /uncertain|budget exhausted/.test(current.detail)) {
             current.stage = "needs-you"; delete current.nextWakeAt;
           } else current.nextWakeAt = new Date(now.getTime() + Math.min(900, 60 * 2 ** (current.errors - 1)) * 1000).toISOString();
         });
-        results.push({ id: job.id, result: job.stage === "needs-you" ? "needs-you" : "retry" });
+        results.push(error instanceof WorkflowRefusedError
+          ? { id: job.id, result: "workflow-refused", detail: job.detail }
+          : { id: job.id, result: job.stage === "needs-you" ? "needs-you" : "retry" });
       } catch { results.push({ id: candidate.id, result: "checkpoint-changed" }); }
     } finally {
       try { save(current => { delete current.claim; }); await adapter.project(job); store.acknowledgeProjection(job); } catch { /* next tick reconciles projection */ }

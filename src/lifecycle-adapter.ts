@@ -3,17 +3,39 @@ import { promisify } from "node:util";
 import { fetchIssue } from "./issue.js";
 import { resolveConfig } from "./config.js";
 import { originRemote } from "./git.js";
-import { digest, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session } from "./lifecycle.js";
+import { WorkflowRefusedError, digest, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session } from "./lifecycle.js";
 
 const exec = promisify(execFile);
+function workflowRefusal(value: unknown): WorkflowRefusedError | undefined {
+  const response = value as { ok?: unknown; error?: { code?: unknown; message?: unknown } } | null;
+  if (response?.ok === false && response.error?.code === "workflow_refused" &&
+      typeof response.error.message === "string" && response.error.message.trim()) {
+    return new WorkflowRefusedError(response.error.message);
+  }
+}
 export async function commandJSON(command: string[], cwd: string, extraEnv: Record<string, string> = {}): Promise<unknown> {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv, NO_COLOR: "1", CLICOLOR: "0" };
   delete env.CLICOLOR_FORCE; delete env.FORCE_COLOR; delete env.GH_FORCE_TTY;
   let stdout: string;
   try {
     ({ stdout } = await exec(command[0], command.slice(1), { cwd, env, encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
-  } catch { throw new Error(`${command[0]} failed or timed out; inspect its authentication and local logs`); }
-  try { return JSON.parse(stdout); } catch { throw new Error(`${command[0]} did not return JSON`); }
+  } catch (error) {
+    const failure = error as { code?: string | number; killed?: boolean; signal?: string; stdout?: string; stderr?: string };
+    // A timeout/signal or HTTP 5xx remains a failure even if stdout contains a refusal.
+    if (command[1] === "workflow" && typeof failure.code === "number" && !failure.killed && !failure.signal &&
+        !/\bHTTP 5\d\d\b/i.test(failure.stderr ?? "")) {
+      let value: unknown;
+      try { value = JSON.parse(failure.stdout ?? ""); } catch { /* genuine command failure */ }
+      const refusal = workflowRefusal(value);
+      if (refusal) throw refusal;
+    }
+    throw new Error(`${command[0]} failed or timed out; inspect its authentication and local logs`);
+  }
+  let value: unknown;
+  try { value = JSON.parse(stdout); } catch { throw new Error(`${command[0]} did not return JSON`); }
+  const refusal = command[1] === "workflow" ? workflowRefusal(value) : undefined;
+  if (refusal) throw refusal;
+  return value;
 }
 
 export function githubRepository(remote?: string): string {

@@ -17,6 +17,13 @@ const value = key => args[args.indexOf(key) + 1];
 const name = path.basename(process.argv[1]);
 let output;
 if (name === "banyanctl") {
+  if (args[0] === "workflow" && args[1] === fixture.refusal?.operation) {
+    fixture.attempts.push(value("--wake-id"));
+    fs.writeFileSync(file, JSON.stringify(fixture));
+    process.stdout.write(JSON.stringify({ok: false, error: {code: "workflow_refused", message: fixture.refusal.message}}));
+    process.stderr.write("banyanctl: server returned HTTP 409\n");
+    process.exit(75);
+  }
   if (args[0] === "session" && args[1] === "list") output = {workflowProtocol: 1, sessions: [fixture.session]};
   else if (args[1] === "set") {
     const previous = fixture.session.workflow || {};
@@ -110,4 +117,54 @@ test("GitHub remote normalization strips .git without losing repository scope", 
   assert.equal(githubRepository("git@github.com:example/project.git"), "example/project");
   assert.equal(githubRepository("https://github.com/example/project"), "example/project");
   assert.throws(() => githubRepository("https://example.invalid/project"));
+});
+
+test("real adapter refusals survive restart, appear in status and heartbeat logs, and retry the same wake", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "workit-refusal-"));
+  const savedEnv = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const cli = join(directory, "banyanctl");
+  writeFileSync(cli, fake, { mode: 0o700 });
+  const file = join(directory, "fixture.json");
+  Object.assign(process.env, { WORKIT_FIXTURE_FILE: file, WORKIT_STATE_DIR: join(directory, "state"), WORKIT_BANYANCTL: cli });
+  const logs: string[] = [];
+  t.mock.method(console, "log", (value: string) => logs.push(value));
+  const store = new JobStore();
+  const adapter = new BanyanLifecycleAdapter(cli);
+  for (const [index, operation] of ["set", "wake"].entries()) {
+    const message = operation === "set" ? "stale workflow revision" : "workflow is needs-you";
+    const job = createJob({ issue: { backend: "github", identifier: String(index), title: "Resume", labels: [],
+      url: `https://github.com/example/project/issues/${index + 1}`,
+      body: "## Acceptance Criteria\n- [ ] `[test:retry]` Retry succeeds.\n- [ ] `[code:detail]` Refusal is visible." },
+      repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "codex",
+      config: { verification: "local", intervalSeconds: 17, maxWakeups: 1, maxErrors: 2 },
+      now: new Date(Date.now() - 60_000) });
+    store.insert(job);
+    writeFileSync(file, JSON.stringify({ session: { id: job.sessionID, cwd: directory, status: "idle" },
+      refusal: { operation, message }, attempts: [], wakes: [] }));
+    await lifecycleCLI(["tick", "--job", job.id]);
+    assert.deepEqual(JSON.parse(logs.at(-1)!), [{ id: job.id, result: "workflow-refused", detail: message }]);
+    await lifecycleCLI(["job", "status", job.id]);
+    assert.equal(JSON.parse(logs.at(-1)!).detail, message);
+    const current = new JobStore().get(job.id);
+    assert.equal(current.stage, "implementing");
+    assert.equal(current.errors, 0);
+    assert.equal(current.wakeups, 0);
+    assert.equal(current.nextWakeAt, new Date(Date.parse(current.updatedAt) + 17_000).toISOString());
+    assert.ok(current.wake);
+    await tick(store, adapter, { now: new Date(current.nextWakeAt!), jobID: job.id });
+    assert.equal(store.get(job.id).wake!.id, current.wake.id);
+    assert.equal(store.get(job.id).stage, "implementing");
+    const fixture = JSON.parse(readFileSync(file, "utf8"));
+    delete fixture.refusal;
+    writeFileSync(file, JSON.stringify(fixture));
+    await tick(store, adapter, { now: new Date(store.get(job.id).nextWakeAt!), jobID: job.id });
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).wakes, [current.wake.id]);
+    assert.equal(store.get(job.id).wake, undefined);
+    assert.equal(store.get(job.id).wakeups, 1);
+  }
 });

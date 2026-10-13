@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, acceptance, checkpoint, createJob, tick, validateReport, workflowState,
+import { JobStore, WorkflowRefusedError, acceptance, checkpoint, createJob, tick, validateReport, workflowState,
   type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerificationReport } from "./lifecycle.js";
 import { heartbeatPlist } from "./heartbeat.js";
 
@@ -154,6 +154,79 @@ test("a proven pre-delivery refusal retries the same persisted wake", async t =>
   assert.notEqual(store.get(job.id).stage, "needs-you");
 });
 
+test("workflow_refused keeps a changed-review wake runnable without spending either budget", async t => {
+  for (const operation of ["project", "wake"] as const) {
+    const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 2, maxWakeups: 1 });
+    checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
+    await run();
+    adapter.snapshot.fingerprint = "review-added";
+    const original = { project: adapter.project, wake: adapter.wake };
+    const attempts: string[] = [];
+    const message = operation === "project" ? "stale workflow revision" : "agent is busy, unobserved, or awaiting human input";
+    adapter[operation] = async current => {
+      if (current.wake) attempts.push(current.wake.id);
+      throw new WorkflowRefusedError(message);
+    };
+    let wakeID: string | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const at = new Date(store.get(job.id).nextWakeAt!);
+      const result = await run(at);
+      const current = store.get(job.id);
+      assert.equal(current.stage, "waiting-ci");
+      assert.equal(current.errors, 0);
+      assert.equal(current.wakeups, 0);
+      assert.equal(current.detail, message);
+      assert.equal(current.claim, undefined);
+      assert.equal(current.nextWakeAt, new Date(at.getTime() + 17_000).toISOString());
+      assert.ok(current.wake);
+      wakeID ??= current.wake.id;
+      assert.equal(current.wake.id, wakeID);
+      assert.equal(current.wake.reason, "PR checks or reviews changed");
+      assert.deepEqual(result, [{ id: job.id, result: "workflow-refused", detail: message }]);
+    }
+    assert.ok(attempts.every(id => id === wakeID));
+    assert.equal(adapter.wakes.length, 0);
+    Object.assign(adapter, original);
+    await run(new Date(store.get(job.id).nextWakeAt!));
+    assert.deepEqual(adapter.wakes, [wakeID]);
+    assert.equal(store.get(job.id).wakeups, 1);
+    assert.equal(store.get(job.id).wake, undefined);
+    adapter.snapshot.ready = true;
+    await run(new Date(store.get(job.id).nextWakeAt!));
+    assert.equal(store.get(job.id).stage, "needs-you");
+    assert.equal(adapter.wakes.length, 1);
+  }
+});
+
+test("a lost delivery response charges the wakeup budget exactly once when reconciled", async t => {
+  const { store, job, adapter, run } = fixture(t, { maxWakeups: 1 });
+  adapter.loseResponse = true;
+  await run();
+  assert.equal(store.get(job.id).wakeups, 0);
+  assert.ok(store.get(job.id).wake);
+  await run(new Date(store.get(job.id).nextWakeAt!));
+  assert.equal(store.get(job.id).wakeups, 1);
+  assert.equal(store.get(job.id).errors, 0);
+  assert.equal(store.get(job.id).wake, undefined);
+  assert.equal(adapter.wakes.length, 1);
+});
+
+test("legacy pending wakes retain their previously charged budget on retry or reconciliation", async t => {
+  for (const delivered of [false, true]) {
+    const { store, job, adapter, run } = fixture(t, { maxWakeups: 1 });
+    store.update(job.id, current => {
+      current.wakeups = 1;
+      current.wake = { id: "legacy-wake", revision: 0, reason: "resume" };
+    }, now);
+    if (delivered) adapter.current.workflow = { owner: "workit", jobID: job.id, revision: 0, state: "working",
+      wake: { id: "legacy-wake", status: "delivered" } };
+    await run();
+    assert.equal(store.get(job.id).wakeups, 1);
+    assert.equal(store.get(job.id).wake, undefined);
+    assert.equal(store.get(job.id).stage, "implementing");
+  }
+});
+
 test("busy, human-prompt, parked, frozen and closed sessions never receive wake input", async t => {
   for (const state of [{ status: "executing" }, { status: "need-input" }, { status: "asking" },
     { status: "closed" }, { status: "idle", isSuspended: true }, { status: "idle", isFrozen: true },
@@ -184,6 +257,25 @@ test("transient errors back off and become visible after a bounded number of ret
   }
   assert.equal(store.get(job.id).stage, "needs-you");
   assert.equal(store.get(job.id).nextWakeAt, undefined);
+});
+
+test("real wake failures still back off and park at maxErrors", async t => {
+  for (const message of ["timed out", "did not return JSON", "server unavailable", "server returned HTTP 503"]) {
+    const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 3, maxWakeups: 1 });
+    const ids: string[] = [];
+    adapter.wake = async (_job, id) => { ids.push(id); throw new Error(message); };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const at = new Date(store.get(job.id).nextWakeAt!);
+      await run(at);
+      const current = store.get(job.id);
+      assert.equal(current.errors, attempt);
+      assert.equal(current.detail, message);
+      assert.equal(current.stage, attempt < 3 ? "implementing" : "needs-you");
+      assert.equal(current.nextWakeAt, attempt < 3 ? new Date(at.getTime() + 60_000 * 2 ** (attempt - 1)).toISOString() : undefined);
+    }
+    assert.equal(ids.length, 3);
+    assert.ok(ids.every(id => id === ids[0]));
+  }
 });
 
 function report(job: Job): VerificationReport {
