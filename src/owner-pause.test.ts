@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { JobStore, createJob, tick } from "./lifecycle.js";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
 
-test("Banyan pause guards the durable job/session and retains pending wake evidence for recovery", async t => {
+test("owner-pause-contract: exact argv guards revision/session, returns projection status and retains uncertain wake audit", async t => {
   const directory = mkdtempSync(join(tmpdir(), "workit-pause-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const ctl = join(directory, "banyanctl");
@@ -19,7 +19,7 @@ test("Banyan pause guards the durable job/session and retains pending wake evide
     body: "## Acceptance Criteria\n- [ ] `[test:pause]` Pause persists.\n- [ ] `[code:contract]` Contract exists." },
     repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture",
     config: { verification: "local" } });
-  job.wake = { id: "uncertain-wake", reason: "unfinished work", revision: 0 };
+  job.wake = { id: "uncertain-wake", reason: "unfinished work", revision: 0, counted: false };
   job.claim = { token: "heartbeat-claim", process: "fixture-process" };
   job.lastRecovery = { wakeID: "previous-wake", outcome: "delivered", detail: "Inspected", at: job.createdAt };
   store.insert(job);
@@ -44,6 +44,7 @@ test("Banyan pause guards the durable job/session and retains pending wake evide
   assert.deepEqual(paused.wake, job.wake);
   assert.deepEqual(paused.issue, job.issue);
   assert.equal(paused.acHash, job.acHash);
+  assert.deepEqual(paused.projection, { status: "confirmed", sessionID: job.sessionID, revision: 1 });
   assert.deepEqual(paused.lastRecovery, job.lastRecovery);
   assert.equal(new JobStore(directory).get(job.id).projectedRevision, 1);
   const projected = JSON.parse(readFileSync(projectionPath, "utf8")) as string[];
@@ -56,7 +57,9 @@ test("Banyan pause guards the durable job/session and retains pending wake evide
 
   // A control outage retains the durable hold for Banyan's projection retry.
   writeFileSync(ctl, '#!/usr/bin/env node\nprocess.exit(69);\n', { mode: 0o700 });
-  assert.equal(pause("1", job.sessionID).stage, "paused");
+  const pending = pause("1", job.sessionID);
+  assert.equal(pending.stage, "paused");
+  assert.deepEqual(pending.projection, { status: "pending", sessionID: job.sessionID, revision: 2 });
   assert.equal(store.get(job.id).projectedRevision, 1);
   assert.equal(store.get(job.id).revision, 2);
   await tick(store, new BanyanLifecycleAdapter(ctl));

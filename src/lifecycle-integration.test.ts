@@ -50,6 +50,7 @@ process.stdout.write(JSON.stringify(output));
 
 test("real CLI/adapters drive deployment wait, version invalidation and evidence-backed closeout using private fixtures", async t => {
   const directory = mkdtempSync(join(tmpdir(), "workit-integration-"));
+  writeFileSync(join(directory, ".workit.yml"), "lifecycle:\n  verifier:\n    enabled: false\n");
   const savedEnv = { ...process.env };
   t.after(() => {
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];

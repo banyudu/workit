@@ -109,6 +109,7 @@ Options:
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
+  --acceptance local|deployed           Explicit per-job acceptance profile (managed only)
   --review / --no-review               Include/skip design guidance
   --instructions <text>                Append guidance to the issue prompt (repeatable)
   --no-instructions                    Drop the prompt guidance (auto-PR + review block)
@@ -165,6 +166,10 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--managed":
         options.managed = true;
+        break;
+      case "--acceptance":
+        options.acceptance = next() as "local" | "deployed";
+        if (!["local", "deployed"].includes(options.acceptance)) throw new Error("--acceptance requires local or deployed");
         break;
       case "--unmanaged":
         options.managed = false;
@@ -780,13 +785,15 @@ async function main(): Promise<void> {
         (options.target ?? config.launch?.target ?? "banyan") !== "banyan")) {
       throw new Error("Managed jobs require a prompted agent in Banyan");
     }
+    if (options.acceptance && !managed) throw new Error("--acceptance requires a managed launch");
     let job: ReturnType<typeof createJob> | undefined;
     let jobStore: JobStore | undefined;
     if (managed && !options.dryRun) {
       await new BanyanLifecycleAdapter().requireWorkflowSupport(root);
       jobStore = new JobStore();
       job = createJob({ issue, repoRoot: root, worktree: worktree.path,
-        githubRepo: githubRepository(remote), agent: selected.name, config: config.lifecycle });
+        githubRepo: githubRepository(remote), agent: selected.name,
+        config: config.lifecycle, acceptance: options.acceptance });
       job.controlCommand = [process.execPath, resolve(process.argv[1])];
       job.stateDirectory = dirname(jobStore.path);
       if (jobStore.list().some(existing => existing.id === job!.id)) {

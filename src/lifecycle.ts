@@ -4,6 +4,7 @@ import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IssueDetails } from "./types.js";
+import { coordinateVerification, refreshHeldFacts } from "./closeout.js";
 
 export const stages = ["implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
@@ -19,7 +20,22 @@ export interface LifecycleConfig {
   verification?: "deployed" | "local";
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
+  /** Trusted grouping key. Attention views expose only its digest. */
+  deploymentDependency?: string;
+  verifier?: { enabled?: boolean; agent?: string; concurrency?: number; maxAttempts?: number; timeoutSeconds?: number };
 }
+export interface Blocker {
+  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout";
+  owner: "owner" | "external" | "system" | "verifier";
+  dependency?: string; observedAt: string; recheckTrigger: string; nextAction: string;
+}
+export interface VerifierRun {
+  id: string; sessionID: string; agent: string; binding: string; reportPath: string; outcomePath: string;
+  state: "reserved" | "running" | "uncertain" | "failed" | "report-ready" | "accepted" | "invalidated";
+  reservedAt: string; startedAt?: string; timeoutSeconds: number;
+  delivery?: "delivered" | "not-delivered"; recovery?: { reason: string; at: string };
+}
+export interface VerifierPlan { enabled: boolean; agent?: string; command?: string; concurrency: number; maxAttempts: number; timeoutSeconds: number }
 export interface Job {
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
@@ -31,9 +47,15 @@ export interface Job {
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
   // Older pending wakes already charged wakeups when they were reserved.
-  wake?: { id: string; reason: string; revision: number; counted?: boolean };
+  wake?: { id: string; reason: string; revision: number; counted?: boolean; delivery?: "not-delivered" };
   verification?: VerificationReport;
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
+  acceptanceChangedAt?: string;
+  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string }>;
+  holdDetail?: string;
+  blocker?: Blocker;
+  facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
+  verifier?: VerifierRun; verifierHistory?: VerifierRun[]; verifierAttempts?: number;
 }
 export interface VerificationReport {
   jobID: string; issueURL: string; acHash: string; mergeSha: string; checkedAt: string;
@@ -47,15 +69,72 @@ export const digest = (value: string): string => createHash("sha256").update(val
 export const terminalStage = (stage: Stage): boolean => ["verified", "cancelled"].includes(stage);
 export const runnableStage = (stage: Stage): boolean => !terminalStage(stage) && !["paused", "needs-you"].includes(stage);
 export const sha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{40}$/i.test(value);
+export function dependencyIdentity(job: Job, kind: "deployment" | "provenance"): string | undefined {
+  const key = job.config.deploymentDependency;
+  return typeof key === "string" && key.trim() ? digest(kind + "\n" + key).slice(0, 20) : undefined;
+}
+export function sanitizedDetail(value: string): string {
+  return value.replace(/https?:\/\/[^\s]+/gi, "[URL]")
+    .replace(/(?:bearer\s+|(?:token|secret|password|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, "[credential]")
+    .replace(/(?:\/[\w.@~%-]+){2,}/g, "[path]")
+    .replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 600);
+}
 
-export function acceptance(body: string): { acHash: string; acLabels: string[] } {
+export function acceptanceCriteria(body: string): string[] {
   const section = body.split(/^##\s+Acceptance Criteria\s*$/im)[1]?.split(/^##\s+/m)[0] ?? "";
-  const lines = section.split("\n").filter(line => /^\s*-\s+\[[ xX]\]\s+/.test(line))
-    .map(line => line.replace(/^\s*-\s+\[[ xX]\]\s+/, "").trim());
+  const criteria: string[] = [];
+  let current: string[] | undefined;
+  let indentation = 0;
+  const finish = () => {
+    if (current) criteria.push(current.join("\n").trim());
+    current = undefined;
+  };
+  for (const line of section.split(/\r?\n/)) {
+    const checkbox = line.match(/^([ \t]*)-\s+\[[ xX]\]\s+(.+)$/);
+    if (checkbox) {
+      finish(); current = [checkbox[2]]; indentation = checkbox[1].length;
+    } else if (current) {
+      // Markdown list items may contain multiple paragraphs. Keep all indented
+      // requirements in both the scope check and AC binding across blank lines.
+      if (!line.trim()) current.push("");
+      else if (line.match(/^[ \t]*/)![0].length > indentation) current.push(line);
+      else finish();
+    }
+  }
+  finish();
+  return criteria;
+}
+export function acceptance(body: string): { acHash: string; acLabels: string[] } {
+  const lines = acceptanceCriteria(body);
   if (lines.length < 2) throw new Error("Managed issues need at least two Acceptance Criteria checkboxes");
   const acLabels = lines.map(line => line.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(line).slice(0, 12));
   if (new Set(acLabels).size !== acLabels.length) throw new Error("Acceptance Criteria labels must be unique");
   return { acHash: digest(lines.join("\n")), acLabels };
+}
+
+function localContractDescription(criterion: string): boolean {
+  const description = criterion.replace(/`?\[(?:test|code):[a-z0-9-]+\]`?/g, "").trim();
+  return /^(?:tests? (?:cover|reject|reconcile|group|establish|enforce|preserve)|a fixture\b|documentation (?:describes|documents|explains|lists)|document\b|describe\b)/i.test(description);
+}
+export function requiresDeployed(criterion: string): boolean {
+  if (/\[deploy(?::|\])/i.test(criterion)) return true;
+  // A fixture/documentation contract can describe deployed behavior without
+  // requiring runtime execution. Direct runtime instructions still take priority.
+  const directRuntime = /\b(?:run|runs|execute|executed|exercise|verify|verified|probe)\b[^.\n]{0,80}\b(?:deployed|production|staging|live runtime)\b/i.test(criterion);
+  const runtimeObligation = /\b(?:deployed|production|staging|serving[ -](?:version|bound|source|runtime))\b[^.\n]{0,100}\b(?:must|shall|required|passes?|succeeds?|completes?)\b|\b(?:must|shall|required)\b[^.\n]{0,100}\b(?:deployed|production|staging|serving)\b/i.test(criterion);
+  if (localContractDescription(criterion) && !directRuntime && !runtimeObligation) return false;
+  return /\[deploy(?::|\])|\bdeployed\b|\bserving[ -](?:version|source|bound|runtime)\b|\b(?:production|staging|live runtime)\b|\b(?:dev|development|remote|live) (?:environment|runtime|service|deployment)\b|\bjourney\b[^.\n]*\b(?:environment|deployment|runtime)\b/i.test(criterion);
+}
+export function requiresHuman(criterion: string): boolean {
+  if (/\[human(?::|\])/i.test(criterion)) return true;
+  if (localContractDescription(criterion) && !/\b(?:obtain|requires?|required|record|recorded|must|shall)\b[^.\n]{0,80}\b(?:human|owner|user) (?:acceptance|approval)\b|\b(?:human|owner|user) (?:acceptance|approval)\b[^.\n]{0,80}\b(?:must|shall|required)\b|\b(?:owner|human|operator|user) (?:approves|accepts|signs off)\b/i.test(criterion)) return false;
+  return /\[human(?::|\])|\b(?:human|manual|user) acceptance\b|\b(?:owner|human|operator|user) (?:approval|acceptance|approves|accepts|sign.off)\b/i.test(criterion);
+}
+export function assertLocalAcceptance(body: string): void {
+  acceptance(body);
+  if (acceptanceCriteria(body).some(line => requiresDeployed(line) || requiresHuman(line))) {
+    throw new Error("Local acceptance cannot bypass a current deployed or human AC; preserve its scope");
+  }
 }
 
 export function workflowState(stage: Stage): string {
@@ -67,14 +146,17 @@ export function workflowState(stage: Stage): string {
 export function createJob(input: {
   issue: IssueDetails; repoRoot: string; worktree: string; githubRepo: string; agent: string;
   config?: LifecycleConfig; now?: Date;
+  acceptance?: "local" | "deployed";
 }): Job {
   const now = (input.now ?? new Date()).toISOString();
   const id = digest(input.repoRoot + "\n" + input.issue.url).slice(0, 24);
-  const config = { verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config };
+  const config = { verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config,
+    ...(input.acceptance ? { verification: input.acceptance } : {}) };
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
   if (!["deployed", "local"].includes(config.verification)) throw new Error("Invalid lifecycle.verification");
+  if (config.verification === "local") assertLocalAcceptance(input.issue.body);
   if (config.deploymentProbe && (!Array.isArray(config.deploymentProbe) || !config.deploymentProbe.length ||
       config.deploymentProbe.some(arg => typeof arg !== "string" || !arg || arg.includes("\0")))) {
     throw new Error("lifecycle.deploymentProbe must be non-empty argv");
@@ -112,6 +194,19 @@ with sqlite3.connect(db, timeout=10) as connection:
         cursor = connection.execute("UPDATE jobs SET revision=?,data=? WHERE id=? AND revision=?",
             (job["revision"], json.dumps(job), job["id"], request["expected"]))
         print("true" if cursor.rowcount == 1 else "false")
+    elif op == "reserve-verifier":
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT data FROM jobs WHERE id=?", (request["job"]["id"],)).fetchone()
+        current = json.loads(row[0]) if row else None
+        active = sum(1 for row in connection.execute("SELECT data FROM jobs")
+            if json.loads(row[0]).get("verifier", {}).get("state") in ["reserved", "running", "uncertain", "invalidated"])
+        job = request["job"]
+        if current and current["revision"] == request["expected"] and active < request["limit"]:
+            connection.execute("UPDATE jobs SET revision=?,data=? WHERE id=? AND revision=?",
+                (job["revision"], json.dumps(job), job["id"], request["expected"]))
+            print("true")
+        else:
+            print("false")
 `;
 
 export class JobStore {
@@ -137,8 +232,17 @@ export class JobStore {
   list(): Job[] { return this.call("list", {}); }
   get(id: string): Job { const job = this.call<Job | null>("get", { id }); if (!job) throw new Error(`Unknown job '${id}'`); return job; }
   insert(job: Job): void { this.call("insert", { job }); }
-  acknowledgeProjection(job: Job): void {
-    this.call("cas", { expected: job.revision, job: { ...job, projectedRevision: job.revision } });
+  reserveVerifier(expected: Job, run: VerifierRun, concurrency: number, maxAttempts: number, now: Date): Job | undefined {
+    if (!runnableStage(expected.stage) || expected.stage !== "verifying" || expected.wake ||
+        (expected.verifier && expected.verifier.state !== "failed") || (expected.verifierAttempts ?? 0) >= maxAttempts) return undefined;
+    const job = structuredClone(expected);
+    if (job.verifier) (job.verifierHistory ??= []).push(job.verifier);
+    job.verifier = run; job.verifierAttempts = (job.verifierAttempts ?? 0) + 1;
+    job.revision++; job.updatedAt = now.toISOString();
+    return this.call<boolean>("reserve-verifier", { job, expected: expected.revision, limit: concurrency }) ? job : undefined;
+  }
+  acknowledgeProjection(job: Job): boolean {
+    return this.call("cas", { expected: job.revision, job: { ...job, projectedRevision: job.revision } });
   }
   update(id: string, change: (job: Job) => void, now = new Date()): Job {
     for (let attempt = 0; attempt < 10; attempt++) {
@@ -187,7 +291,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.facts;
       }
       job.pr = patch.pr;
     }
@@ -200,8 +304,10 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
+    delete job.blocker;
+    if (["paused", "needs-you"].includes(job.stage)) job.holdDetail = patch.detail;
     delete job.fingerprint; delete job.claim;
-    // Retain uncertain delivery evidence while the operator holds the job.
+    // A hold must retain pending delivery evidence for inspected recovery.
     if (runnableStage(job.stage)) delete job.wake;
     if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? 60) * 1000).toISOString();
     else delete job.nextWakeAt;
@@ -212,12 +318,12 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
   const report = value as VerificationReport;
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
-  if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || !report.reviewer?.independent || !report.reviewer.runID?.trim() ||
+  if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
       [job.id, job.sessionID].includes(report.reviewer.runID)) {
     throw new Error("Verification needs the merged source and an independent reviewer run");
   }
   const checked = Date.parse(report.checkedAt);
-  if (!Number.isFinite(checked) || checked < Date.parse(job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
+  if (!Number.isFinite(checked) || checked < Date.parse(job.acceptanceChangedAt ?? job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
   if (!Array.isArray(report.criteria) || report.criteria.length !== job.acLabels.length ||
       new Set(report.criteria.map(item => item.label)).size !== job.acLabels.length) throw new Error("Verification must cover every AC exactly once");
   for (const label of job.acLabels) {
@@ -227,13 +333,22 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
       throw new Error(`AC '${label}' lacks passing evidence`);
     }
   }
+  if (job.config.verification === "local") assertLocalAcceptance(currentBody);
   if (job.config.verification !== "local") {
     const matches = (value?: Deployment) => value && job.deployment &&
       ["environment", "target", "sourceSha", "version"].every(key => value[key as keyof Deployment] === job.deployment![key as keyof Deployment]);
     if (!matches(report.deployment) || !report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matches(entry.deployment)))) {
       throw new Error("Verification needs journey evidence for the observed deployment");
     }
+    acceptanceCriteria(currentBody).forEach((criterion, index) => {
+      if (requiresDeployed(criterion) && !report.criteria.find(item => item.label === job.acLabels[index])?.evidence.some(entry => entry.kind === "journey" && matches(entry.deployment))) {
+        throw new Error("Every deployed AC needs its own serving-bound journey evidence");
+      }
+    });
   }
+  acceptanceCriteria(currentBody).forEach((criterion, index) => {
+    if (requiresHuman(criterion) && !report.criteria.find(item => item.label === job.acLabels[index])?.evidence.some(entry => entry.kind === "human")) throw new Error("Human AC requires explicit human acceptance evidence");
+  });
   return report;
 }
 
@@ -248,11 +363,12 @@ export interface Session {
   needsRecovery?: boolean;
   workflow?: { owner: string; jobID: string; revision: number; state: string; wake?: { id: string; status: string } };
 }
-export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean }
+export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean; headSha?: string; mergeState?: string; checks?: "pending" | "pass" | "fail" }
 export class WorkflowRefusedError extends Error {
   readonly code = "workflow_refused";
   override name = "WorkflowRefusedError";
 }
+export class SourceProvenanceError extends Error {}
 export interface LifecycleAdapter {
   session(job: Job): Promise<Session | undefined>;
   project(job: Job): Promise<void>;
@@ -260,6 +376,9 @@ export interface LifecycleAdapter {
   pr(job: Job): Promise<PRSnapshot>;
   deployment(job: Job): Promise<Deployment | undefined>;
   containsMerge(job: Job, sourceSha: string): Promise<boolean>;
+  currentIssue?(job: Job): Promise<IssueDetails>;
+  verifierPlan?(job: Job): Promise<VerifierPlan>;
+  launchVerifier?(job: Job, run: VerifierRun, plan: VerifierPlan): Promise<void>;
 }
 
 function available(session: Session): boolean {
@@ -281,10 +400,13 @@ function prompt(job: Job, reason: string): string {
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
     "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
+    `Acceptance profile: ${job.config.verification}. Apply its current AC scope; local acceptance does not require deployed journeys.`,
     "Own implementation, preverification, review repair, merge when authorized, deployed acceptance and any follow-up fix. Do not stop at merge.",
     "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
     `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
-    "Verification requires independent AC evidence, the actual serving version, and applicable journeys. Use workit job verify --report; process exit is not completion.",
+    job.config.verification === "local"
+      ? "Verification requires independent complete local AC evidence and merged source. Use workit job verify --report; process exit is not completion."
+      : "Verification requires independent AC evidence, the actual serving version, and applicable journeys. Use workit job verify --report; process exit is not completion.",
   ].filter(Boolean).join("\n");
 }
 
@@ -300,8 +422,9 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
     if (options.jobID && candidate.id !== options.jobID) continue;
     // Project pause/cancel/completion too; it must survive an app outage.
     if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you") {
-      if (candidate.projectedRevision !== candidate.revision) {
-        try { await adapter.project(candidate); store.acknowledgeProjection(candidate); } catch { /* durable job remains authoritative */ }
+      const held = terminalStage(candidate.stage) ? candidate : await refreshHeldFacts(store, adapter, candidate, now);
+      if (held.projectedRevision !== held.revision) {
+        try { await adapter.project(held); store.acknowledgeProjection(held); } catch { /* durable job remains authoritative */ }
       }
       continue;
     }
@@ -341,7 +464,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         if (receipt?.id === job.wake.id && receipt.status === "delivered") {
           save(current => {
             if (current.wake?.counted === false) current.wakeups++;
-            delete current.wake; current.errors = 0;
+            delete current.wake; delete current.blocker; current.errors = 0;
           });
           results.push({ id: job.id, result: "wake-reconciled" }); continue;
         }
@@ -352,6 +475,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         reason = job.wake.reason;
       } else if (job.stage === "waiting-ci") {
         const pr = await adapter.pr(job);
+        save(current => { current.facts = { pr, observedAt: now.toISOString(), nextCheckAt: new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString() }; });
         if (pr.closed && !pr.merged) throw new Error("PR was closed without merging");
         if (pr.merged) {
           if (!sha(pr.mergeSha)) throw new Error("Merged PR has no exact merge SHA");
@@ -373,8 +497,13 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           reason = "deployment containing the merged change is ready; run applicable journeys";
         }
       }
+      if (job.stage === "verifying" && !job.wake && adapter.verifierPlan) {
+        const coordinated = await coordinateVerification(store, adapter, job, now, candidate.stage !== "verifying");
+        job = store.get(job.id);
+        if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
+      }
       if (!actionable) {
-        save(current => { current.errors = 0; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
+        save(current => { current.errors = 0; delete current.blocker; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
         results.push({ id: job.id, result: "unchanged" }); continue;
       }
       if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
@@ -383,15 +512,21 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;
-        delete current.wake; current.errors = 0;
+        delete current.wake; delete current.blocker; current.errors = 0;
         current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
       });
       results.push({ id: job.id, result: "woken" });
     } catch (error) {
       try {
         save(current => {
-          current.detail = error instanceof Error ? error.message : "Heartbeat failed";
+          current.detail = sanitizedDetail(error instanceof Error ? error.message : "Heartbeat failed");
+          current.blocker = { reason: error instanceof SourceProvenanceError ? "source-provenance" : /uncertain/.test(current.detail) ? "uncertain-delivery" : "runner-error",
+            owner: error instanceof SourceProvenanceError ? "external" : /uncertain/.test(current.detail) ? "owner" : "system",
+            dependency: error instanceof SourceProvenanceError ? dependencyIdentity(current, "provenance") : undefined,
+            observedAt: now.toISOString(), recheckTrigger: error instanceof SourceProvenanceError ? "serving-provenance-repaired" : "tool-repaired-or-inspected-recovery",
+            nextAction: error instanceof SourceProvenanceError ? "Repair the runtime's actual serving source/version probe; health alone cannot establish acceptance" : "Inspect tool authentication, local logs and delivery receipts before retrying" };
           if (error instanceof WorkflowRefusedError) {
+            if (current.wake) current.wake.delivery = "not-delivered";
             current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
             return;
           }
@@ -405,7 +540,12 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           : { id: job.id, result: job.stage === "needs-you" ? "needs-you" : "retry" });
       } catch { results.push({ id: candidate.id, result: "checkpoint-changed" }); }
     } finally {
-      try { save(current => { delete current.claim; }); await adapter.project(job); store.acknowledgeProjection(job); } catch { /* next tick reconciles projection */ }
+      try {
+        const latest = store.get(job.id);
+        if (latest.claim?.token === token) save(current => { delete current.claim; });
+        else job = latest;
+        await adapter.project(job); store.acknowledgeProjection(job);
+      } catch { /* next tick reconciles projection */ }
     }
   }
   return results;

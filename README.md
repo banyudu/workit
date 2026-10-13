@@ -255,6 +255,11 @@ durable heartbeat and guarded Banyan continuation instead of the built-in native
 goal instruction. Repositories without Superdog can replace
 the guidance below with their own review policy.
 
+Managed jobs support `--acceptance local|deployed`, audited acceptance correction,
+`workit job attention --format text`, and opt-in bounded independent verifiers.
+The [workflow contract](docs/managed-delivery.md) also documents Banyan's atomic
+revision/session-checked owner pause and recovery after partial failures.
+
 Override it per repository — the list replaces the default, so `[]` disables it:
 
 ```yaml

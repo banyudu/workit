@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentDefinition, CliOptions, IssueDetails, ResolvedConfig, WorktreeResult } from "./types.js";
+import type { Job, VerifierPlan, VerifierRun } from "./lifecycle.js";
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -141,8 +142,9 @@ function runBanyan(
   issue: IssueDetails,
   worktree: WorktreeResult,
   sessionID?: string,
+  control?: { executable: string; quiet: boolean },
 ): void {
-  const banyanctl = findBanyanctl();
+  const banyanctl = control?.executable ?? findBanyanctl();
   const args = [
     "session", "new",
     "--id", sessionID ?? issue.identifier,
@@ -154,9 +156,40 @@ function runBanyan(
     args.push("--parent", process.env.BANYAN_PARENT_SESSION_ID ?? process.env.BANYAN_SESSION_ID!);
   }
   if (command) args.push("--command", `cd ${shellQuote(worktree.path)} && ${command}`);
-  const result = spawnSync(banyanctl, args, { stdio: "inherit" });
+  const result = spawnSync(banyanctl, args, { stdio: control?.quiet ? "pipe" : "inherit", timeout: 30_000 });
   if (result.error) throw new Error(`Unable to launch Banyan: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`banyanctl exited with status ${result.status ?? "unknown"}`);
+}
+
+/** A separate bounded review run using the existing registry and Banyan launcher. */
+export function launchIndependentVerifier(job: Job, run: VerifierRun, plan: VerifierPlan, banyanctl = findBanyanctl()): void {
+  if (!plan.command) throw new Error("No verifier command available");
+  const prompt = [
+    `Independently verify managed job ${job.id}. Reviewer run ID: ${run.id}.`,
+    `Issue: ${job.issue.url}. Merged source: ${job.mergeSha}. Current AC hash: ${job.acHash}.`,
+    `Acceptance profile: ${job.config.verification}. AC labels: ${job.acLabels.join(", ")}.`,
+    job.deployment ? `Expected serving binding: ${JSON.stringify(job.deployment)}.` : "All acceptance must be proven locally; deployment evidence is unnecessary.",
+    `Read the current issue and repository instructions. Write the complete JSON VerificationReport to ${run.reportPath}.`,
+    `Use reviewer: {runID: "${run.id}", independent: true}, jobID, issueURL, acHash, mergeSha, checkedAt and one criterion with actual evidence per current AC.`,
+    "Each criterion needs label, status and evidence entries with kind, reference and observed. Deployed journeys also need the actual environment, target, sourceSha and version on the report and evidence.",
+    "Report fail/blocked for anything unproven. Do not fabricate journeys, deployment provenance or human acceptance.",
+    "This is a bounded verification run. Do not implement changes, replay the implementation task, create native goals, schedule work, launch other agents, merge, deploy, send external messages, edit issue ACs/checklists or mark the issue Done.",
+    "Do not start paid/provider journeys or perform human acceptance. Only use already authorized local fixtures and read-only probes. Report blocked when further authority or external provenance is required.",
+  ].join("\n");
+  // Node supplies a portable process timeout; no new scheduler or live config writes.
+  const runner = `const {spawn}=require('node:child_process');const fs=require('node:fs');
+const [command,outcome,seconds]=process.argv.slice(1);
+let timedOut=false;
+const child=spawn('/bin/sh',['-lc',command],{stdio:'inherit',detached:true});
+const stop=()=>{timedOut=true;try{process.kill(-child.pid,'SIGKILL')}catch{}};
+const timer=setTimeout(stop,Number(seconds)*1000);
+const finish=status=>{clearTimeout(timer);fs.writeFileSync(outcome+'.tmp',JSON.stringify({status}),{mode:0o600});fs.renameSync(outcome+'.tmp',outcome)};
+child.on('error',()=>finish('failed'));
+child.on('exit',(code)=>finish(!timedOut&&code===0?'complete':'failed'));
+process.on('SIGTERM',stop);process.on('SIGINT',stop);`;
+  const command = [process.execPath, "-e", runner, "--", headlessPromptCommand(plan.command, prompt), run.outcomePath, String(run.timeoutSeconds)].map(shellQuote).join(" ");
+  runBanyan(command, { ...job.issue, identifier: run.id, title: "Independent managed verification" },
+    { path: job.worktree, branch: "", sourceBranch: "", resumed: false }, run.sessionID, { executable: banyanctl, quiet: true });
 }
 
 function runIterm(

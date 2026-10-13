@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, checkpoint, controlCommand, issueFinished, stages, tick, validateReport, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { heartbeatCLI } from "./heartbeat.js";
 
 function options(args: string[]): Record<string, string> {
@@ -16,9 +17,12 @@ function options(args: string[]): Record<string, string> {
 function only(values: Record<string, string>, allowed: string[]): void {
   for (const key of Object.keys(values)) if (!allowed.includes(key)) throw new Error("Unknown option " + key);
 }
-async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<void> {
-  try { await adapter.project(job); store.acknowledgeProjection(job); }
-  catch { console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); }
+async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<"confirmed" | "pending"> {
+  try {
+    await adapter.project(job);
+    if (store.acknowledgeProjection(job)) { job.projectedRevision = job.revision; return "confirmed"; }
+  } catch { /* durable change retained */ }
+  console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); return "pending";
 }
 export async function lifecycleCLI(args: string[]): Promise<void> {
   if (args[0] === "heartbeat") { heartbeatCLI(args.slice(1)); return; }
@@ -26,6 +30,10 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
     console.log(`workit tick [--job ID]
 workit job list
 workit job status ID
+workit job attention [--format json|text]
+workit job acceptance ID
+workit job acceptance ID --profile local|deployed --reason TEXT --expected-revision N --expected-ac-hash HASH
+workit job verifier-reconcile ID --run-id ID --outcome delivered|not-delivered|completed --reason TEXT --expected-revision N
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS]
 workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
 workit job cancel ID --detail TEXT
@@ -54,12 +62,42 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
   }
   const [action, id, ...rest] = args.slice(1);
   if (action === "list" && !id) { console.log(JSON.stringify(store.list(), null, 2)); return; }
+  if (action === "attention") {
+    const values = options(args.slice(2)); only(values, ["--format"]);
+    if (values["--format"] && !["json", "text"].includes(values["--format"])) throw new Error("attention --format requires json or text");
+    const view = attention(store.list());
+    console.log(values["--format"] === "text" ? readableAttention(view) : JSON.stringify(view, null, 2)); return;
+  }
   if (!id) throw new Error("workit job requires an action and job ID; see workit job --help");
   const values = options(rest);
   let job: Job;
+  let projection: "confirmed" | "pending" | undefined;
   switch (action) {
     case "status":
       only(values, []); job = store.get(id); break;
+    case "acceptance": {
+      only(values, ["--profile", "--reason", "--expected-revision", "--expected-ac-hash"]);
+      if (!Object.keys(values).length) {
+        const current = store.get(id);
+        const issue = await adapter.currentIssue(current);
+        let localEligible = true;
+        try { assertLocalAcceptance(issue.body); } catch { localEligible = false; }
+        console.log(JSON.stringify({ jobID: id, revision: current.revision, profile: current.config.verification,
+          boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
+      }
+      if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("acceptance requires --expected-revision N");
+      const expected = store.get(id);
+      if (expected.revision !== Number(values["--expected-revision"])) throw new Error("Job revision mismatch; reread before correcting acceptance");
+      const issue = await adapter.currentIssue(expected);
+      job = correctAcceptance(store, id, { profile: values["--profile"] as "local" | "deployed", reason: values["--reason"],
+        expectedRevision: Number(values["--expected-revision"]), expectedAcHash: values["--expected-ac-hash"] }, issue);
+      await project(store, adapter, job); break;
+    }
+    case "verifier-reconcile":
+      only(values, ["--run-id", "--outcome", "--reason", "--expected-revision"]);
+      if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("verifier-reconcile requires --expected-revision N");
+      job = reconcileVerifier(store, id, { runID: values["--run-id"], outcome: values["--outcome"], reason: values["--reason"], expectedRevision: Number(values["--expected-revision"]) });
+      await project(store, adapter, job); break;
     case "checkpoint":
       only(values, ["--stage", "--detail", "--pr", "--merge-sha", "--after"]);
       if (!values["--stage"] || !values["--detail"]?.trim()) throw new Error("checkpoint requires --stage and --detail");
@@ -75,17 +113,18 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"],
         expectedRevision: values["--expected-revision"] === undefined ? undefined : Number(values["--expected-revision"]),
         expectedSessionID: values["--expected-session-id"] });
-      await project(store, adapter, job); break;
+      projection = await project(store, adapter, job); break;
     case "resume":
       only(values, ["--detail"]);
       job = store.update(id, current => {
         if (!["paused", "needs-you"].includes(current.stage)) throw new Error("Only paused/human-blocked jobs can be resumed");
         if (current.wake) throw new Error("Pending wake requires inspected job reconcile before resume");
+        if (current.verifier && ["reserved", "uncertain", "invalidated"].includes(current.verifier.state)) throw new Error("Pending verifier requires inspected job verifier-reconcile before resume");
         current.stage = current.deployment || (current.mergeSha && current.config.verification === "local") ? "verifying"
           : current.mergeSha ? "waiting-deploy" : current.pr ? "waiting-ci" : "implementing";
         current.detail = values["--detail"] ?? "Explicitly resumed";
         current.nextWakeAt = new Date().toISOString(); current.errors = 0; current.wakeups = 0;
-        delete current.claim;
+        delete current.claim; delete current.holdDetail; delete current.blocker;
       });
       await project(store, adapter, job); break;
     case "reconcile": {
@@ -110,38 +149,24 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
       only(values, ["--report"]);
       if (!values["--report"]) throw new Error("verify requires --report PATH");
       const expected = store.get(id);
-      if (expected.stage !== "verifying") throw new Error("Job must be in verifying before completion");
-      const pr = await adapter.pr(expected);
-      if (!pr.merged || pr.mergeSha !== expected.mergeSha) throw new Error("GitHub does not establish the expected merged source");
-      if (expected.config.verification !== "local") {
-        const deployment = await adapter.deployment(expected);
-        if (!deployment || JSON.stringify(deployment) !== JSON.stringify(expected.deployment) ||
-            !await adapter.containsMerge(expected, deployment.sourceSha)) throw new Error("Serving deployment changed; rerun applicable verification");
-      }
-      const issue = await adapter.currentIssue(expected);
-      const report = validateReport(expected, JSON.parse(readFileSync(resolve(values["--report"]), "utf8")), issue.body);
-      if (!issueFinished(issue)) throw new Error("Acceptance evidence is valid; reconcile the issue's evidence/checklist and close it under repository policy, then retry");
-      job = store.update(id, current => {
-        if (current.stage !== expected.stage || current.acHash !== expected.acHash ||
-            current.pr !== expected.pr || current.mergeSha !== expected.mergeSha ||
-            JSON.stringify(current.deployment) !== JSON.stringify(expected.deployment)) {
-          throw new Error("Job changed during verification; reread and retry");
-        }
-        current.verification = report; current.stage = "verified"; current.detail = "Every current AC has independent passing evidence";
-        delete current.nextWakeAt; delete current.claim; delete current.wake;
-      });
+      const checked = await checkVerification(adapter, expected, JSON.parse(readFileSync(resolve(values["--report"]), "utf8")));
+      if (!checked.finished) throw new Error("Acceptance evidence is valid; reconcile the issue's evidence/checklist and close it under repository policy, then retry");
+      job = completeVerification(store, expected, checked.report);
       await project(store, adapter, job); break;
     }
     default: throw new Error("Unknown job action; see workit job --help");
   }
-  console.log(JSON.stringify(job, null, 2));
+  console.log(JSON.stringify(projection ? { ...job, projection: { status: projection, sessionID: job.sessionID, revision: job.revision } } : job, null, 2));
 }
 
 export function managedInstructions(job: Job): string[] {
   return [
     `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
     `You own managed workit job ${job.id} through verified issue completion, not just a PR. Banyan session: ${job.sessionID}.`,
-    "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, await the scheduled deployment, then independently verify the applicable deployed journeys.",
+    `Acceptance profile: ${job.config.verification}. Local acceptance needs complete independent local evidence; deployed acceptance needs actual serving-bound journeys. Never waive a deployed or human AC.`,
+    job.config.verification === "local"
+      ? "Read repository instructions and current ACs. Establish local acceptance probes, preverify locally, repair review/CI, merge only when authorized, then obtain complete independent local evidence."
+      : "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, await the scheduled deployment, then independently verify the applicable deployed journeys.",
     "Do not create a native goal or scheduled task for this managed issue: workit owns continuation and its heartbeat. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
     `Use workit job status ${job.id} to read durable state. Before ending a turn, use workit job checkpoint ${job.id} --stage STAGE --detail TEXT, with --pr URL and --merge-sha FULL_SHA when known.`,
     "Use waiting-ci or waiting-deploy for external waits; use needs-you for missing authority, auth, tools, ambiguous recovery or irreducible human acceptance. Do not leave an active goal repeatedly polling an external wait.",
