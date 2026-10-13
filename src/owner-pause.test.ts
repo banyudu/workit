@@ -51,4 +51,19 @@ test("owner-pause-contract: exact argv guards revision/session, returns projecti
     ["--import", "tsx", "src/cli.ts", "job", "pause", job.id, "--detail", "Keep held"],
     { encoding: "utf8", env: { ...process.env, WORKIT_STATE_DIR: directory, WORKIT_BANYANCTL: ctl }, stdio: ["ignore", "pipe", "pipe"] }));
   assert.equal(legacy.stage, "paused");
+  const invoke = (args: string[]) => JSON.parse(execFileSync(process.execPath,
+    ["--import", "tsx", "src/cli.ts", "job", ...args],
+    { encoding: "utf8", env: { ...process.env, WORKIT_STATE_DIR: directory, WORKIT_BANYANCTL: ctl }, stdio: ["ignore", "pipe", "pipe"] }));
+  assert.throws(() => invoke(["resume", job.id]));
+  assert.deepEqual(store.get(job.id).wake, job.wake);
+  writeFileSync(ctl, '#!/usr/bin/env node\nconsole.log(JSON.stringify({ok:true}));\n', { mode: 0o700 });
+  const reconciled = invoke(["reconcile", job.id, "--delivery", "not-delivered", "--detail", "Inspected original conversation; no delivery"]);
+  assert.equal(reconciled.stage, "paused");
+  assert.equal(reconciled.nextWakeAt, undefined);
+  assert.equal(reconciled.wake, undefined);
+  assert.equal(reconciled.lastRecovery.wakeID, job.wake!.id);
+  const resumed = invoke(["resume", job.id]);
+  assert.equal(resumed.sessionID, job.sessionID);
+  assert.equal(resumed.stage, "implementing");
+  assert.ok(resumed.nextWakeAt);
 });

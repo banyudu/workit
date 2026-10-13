@@ -165,6 +165,7 @@ export interface ResolvedConfig {
 
 export interface CliOptions {
   managed?: boolean;
+  acceptance?: "local" | "deployed";
   sessionID?: string;
   provider?: ProviderMode;
   repo?: string;
