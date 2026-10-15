@@ -111,6 +111,7 @@ async function linearApi(
   if (!token) return undefined;
   const response = await fetch(apiUrl, {
     method: "POST",
+    signal: AbortSignal.timeout(30_000),
     headers: {
       "content-type": "application/json",
       authorization: token,
@@ -123,6 +124,49 @@ async function linearApi(
     throw new Error(payload.errors.map((error) => error.message).filter(Boolean).join("; "));
   }
   return payload.data;
+}
+
+export interface LinearWorkflowState { id: string; name: string; type: string; position: number; archivedAt?: string | null }
+export interface TrackerIssue extends IssueDetails {
+  linear?: { id: string; teamID: string; stateID: string; updatedAt: string; completedStateID?: string;
+    archivedAt?: string | null; snoozedUntilAt?: string | null };
+}
+
+export function completedLinearState(states: LinearWorkflowState[], current: LinearWorkflowState): string | undefined {
+  if (current.type === "completed") return current.id;
+  return states.filter(state => state.type === "completed" && !state.archivedAt)
+    .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id))[0]?.id;
+}
+
+/** Closeout uses the public API directly so revision/workflow metadata is never lost in CLI formatting. */
+export async function fetchLinearCloseoutIssue(identifier: string, config: WorkitConfig): Promise<TrackerIssue> {
+  if (!process.env.LINEAR_API_KEY) throw new Error("Linear closeout requires LINEAR_API_KEY for the supported GraphQL API");
+  const data = await linearApi(config, `query CloseoutIssue($id: String!) {
+    issue(id: $id) { id identifier title description url updatedAt archivedAt snoozedUntilAt
+      state { id name type position }
+      labels(first: 250) { nodes { name } pageInfo { hasNextPage } }
+      team { id states(first: 250) { nodes { id name type position archivedAt } pageInfo { hasNextPage } } }
+    }
+  }`, { id: identifier });
+  const issue = data?.issue;
+  if (!issue?.id || !issue.identifier || !issue.title || !issue.url || !issue.updatedAt || !issue.state?.id ||
+      !issue.state.type || !issue.team?.id || !Array.isArray(issue.team.states?.nodes) ||
+      !Array.isArray(issue.labels?.nodes) || issue.labels.pageInfo?.hasNextPage !== false ||
+      issue.team.states.pageInfo?.hasNextPage !== false) throw new Error("Linear closeout metadata is incomplete; cannot resolve current workflow/holds");
+  return { backend: "linear", identifier: issue.identifier, title: issue.title, body: issue.description ?? "",
+    url: issue.url, labels: issue.labels.nodes.map((label: { name: string }) => label.name),
+    state: issue.state.name, stateType: issue.state.type,
+    linear: { id: issue.id, teamID: issue.team.id, stateID: issue.state.id, updatedAt: issue.updatedAt,
+      completedStateID: completedLinearState(issue.team.states.nodes, issue.state),
+      archivedAt: issue.archivedAt, snoozedUntilAt: issue.snoozedUntilAt } };
+}
+
+export async function updateLinearCloseoutIssue(config: WorkitConfig, id: string, input: { description?: string; stateId?: string }): Promise<void> {
+  if (!process.env.LINEAR_API_KEY) throw new Error("Linear closeout requires LINEAR_API_KEY");
+  const data = await linearApi(config, `mutation CloseoutUpdate($id: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $id, input: $input) { success }
+  }`, { id, input });
+  if (data?.issueUpdate?.success !== true) throw new Error("Linear did not acknowledge the closeout mutation; reconcile by readback before retrying");
 }
 
 function linearProject(value: any): string {

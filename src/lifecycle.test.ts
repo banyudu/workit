@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, WorkflowRefusedError, acceptance, checkpoint, createJob, tick, validateReport, workflowState,
+import { JobStore, WorkflowRefusedError, acceptance, checkpoint, createJob, provenChecklist, tick, validateReport, workflowState,
   type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerificationReport } from "./lifecycle.js";
 import { heartbeatPlist } from "./heartbeat.js";
 
@@ -295,6 +295,7 @@ test("completion rejects stale ACs, failed/missing evidence, unmerged source, se
     (value: VerificationReport) => { value.criteria[0].status = "fail"; },
     (value: VerificationReport) => { value.criteria[0].evidence = []; },
     (value: VerificationReport) => { value.reviewer.independent = false; },
+    (value: VerificationReport) => { (value.reviewer as unknown as { independent: string }).independent = "false"; },
     (value: VerificationReport) => { value.mergeSha = "c".repeat(40); },
     (value: VerificationReport) => { value.deployment!.version = "old"; },
     (value: VerificationReport) => { value.criteria[0].evidence[0].deployment!.version = "old"; value.criteria[1].evidence = []; },
@@ -312,6 +313,43 @@ test("local-only acceptance is explicit and still needs complete independent AC 
   validateReport(job, valid, body, now);
   const deployed = { ...job, config: { ...job.config, verification: "deployed" as const } };
   assert.throws(() => validateReport(deployed, valid, body, now), /journey/);
+});
+
+test("stable-label synchronization preserves all other bytes, including CRLF, notes and other checklists", () => {
+  const original = "## Notes\r\n- [ ] Unrelated task\r\n" + body.replaceAll("\n", "\r\n") +
+    "\r\n  A human note.\r\n## Delivery\r\n- [ ] Another task\r\n";
+  const after = provenChecklist(original, ["contract"]);
+  assert.equal(after, original.replace("[ ] `[code:contract]`", "[x] `[code:contract]`"));
+  assert.deepEqual(acceptance(after), acceptance(original));
+  assert.equal(provenChecklist(after, ["contract"]), after);
+  assert.throws(() => provenChecklist(body + "\n- [ ] `[code:contract]` Duplicate", ["contract"]), /unique/);
+});
+
+test("indented multiline AC edits invalidate evidence and unlabeled checkboxes still synchronize", t => {
+  const multiline = "## Acceptance Criteria\n- [ ] A multiline requirement.\n\n  Includes this constraint.\n- [ ] `[code:contract]` Documentation.";
+  const { job } = fixture(t, { verification: "local" });
+  Object.assign(job, acceptance(multiline)); job.mergeSha = mergeSha;
+  const valid = report(job);
+  validateReport(job, valid, multiline, now);
+  assert.throws(() => validateReport(job, valid, multiline.replace("this constraint", "a new constraint"), now), /stale/);
+  const after = provenChecklist(multiline, job.acLabels);
+  assert.equal(after, multiline.replaceAll("[ ]", "[x]"));
+  assert.deepEqual(acceptance(after), acceptance(multiline));
+});
+
+test("human acceptance requires explicit attributed confirmation, including unlabeled human ACs", t => {
+  for (const tag of ["[human:behavior]", "[human]"]) {
+    const humanBody = body.replace("[test:behavior]", tag);
+    const { job } = fixture(t, { verification: "local" });
+    Object.assign(job, acceptance(humanBody)); job.mergeSha = mergeSha;
+    const valid = report(job);
+    assert.throws(() => validateReport(job, valid, humanBody, now), /human confirmation/);
+    valid.criteria[0].evidence = [{ kind: "human", reference: "artifact://owner-confirmation",
+      observed: "Owner explicitly accepted this criterion", confirmedBy: "Fixture Owner" }];
+    validateReport(job, valid, humanBody, now);
+    delete valid.criteria[0].evidence[0].confirmedBy;
+    assert.throws(() => validateReport(job, valid, humanBody.replaceAll("[ ]", "[x]"), now), /human confirmation/);
+  }
 });
 
 test("launchd uses pinned argv and XML escaping, and does not serialize credentials", () => {

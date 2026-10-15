@@ -33,6 +33,10 @@ export interface Job {
   // Older pending wakes already charged wakeups when they were reserved.
   wake?: { id: string; reason: string; revision: number; counted?: boolean };
   verification?: VerificationReport;
+  closeout?: {
+    checklist?: { before: string; after: string; issueID: string; teamID: string };
+    checklistConfirmed?: boolean; stateID?: string; stateConfirmed?: boolean;
+  };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
 }
 export interface VerificationReport {
@@ -40,7 +44,7 @@ export interface VerificationReport {
   reviewer: { runID: string; independent: boolean };
   deployment?: Deployment;
   criteria: Array<{ label: string; status: "pass" | "fail" | "blocked";
-    evidence: Array<{ kind: string; reference: string; observed: string; deployment?: Deployment }> }>;
+    evidence: Array<{ kind: string; reference: string; observed: string; deployment?: Deployment; confirmedBy?: string }> }>;
 }
 
 export const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -48,14 +52,60 @@ export const terminalStage = (stage: Stage): boolean => ["verified", "cancelled"
 export const runnableStage = (stage: Stage): boolean => !terminalStage(stage) && !["paused", "needs-you"].includes(stage);
 export const sha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{40}$/i.test(value);
 
+function checklistCriteria(body: string) {
+  const heading = /^##[ \t]+Acceptance Criteria[ \t]*\r?$/im.exec(body);
+  const start = heading ? heading.index + heading[0].length : body.length;
+  const tail = body.slice(start);
+  const end = tail.search(/^##[ \t]+/m);
+  const section = end < 0 ? tail : tail.slice(0, end);
+  const criteria: Array<{ text: string; checked: boolean; offset: number }> = [];
+  let current: { lines: string[]; checked: boolean; offset: number; indentation: number } | undefined;
+  const finish = () => {
+    if (current) criteria.push({ text: current.lines.join("\n").trim(), checked: current.checked, offset: current.offset });
+    current = undefined;
+  };
+  let offset = start;
+  for (const raw of section.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const checkbox = line.match(/^([ \t]*)-[ \t]+\[([ xX])\][ \t]+(.+)$/);
+    if (checkbox) {
+      finish();
+      current = { lines: [checkbox[3]], checked: checkbox[2] !== " ", offset: offset + line.indexOf("[") + 1,
+        indentation: checkbox[1].length };
+    } else if (current) {
+      if (!line.trim()) current.lines.push("");
+      else if (line.match(/^[ \t]*/)![0].length > current.indentation) current.lines.push(line);
+      else finish();
+    }
+    offset += raw.length + 1;
+  }
+  finish();
+  return criteria.map(item => ({ ...item,
+    label: item.text.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(item.text).slice(0, 12),
+    human: /\[human(?::[a-z0-9-]+)?\]/.test(item.text) }));
+}
+
+// Keep the text-only parser contract shared with acceptance planning (#10).
+export function acceptanceCriteria(body: string): string[] {
+  return checklistCriteria(body).map(item => item.text);
+}
+
 export function acceptance(body: string): { acHash: string; acLabels: string[] } {
-  const section = body.split(/^##\s+Acceptance Criteria\s*$/im)[1]?.split(/^##\s+/m)[0] ?? "";
-  const lines = section.split("\n").filter(line => /^\s*-\s+\[[ xX]\]\s+/.test(line))
-    .map(line => line.replace(/^\s*-\s+\[[ xX]\]\s+/, "").trim());
-  if (lines.length < 2) throw new Error("Managed issues need at least two Acceptance Criteria checkboxes");
-  const acLabels = lines.map(line => line.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(line).slice(0, 12));
+  const criteria = checklistCriteria(body);
+  if (criteria.length < 2) throw new Error("Managed issues need at least two Acceptance Criteria checkboxes");
+  const acLabels = criteria.map(item => item.label);
   if (new Set(acLabels).size !== acLabels.length) throw new Error("Acceptance Criteria labels must be unique");
-  return { acHash: digest(lines.join("\n")), acLabels };
+  return { acHash: digest(criteria.map(item => item.text).join("\n")), acLabels };
+}
+
+/** Replace only the checkbox byte of proven, stable-labelled ACs. */
+export function provenChecklist(body: string, labels: string[]): string {
+  acceptance(body); // Reject ambiguous labels before editing.
+  const proven = new Set(labels);
+  for (const item of checklistCriteria(body).reverse()) {
+    if (proven.has(item.label) && !item.checked) body = body.slice(0, item.offset) + "x" + body.slice(item.offset + 1);
+  }
+  return body;
 }
 
 export function workflowState(stage: Stage): string {
@@ -187,12 +237,12 @@ export function checkpoint(store: JobStore, id: string, patch: {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.closeout;
       }
       job.pr = patch.pr;
     }
     if (patch.mergeSha !== undefined) {
-      if (patch.mergeSha !== job.mergeSha) { delete job.deployment; delete job.verification; }
+      if (patch.mergeSha !== job.mergeSha) { delete job.deployment; delete job.verification; delete job.closeout; }
       job.mergeSha = patch.mergeSha;
     }
     if (patch.stage === "waiting-ci" && !job.pr) throw new Error("waiting-ci requires a PR");
@@ -212,7 +262,7 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
   const report = value as VerificationReport;
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
-  if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || !report.reviewer?.independent || !report.reviewer.runID?.trim() ||
+  if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
       [job.id, job.sessionID].includes(report.reviewer.runID)) {
     throw new Error("Verification needs the merged source and an independent reviewer run");
   }
@@ -225,6 +275,10 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
     if (!item || item.status !== "pass" || !Array.isArray(item.evidence) || !item.evidence.length ||
         item.evidence.some(entry => !entry.kind?.trim() || !entry.reference?.trim() || !entry.observed?.trim())) {
       throw new Error(`AC '${label}' lacks passing evidence`);
+    }
+    if (checklistCriteria(currentBody).find(criterion => criterion.label === label)?.human &&
+        !item.evidence.some(entry => entry.kind === "human" && typeof entry.confirmedBy === "string" && entry.confirmedBy.trim())) {
+      throw new Error(`AC '${label}' needs real human confirmation (human evidence with confirmedBy and a confirmation reference)`);
     }
   }
   if (job.config.verification !== "local") {
@@ -239,7 +293,7 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
 
 export function issueFinished(issue: IssueDetails): boolean {
   return issue.backend === "github" ? issue.state === "CLOSED"
-    : issue.stateType === "completed" || ["done", "completed"].includes(issue.state?.toLowerCase() ?? "");
+    : issue.stateType === "completed";
 }
 
 export interface Session {

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { fetchIssue } from "./issue.js";
+import { fetchIssue, fetchLinearCloseoutIssue, updateLinearCloseoutIssue } from "./issue.js";
 import { resolveConfig } from "./config.js";
 import { originRemote } from "./git.js";
 import { WorkflowRefusedError, digest, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session } from "./lifecycle.js";
@@ -106,10 +106,19 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
     const value = await commandJSON(["gh", "api", `repos/${job.githubRepo}/compare/${job.mergeSha}...${sourceSha}`], job.repoRoot) as { status?: string };
     return value.status === "identical" || value.status === "ahead";
   }
-  async currentIssue(job: Job) {
+  private issueConfig(job: Job) {
     const resolved = resolveConfig(job.repoRoot, { remote: originRemote(job.repoRoot) });
-    return fetchIssue(job.issue.backend, job.issue.identifier, {
+    return {
       ...resolved.config, repo: job.githubRepo, github: { ...resolved.config.github, repo: job.githubRepo },
-    }, job.repoRoot);
+    };
+  }
+  async currentIssue(job: Job) {
+    const config = this.issueConfig(job);
+    return job.issue.backend === "linear" ? fetchLinearCloseoutIssue(job.issue.identifier, config)
+      : fetchIssue(job.issue.backend, job.issue.identifier, config, job.repoRoot);
+  }
+  async updateIssue(job: Job, id: string, input: { description?: string; stateId?: string }): Promise<void> {
+    if (job.issue.backend !== "linear") throw new Error("Automatic tracker mutations apply only to Linear");
+    await updateLinearCloseoutIssue(this.issueConfig(job), id, input);
   }
 }
