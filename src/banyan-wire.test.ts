@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { createJob } from "./lifecycle.js";
+import { createJob, type Session } from "./lifecycle.js";
 
 // Optional cross-repository check: use the actual compiled companion CLI with
 // an isolated authenticated HTTP fixture. No user app, daemon or agent is used.
@@ -36,7 +36,19 @@ test("compiled Banyan CLI preserves capabilities, workflow metadata and authenti
     requests.push({ path: request.url, token: request.headers["x-banyan-token"] as string, body });
     if (request.url === "/workflow-set" && body) session.workflow = {
       owner: body.owner, jobID: body.jobID, revision: Number(body.revision), state: body.state,
+      wake: (session.workflow as Session["workflow"])?.wake,
     };
+    if (request.url === "/workflow-resolve" && body) {
+      const workflow = session.workflow as Session["workflow"];
+      if (!workflow || workflow.jobID !== body.jobID || workflow.revision !== Number(body.revision) ||
+          workflow.wake?.id !== body.wakeID) {
+        response.writeHead(409, { "content-type": "application/json" });
+        response.end(JSON.stringify({ data: { ok: false, error: { code: "workflow_refused", message: "matching receipt required" } } }));
+        return;
+      }
+      if (body.outcome === "delivered") workflow.wake.status = "delivered";
+      else delete workflow.wake;
+    }
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ data: request.url === "/list" ? { workflowProtocol: 1, sessions: [session] } : { ok: true } }));
   });
@@ -59,4 +71,23 @@ test("compiled Banyan CLI preserves capabilities, workflow metadata and authenti
   assert.equal(wake?.body?.jobID, job.id);
   assert.equal(wake?.body?.wakeID, "wake-a");
   assert.equal(wake?.body?.text, "Continue\nverification");
+
+  job.stage = "needs-you";
+  job.wake = { id: "wake-a", reason: "unfinished work", revision: job.revision };
+  (session.workflow as NonNullable<Session["workflow"]>).wake = { id: "wake-a", status: "uncertain" };
+  await adapter.project(job);
+  await adapter.reconcile(job, "delivered", "Inspected original conversation");
+  const resolution = requests.find(request => request.path === "/workflow-resolve");
+  assert.equal(resolution?.body?.jobID, job.id);
+  assert.equal(Number(resolution?.body?.revision), job.revision);
+  assert.equal(resolution?.body?.wakeID, "wake-a");
+  assert.equal(resolution?.body?.outcome, "delivered");
+
+  job.wake.id = "workit-only-intent";
+  await adapter.reconcile(job, "not-delivered", "Inspected original conversation; no prompt sent");
+  assert.deepEqual((session.workflow as Session["workflow"])?.wake, { id: "wake-a", status: "delivered" });
+  await assert.rejects(adapter.reconcile(job, "delivered", "Inspected"));
+  assert.equal(requests.filter(request => request.path === "/workflow-resolve").length, 1);
+  assert.equal(requests.filter(request => request.path === "/workflow-wake").length, 1);
+  assert.ok(requests.every(request => request.token === "fixture-token"));
 });
