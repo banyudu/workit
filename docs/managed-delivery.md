@@ -133,6 +133,12 @@ workit job resume JOB_ID
 
 Use `--delivery not-delivered` only when inspection establishes that no prompt
 was delivered. Reconciliation leaves the job held until explicit resume.
+Workit may have saved an intent that Banyan never admitted. For this inspected
+`not-delivered` outcome, reconciliation can clear only Workit's intent when
+protocol v1 confirms the original session's readable, current held workflow has
+no matching receipt and no other unresolved wake. Any older settled native
+receipt is preserved. Matching receipts still use Banyan's guarded resolution;
+an absent receipt never establishes a `delivered` outcome.
 Missing/ambiguous conversation identity, unreadable journals, removed worktrees
 and uncertain launches never fall back to replaying the initial task in a new
 conversation. Recover the named Banyan session first. Repeated auth/control

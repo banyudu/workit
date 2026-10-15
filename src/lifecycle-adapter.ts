@@ -68,6 +68,30 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
       "--job-id", job.id, "--revision", String(job.revision), "--wake-id", wakeID, "--text", text], job.repoRoot);
   }
   async reconcile(job: Job, outcome: string, detail: string): Promise<void> {
+    if (!["paused", "needs-you"].includes(job.stage) || !job.wake ||
+        !["delivered", "not-delivered"].includes(outcome) || !detail.trim()) {
+      throw new WorkflowRefusedError("Recovery requires a held job, pending wake and inspected delivery outcome");
+    }
+    const value = await commandJSON([this.banyanctl, "session", "list"], job.repoRoot) as {
+      workflowProtocol?: number; sessions?: Session[];
+    };
+    const matches = value.sessions?.filter(session => session.id === job.sessionID) ?? [];
+    const session = matches.length === 1 ? matches[0] : undefined;
+    const workflow = session?.workflow;
+    if (value.workflowProtocol !== 1 || !session || session.cwd !== job.worktree ||
+        session.workflowRecoveryError != null || workflow?.owner !== "workit" || workflow.jobID !== job.id ||
+        workflow.revision !== job.revision || workflow.state !== workflowState(job.stage)) {
+      throw new WorkflowRefusedError("Recovery requires the original session's readable, current held workflow");
+    }
+    if (workflow.wake?.id !== job.wake.id) {
+      // Workit persists intent before calling Banyan. An inspected refusal before
+      // admission has no native receipt to resolve. Preserve any older settled
+      // receipt; the caller clears only Workit's intent with its revision guard.
+      if (outcome === "not-delivered" && (!workflow.wake ||
+          (typeof workflow.wake.id === "string" && workflow.wake.id.trim() &&
+           ["delivered", "not-delivered"].includes(workflow.wake.status)))) return;
+      throw new WorkflowRefusedError("A different unresolved native wake requires inspection; delivery cannot be inferred");
+    }
     await commandJSON([this.banyanctl, "workflow", "resolve", "--id", job.sessionID,
       "--job-id", job.id, "--revision", String(job.revision), "--wake-id", job.wake!.id,
       "--outcome", outcome, "--detail", detail], job.repoRoot);
