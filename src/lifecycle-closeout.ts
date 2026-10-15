@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { TrackerIssue } from "./issue.js";
-import { JobStore, issueFinished, processIdentity, processIsAlive, provenChecklist, validateReport,
+import { JobStore, checklistChanges, issueFinished, processIdentity, processIsAlive, provenChecklist, reportComplete,
+  synchronizeChecklist, validateProgressReport, validateReport,
   type Job, type LifecycleAdapter } from "./lifecycle.js";
 
 export interface CloseoutAdapter extends LifecycleAdapter {
@@ -22,7 +23,6 @@ function assertTracker(job: Job, issue: TrackerIssue): void {
   if (!["triage", "backlog", "unstarted", "started", "completed"].includes(issue.stateType ?? "")) {
     throw new Error("Linear issue is canceled, duplicate or has an unknown workflow type; cannot complete it");
   }
-  if (!issue.linear.completedStateID) throw new Error("The issue's team has no active completed workflow state");
 }
 
 /** Local claims serialize workit only. Linear issueUpdate has no server-side CAS. */
@@ -34,6 +34,7 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
   }
   if (expected.wake) throw new Error("Pending wake must be reconciled before tracker closeout");
   const value = input.report ?? (input.reconcile ? expected.verification : undefined);
+  const validate = expected.issue.backend === "linear" ? validateProgressReport : validateReport;
   const token = randomUUID();
   let job = store.update(id, current => {
     if (current.revision !== expected.revision || (current.claim && processIsAlive(current.claim.process))) {
@@ -73,7 +74,10 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
     assertOwned();
     const issue = await adapter.currentIssue(job);
     assertTracker(job, issue);
-    validateReport(job, value, issue.body);
+    const report = validate(job, value, issue.body);
+    if (issue.backend === "linear" && reportComplete(job, report) && !issue.linear?.completedStateID) {
+      throw new Error("The issue's team has no active completed workflow state");
+    }
     const intent = job.closeout?.checklist;
     if (intent && (issue.linear?.id !== intent.issueID || issue.linear.teamID !== intent.teamID)) {
       throw new Error("Linear issue/team changed during closeout; inspect the pending effect before retrying");
@@ -93,20 +97,27 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
     if (!value) throw new Error("No stored independent report; use job verify --report PATH");
     await source();
     let issue = await read();
-    const report = validateReport(job, value, issue.body);
-    save(current => { current.verification = report; current.closeout ??= {}; });
+    const report = validate(job, value, issue.body);
+    const changes = checklistChanges(report);
+    const complete = reportComplete(job, report);
+    save(current => {
+      current.verification = report; current.closeout ??= {};
+      if (!complete) current.closeout.stateConfirmed = false;
+    });
     if (issue.backend === "linear") {
       // Every retry reads the actual effect first, including lost mutation responses.
       const pending = job.closeout?.checklist;
-      let after = provenChecklist(issue.body, report.criteria.map(item => item.label));
-      if (pending && after !== issue.body && issue.body !== pending.before) {
+      const pendingChanges = pending?.changes ?? job.acLabels.map(label => ({ label, checked: true }));
+      let after = synchronizeChecklist(issue.body, changes);
+      if (pending && !job.closeout?.checklistConfirmed && issue.body !== pending.before &&
+          synchronizeChecklist(issue.body, pendingChanges) !== issue.body) {
         throw new Error("Pending checklist conflicts with current description; inspect/merge the checkbox-only change before job closeout retry");
       }
       if (after !== issue.body) {
         issue = await unchanged(issue);
-        after = provenChecklist(issue.body, report.criteria.map(item => item.label));
+        after = synchronizeChecklist(issue.body, changes);
         save(current => {
-          current.closeout!.checklist = { before: issue.body, after, issueID: issue.linear!.id, teamID: issue.linear!.teamID };
+          current.closeout!.checklist = { before: issue.body, after, issueID: issue.linear!.id, teamID: issue.linear!.teamID, changes };
           current.closeout!.checklistConfirmed = false;
         });
         assertOwned();
@@ -121,6 +132,15 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
       save(current => { current.closeout!.checklistConfirmed = true; });
       await source();
       issue = await read();
+      if (!complete) {
+        if (synchronizeChecklist(issue.body, changes) !== issue.body) throw new Error("Checklist progress changed; retry job closeout");
+        save(current => {
+          current.detail = `AC progress synchronized (${changes.filter(item => item.checked).length} pass, ${changes.filter(item => !item.checked).length} fail); complete independent passing evidence is still required`;
+          current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+          delete current.claim;
+        });
+        return job;
+      }
       if (provenChecklist(issue.body, job.acLabels) !== issue.body) throw new Error("Checklist changed before completion; retry job closeout");
       if (!issueFinished(issue)) {
         issue = await unchanged(issue);

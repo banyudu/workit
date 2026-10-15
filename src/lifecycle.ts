@@ -20,6 +20,7 @@ export interface LifecycleConfig {
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
 }
+export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
@@ -34,7 +35,7 @@ export interface Job {
   wake?: { id: string; reason: string; revision: number; counted?: boolean };
   verification?: VerificationReport;
   closeout?: {
-    checklist?: { before: string; after: string; issueID: string; teamID: string };
+    checklist?: { before: string; after: string; issueID: string; teamID: string; changes?: ChecklistChange[] };
     checklistConfirmed?: boolean; stateID?: string; stateConfirmed?: boolean;
   };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
@@ -100,12 +101,24 @@ export function acceptance(body: string): { acHash: string; acLabels: string[] }
 
 /** Replace only the checkbox byte of proven, stable-labelled ACs. */
 export function provenChecklist(body: string, labels: string[]): string {
+  return synchronizeChecklist(body, labels.map(label => ({ label, checked: true })));
+}
+
+export function synchronizeChecklist(body: string, changes: ChecklistChange[]): string {
   acceptance(body); // Reject ambiguous labels before editing.
-  const proven = new Set(labels);
+  const proven = new Map(changes.map(item => [item.label, item.checked]));
   for (const item of checklistCriteria(body).reverse()) {
-    if (proven.has(item.label) && !item.checked) body = body.slice(0, item.offset) + "x" + body.slice(item.offset + 1);
+    if (proven.has(item.label) && proven.get(item.label) !== item.checked) {
+      body = body.slice(0, item.offset) + (proven.get(item.label) ? "x" : " ") + body.slice(item.offset + 1);
+    }
   }
   return body;
+}
+
+/** Call only after validating the independent report. Omitted/blocked/unproven results leave boxes alone. */
+export function checklistChanges(report: VerificationReport): ChecklistChange[] {
+  return report.criteria.filter(item => item.status !== "blocked" && item.evidence.length > 0)
+    .map(item => ({ label: item.label, checked: item.status === "pass" }));
 }
 
 export function workflowState(stage: Stage): string {
@@ -258,7 +271,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
   }, now);
 }
 
-export function validateReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
+export function validateProgressReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
   const report = value as VerificationReport;
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
@@ -268,13 +281,17 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
   }
   const checked = Date.parse(report.checkedAt);
   if (!Number.isFinite(checked) || checked < Date.parse(job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
-  if (!Array.isArray(report.criteria) || report.criteria.length !== job.acLabels.length ||
-      new Set(report.criteria.map(item => item.label)).size !== job.acLabels.length) throw new Error("Verification must cover every AC exactly once");
-  for (const label of job.acLabels) {
-    const item = report.criteria.find(item => item.label === label);
-    if (!item || item.status !== "pass" || !Array.isArray(item.evidence) || !item.evidence.length ||
+  if (!Array.isArray(report.criteria) || !report.criteria.length || report.criteria.length > job.acLabels.length ||
+      new Set(report.criteria.map(item => item?.label)).size !== report.criteria.length ||
+      report.criteria.some(item => !item || !job.acLabels.includes(item.label) || !["pass", "fail", "blocked"].includes(item.status) || !Array.isArray(item.evidence))) {
+    throw new Error("Verification entries must have unique current AC labels, a valid status and an evidence array");
+  }
+  for (const item of report.criteria) {
+    const label = item.label;
+    if (item.status === "blocked" || (item.status === "fail" && !item.evidence.length)) continue;
+    if (!item.evidence.length ||
         item.evidence.some(entry => !entry.kind?.trim() || !entry.reference?.trim() || !entry.observed?.trim())) {
-      throw new Error(`AC '${label}' lacks passing evidence`);
+      throw new Error(`AC '${label}' lacks evidence for its reported result`);
     }
     if (checklistCriteria(currentBody).find(criterion => criterion.label === label)?.human &&
         !item.evidence.some(entry => entry.kind === "human" && typeof entry.confirmedBy === "string" && entry.confirmedBy.trim())) {
@@ -282,12 +299,34 @@ export function validateReport(job: Job, value: unknown, currentBody: string, no
     }
   }
   if (job.config.verification !== "local") {
-    const matches = (value?: Deployment) => value && job.deployment &&
-      ["environment", "target", "sourceSha", "version"].every(key => value[key as keyof Deployment] === job.deployment![key as keyof Deployment]);
-    if (!matches(report.deployment) || !report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matches(entry.deployment)))) {
-      throw new Error("Verification needs journey evidence for the observed deployment");
+    if (report.deployment && !matchesDeployment(job, report.deployment)) throw new Error("Verification deployment binding is stale");
+    for (const item of report.criteria.filter(item => item.status !== "blocked")) {
+      for (const entry of item.evidence) {
+        if ((entry.deployment && !matchesDeployment(job, entry.deployment)) ||
+            (entry.kind === "journey" && (!matchesDeployment(job, report.deployment) || !matchesDeployment(job, entry.deployment)))) {
+          throw new Error("Verification needs journey evidence for the observed deployment");
+        }
+      }
     }
   }
+  return report;
+}
+
+function matchesDeployment(job: Job, value?: Deployment): boolean {
+  return !!value && !!job.deployment &&
+    (["environment", "target", "sourceSha", "version"] as const).every(key => value[key] === job.deployment![key]);
+}
+
+/** Completeness is a report property; existing checked boxes cannot supply missing evidence. */
+export function reportComplete(job: Job, report: VerificationReport): boolean {
+  return report.criteria.length === job.acLabels.length && report.criteria.every(item => item.status === "pass") &&
+    (job.config.verification === "local" || (matchesDeployment(job, report.deployment) &&
+      report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment)))));
+}
+
+export function validateReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
+  const report = validateProgressReport(job, value, currentBody, now);
+  if (!reportComplete(job, report)) throw new Error("Completion needs passing evidence for every AC and applicable deployed journey evidence");
   return report;
 }
 
@@ -338,7 +377,8 @@ function prompt(job: Job, reason: string): string {
     "Own implementation, preverification, review repair, merge when authorized, deployed acceptance and any follow-up fix. Do not stop at merge.",
     "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
     `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
-    "Verification requires independent AC evidence, the actual serving version, and applicable journeys. Use workit job verify --report; process exit is not completion.",
+    "Submit independent partial AC results with workit job verify --report to synchronize proven Linear checkbox states while leaving the issue state unchanged.",
+    "Completion still requires complete passing independent AC evidence, the actual serving version where applicable, and applicable journeys; process exit is not completion.",
   ].filter(Boolean).join("\n");
 }
 

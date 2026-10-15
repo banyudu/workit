@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, WorkflowRefusedError, acceptance, checkpoint, createJob, provenChecklist, tick, validateReport, workflowState,
+import { JobStore, WorkflowRefusedError, acceptance, checkpoint, checklistChanges, createJob, provenChecklist, synchronizeChecklist, tick, validateProgressReport, validateReport, workflowState,
   type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerificationReport } from "./lifecycle.js";
 import { heartbeatPlist } from "./heartbeat.js";
 
@@ -313,6 +313,23 @@ test("local-only acceptance is explicit and still needs complete independent AC 
   validateReport(job, valid, body, now);
   const deployed = { ...job, config: { ...job.config, verification: "deployed" as const } };
   assert.throws(() => validateReport(deployed, valid, body, now), /journey/);
+});
+
+test("independent partial reports sync only evidenced results without satisfying completion", t => {
+  const { job } = fixture(t, { verification: "local" }); job.mergeSha = mergeSha;
+  const partial = report(job); partial.criteria.pop();
+  validateProgressReport(job, partial, body, now);
+  assert.throws(() => validateReport(job, partial, body, now), /every AC/);
+  const after = synchronizeChecklist(body, checklistChanges(partial));
+  assert.equal(after, body.replace("[ ] `[test:behavior]`", "[x] `[test:behavior]`"));
+  partial.criteria[0].status = "fail";
+  validateProgressReport(job, partial, after, now);
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), body);
+  partial.criteria[0].evidence = [];
+  validateProgressReport(job, partial, after, now);
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), after, "unproven failure cannot clear a checkbox");
+  partial.criteria[0].status = "blocked";
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), after);
 });
 
 test("stable-label synchronization preserves all other bytes, including CRLF, notes and other checklists", () => {

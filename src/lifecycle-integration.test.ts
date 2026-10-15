@@ -344,14 +344,15 @@ test("actual process interruption after checklist commit recovers from persisted
 });
 
 test("acceptance and owner gates prevent every tracker write", async t => {
-  for (const gate of ["stale-ac", "partial", "failed", "self", "unmerged", "human", "paused", "needs-you", "cancelled",
+  for (const gate of ["stale-ac", "missing-evidence", "unknown-label", "duplicate-label", "self", "unmerged", "human", "paused", "needs-you", "cancelled",
     "tracker-hold", "hold-label", "canceled-state", "duplicate-state", "archived", "snoozed", "no-completed-state", "pending-wake"]) {
     await t.test(gate, async tt => {
       const f = await linearFixture(tt, gate === "human");
       switch (gate) {
         case "stale-ac": f.linear.description += "\n"; f.linear.description = f.linear.description.replace("Expected behavior.", "New requirement."); break;
-        case "partial": f.report.criteria.pop(); break;
-        case "failed": f.report.criteria[0].status = "fail"; break;
+        case "missing-evidence": f.report.criteria[0].evidence = []; break;
+        case "unknown-label": f.report.criteria[0].label = "unknown"; break;
+        case "duplicate-label": f.report.criteria[0].label = f.report.criteria[1].label; break;
         case "self": f.report.reviewer.runID = f.job.sessionID; break;
         case "unmerged": f.github.mergeSha = "c".repeat(40); writeFileSync(f.githubFile, JSON.stringify(f.github)); break;
         case "paused": case "needs-you": case "cancelled": checkpoint(f.store, f.job.id, { stage: gate, detail: "Owner hold" }); break;
@@ -452,6 +453,8 @@ test("generated managed instructions describe automatic closeout, recovery, race
   const f = await linearFixture(t);
   const instructions = managedInstructions(f.job).join("\n");
   assert.match(instructions, /automatically synchronizes proven Linear AC/);
+  assert.match(instructions, /Submit independent partial progress/);
+  assert.match(instructions, /Only evidenced pass\/fail checkbox states/);
   assert.match(instructions, /job closeout/);
   assert.match(instructions, /race/);
   assert.match(instructions, /owner holds and real human acceptance/);
@@ -498,4 +501,111 @@ test("serving version changes prevent state completion even after the checklist 
   assert.equal(f.store.get(f.job.id).stage, "verifying");
   await assert.rejects(f.retry(), /Serving deployment changed/);
   assert.equal(f.effects.writes.length, 1);
+});
+
+test("partial and mixed reports synchronize proven checkbox states while keeping the issue and job unfinished", async t => {
+  for (const remaining of ["omitted", "fail", "blocked", "unproven-fail"]) await t.test(remaining, async tt => {
+    const f = await linearFixture(tt);
+    const complete = structuredClone(f.report);
+    if (remaining === "omitted") f.report.criteria.pop();
+    else {
+      // A blocked/unproven result must preserve a human's existing checked box.
+      f.linear.description = f.linear.description.replace("[ ] `[code:contract]`", "[x] `[code:contract]`");
+      f.report.criteria[1].status = remaining === "blocked" ? "blocked" : "fail";
+      if (remaining !== "fail") f.report.criteria[1].evidence = [];
+    }
+    const before = f.linear.description;
+    await f.verify();
+    const expected = before.replace("[ ] `[test:behavior]`", "[x] `[test:behavior]`");
+    assert.equal(f.linear.description, remaining === "fail" ? expected.replace("[x] `[code:contract]`", "[ ] `[code:contract]`") : expected);
+    assert.equal(f.linear.state.id, "review-id");
+    assert.equal(f.store.get(f.job.id).stage, "verifying");
+    assert.match(f.store.get(f.job.id).detail, /progress synchronized/);
+    assert.deepEqual([...f.effects.writes], [{ description: f.linear.description }]);
+    await f.retry();
+    assert.equal(f.effects.writes.length, 1, "partial report retries are idempotent");
+    assert.equal(f.store.get(f.job.id).stage, "verifying");
+    Object.assign(f.report, complete);
+    await f.verify();
+    assert.equal(f.store.get(f.job.id).stage, "verified");
+    assert.equal(f.linear.state.id, "team-a-complete");
+    assert.equal(f.effects.writes.filter(input => input.stateId).length, 1);
+  });
+});
+
+test("separate partial reports can check every box without accumulating evidence into completion", async t => {
+  const f = await linearFixture(t);
+  const complete = structuredClone(f.report);
+  f.report.criteria = [complete.criteria[0]];
+  await f.verify();
+  f.linear.description += "Preserve this newer human note.\n";
+  f.report.criteria = [complete.criteria[1]];
+  await f.verify();
+  assert.equal(provenChecklist(f.linear.description, f.job.acLabels), f.linear.description, "all boxes are checked");
+  assert.equal(f.store.get(f.job.id).stage, "verifying", "only the latest independent report counts for completeness");
+  assert.equal(f.linear.state.id, "review-id");
+  assert.equal(f.effects.writes.length, 2);
+  await f.retry();
+  assert.equal(f.effects.writes.length, 2);
+  Object.assign(f.report, complete);
+  await f.verify();
+  assert.equal(f.store.get(f.job.id).stage, "verified");
+  assert.equal(f.effects.writes.length, 3, "complete report needs only the state update");
+  assert.match(f.linear.description, /newer human note/);
+});
+
+test("partial synchronization failures and uncertain responses recover without closing the issue", async t => {
+  for (const mode of ["reject", "unreadable", "lost"]) await t.test(mode, async tt => {
+    const f = await linearFixture(tt);
+    f.report.criteria.pop();
+    f.effects.modes.description = mode;
+    if (mode === "lost") await f.verify();
+    else await assert.rejects(f.verify());
+    const saved = new JobStore(join(f.directory, "state")).get(f.job.id);
+    assert.equal(saved.stage, "verifying");
+    assert.equal(saved.verification?.criteria.length, 1);
+    delete f.effects.modes.description;
+    await f.retry();
+    assert.equal(f.store.get(f.job.id).stage, "verifying");
+    assert.equal(f.linear.state.id, "review-id");
+    assert.equal(f.effects.writes.length, mode === "reject" ? 2 : 1);
+    assert.equal(f.effects.writes.some(input => input.stateId), false);
+  });
+});
+
+test("blocked human acceptance allows other proven ACs to sync and never substitutes for confirmation", async t => {
+  const f = await linearFixture(t, true);
+  f.report.criteria[0].status = "blocked"; f.report.criteria[0].evidence = [];
+  await f.verify();
+  assert.match(f.linear.description, /\[ \] `\[human:behavior\]`/);
+  assert.match(f.linear.description, /\[x\] `\[code:contract\]`/);
+  assert.equal(f.store.get(f.job.id).stage, "verifying");
+  const writes = f.effects.writes.length;
+  f.report.criteria[0].status = "pass";
+  f.report.criteria[0].evidence = [{ kind: "test", reference: "artifact://not-confirmation", observed: "Automated test" }];
+  await assert.rejects(f.verify(), /human confirmation/);
+  assert.equal(f.effects.writes.length, writes);
+});
+
+test("deployed progress can sync code evidence while journey acceptance remains pending", async t => {
+  const f = await linearFixture(t);
+  const { ready, ...deployment } = f.github.deployment;
+  f.store.update(f.job.id, current => { current.config.verification = "deployed"; current.deployment = deployment; });
+  const complete = structuredClone(f.report);
+  f.report.criteria = [complete.criteria[1]];
+  await f.verify();
+  assert.equal(f.store.get(f.job.id).stage, "verifying");
+  assert.equal(f.effects.writes.length, 1);
+  f.github.deployment.version = "v2"; writeFileSync(f.githubFile, JSON.stringify(f.github));
+  await assert.rejects(f.retry(), /Serving deployment changed/);
+  assert.equal(f.effects.writes.length, 1);
+  f.github.deployment.version = "v1"; writeFileSync(f.githubFile, JSON.stringify(f.github));
+  Object.assign(f.report, complete);
+  await f.verify();
+  assert.equal(f.store.get(f.job.id).stage, "verifying", "even all-pass local results cannot close deployed acceptance without a journey");
+  assert.equal(f.linear.state.id, "review-id");
+  f.report.deployment = deployment;
+  f.report.criteria[0].evidence = [{ kind: "journey", reference: "artifact://serving-journey", observed: "Journey passed", deployment }];
+  await f.verify();
+  assert.equal(f.store.get(f.job.id).stage, "verified");
 });

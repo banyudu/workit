@@ -140,15 +140,38 @@ failures use bounded exponential backoff, then become `needs-you`.
 
 ## Verified completion
 
-An independent verifier produces a report covering every current AC. Submit it
-once acceptance is proven:
+An independent verifier can submit AC progress as soon as individual results
+are proven, using the same command as final completion:
 
 ```bash
 workit job verify JOB_ID --report /absolute/path/verification.json
 ```
 
-For Linear, this command automatically checks the proven ACs, resolves the
-issue's actual team's active `completed` workflow state, and confirms checklist
+For Linear, partial reports synchronize evidenced results even while other ACs
+are missing, failed or blocked. `pass` with valid evidence checks that AC; `fail`
+with valid evidence unchecks it. Omitted or `blocked` ACs, and failures with no
+evidence, retain their existing checkbox state. A claimed pass with missing or
+invalid evidence rejects the report. Each included label must be current and
+unique, and human results still require attributed human confirmation.
+Report pending human acceptance as `blocked` so other proven ACs can synchronize.
+
+For example, submit just the passing `documented-contract` entry from the report
+below while the journey is still pending. Only that checkbox is synchronized;
+the issue state is unchanged and the returned job remains `verifying`. This is
+accepted progress, not verified completion. Retry a failed/interrupted sync with
+`job closeout JOB_ID`, which revalidates the stored partial report first.
+
+Progress synchronization retains the current issue/AC binding, merged-source,
+independent-reviewer, owner-hold and applicable serving-version gates. A deployed
+job still rechecks its observed serving version, but a partial report containing
+only local/code evidence does not need a fabricated journey. Included journey
+or version-bound evidence must match the actual observed deployment.
+
+Final completion requires one complete passing report covering every current
+AC, including applicable deployed journey evidence. Reports are not accumulated
+to infer completion: existing checked boxes and passes from earlier submissions
+cannot fill gaps in the latest report. Only then does workit resolve the
+issue's actual team's active `completed` workflow state and confirm checklist
 and state by readback before marking the job `verified`. No extra per-issue
 approval is needed for this validated managed path. Existing completed states
 are retained; canceled/duplicate states never count as successful completion.
@@ -161,7 +184,9 @@ Linear closeout requires `LINEAR_API_KEY` and uses the supported public
 `IssueUpdateInput.description` or `stateId`. It does not depend on CLI-specific
 full-description helpers or an invented compare-and-swap parameter.
 
-The job stores the accepted report and each mutation intent before sending it.
+The job stores the latest accepted progress/completion report and each mutation
+intent before sending it. A subsequent report can update more ACs without
+repeating already-applied results.
 After a failure or interruption, inspect status and retry only that job:
 
 ```bash
@@ -179,9 +204,9 @@ migration runs automatically. Missing/stale reports require fresh independent
 evidence and `job verify --report PATH`.
 
 Checkbox synchronization matches unique stable labels in a fresh Acceptance
-Criteria section and changes only the checkbox character, retaining all other
-description bytes, other checklists and current human edits. A second read
-compares description, `updatedAt`, team, state and hold labels immediately before
+Criteria section and changes only the evidenced pass/fail checkbox character,
+retaining all other description bytes, other checklists and current human edits.
+A second read compares description, `updatedAt`, team, state and hold labels immediately before
 each mutation. Changed AC content invalidates the report. Changed snapshots
 abort before writing; post-write readback must match the intended description.
 On an ambiguous pending checklist conflict, inspect Linear's current description
@@ -247,10 +272,10 @@ Example report (labels and hashes must match job status):
 
 AC labels use `[test:journey-contract]`-style tags. Unlabeled checkboxes receive
 stable content hashes shown in job status. Checked/unchecked changes preserve
-the AC hash; contract edits invalidate it. Every AC must occur exactly once with
-passing evidence. Deployed acceptance needs applicable journey evidence bound to
-the observed target/version. Completion rechecks the merged PR, current ACs,
-tracker completion and serving deployment. A changed serving version requires
+the AC hash; contract edits invalidate it. For final completion, every AC must
+occur exactly once with passing evidence. Deployed acceptance needs applicable
+journey evidence bound to the observed target/version. Completion rechecks the
+merged PR, current ACs, tracker completion and serving deployment. A changed serving version requires
 fresh applicable evidence.
 
 Every `[human:label]` (or `[human]`) AC additionally requires evidence with

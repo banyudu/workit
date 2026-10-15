@@ -42,8 +42,10 @@ The heartbeat never grants merge/deployment authority.`);
     console.log(`Verification report contract (see docs/managed-delivery.md):
 {jobID, issueURL, acHash, mergeSha, checkedAt, reviewer: {runID, independent: true},
  deployment?: {environment, target, sourceSha, version},
- criteria: [{label, status: "pass", evidence: [{kind, reference, observed, deployment?, confirmedBy?}]}]}
-Use exact labels/hash from job status, one entry per AC, and an independent verifier's observations.
+ criteria: [{label, status: "pass"|"fail"|"blocked", evidence: [{kind, reference, observed, deployment?, confirmedBy?}]}]}
+Use exact labels/hash from job status, unique AC entries, and an independent verifier's observations.
+Linear accepts partial reports: evidenced passes check ACs, evidenced failures uncheck them, and omitted/blocked results leave boxes unchanged.
+Partial reports leave the issue state unchanged and job verifying; completion still requires a complete passing report.
 Deployed acceptance requires journey evidence bound to the observed serving version.
 Human ACs require human evidence with confirmedBy and a reference to actual confirmation.
 Validated Linear closeout automatically checks proven ACs and completes the actual team workflow.
@@ -139,6 +141,7 @@ export function managedInstructions(job: Job): string[] {
     `Use workit job status ${job.id} to read durable state. Before ending a turn, use workit job checkpoint ${job.id} --stage STAGE --detail TEXT, with --pr URL and --merge-sha FULL_SHA when known.`,
     "Use waiting-ci or waiting-deploy for external waits; use needs-you for missing authority, auth, tools, ambiguous recovery or irreducible human acceptance. Do not leave an active goal repeatedly polling an external wait.",
     `Completion requires an independent verification report accepted by workit job verify ${job.id} --report PATH. Source, merge, deployment, journey and issue closeout are separate claims. After validated acceptance, workit automatically synchronizes proven Linear AC checkboxes, resolves the actual team completed state, and confirms both by readback before marking verified. No extra approval is needed for this managed closeout; owner holds and real human acceptance remain authoritative. GitHub closeout still follows repository policy.`,
+    `Submit independent partial progress with workit job verify ${job.id} --report PATH even while other ACs are omitted, failed or blocked. Only evidenced pass/fail checkbox states synchronize; the job stays verifying and the issue state is unchanged until a complete passing report meets every completion gate. Existing checked boxes never substitute for missing report evidence.`,
     `Retry interrupted tracker effects with workit job closeout ${job.id}; it revalidates the stored independent report and can reconcile an older verified-but-open job. Fresh reads detect observable conflicts; Linear has no conditional description update, so concurrent edits in the final read/write window remain a race. Inspect conflicts before retrying.`,
     "Use workit job --help for the verification report contract. If the serving version changes during verification, checkpoint waiting-deploy to refresh it and rerun the affected acceptance probes before submitting new evidence.",
     "The job is not complete when your process exits. Fix failed acceptance in a follow-up PR and refresh the merge/deployment checkpoint before verifying again.",
