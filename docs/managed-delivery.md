@@ -140,13 +140,96 @@ failures use bounded exponential backoff, then become `needs-you`.
 
 ## Verified completion
 
-An independent verifier produces a report covering every current AC. After
-acceptance is proven, reconcile the issue's evidence/checklist and completed
-state under repository policy, then submit:
+An independent verifier can submit AC progress as soon as individual results
+are proven, using the same command as final completion:
 
 ```bash
 workit job verify JOB_ID --report /absolute/path/verification.json
 ```
+
+For Linear, partial reports synchronize evidenced results even while other ACs
+are missing, failed or blocked. `pass` with valid evidence checks that AC; `fail`
+with valid evidence unchecks it. Omitted or `blocked` ACs, and failures with no
+evidence, retain their existing checkbox state. A claimed pass with missing or
+invalid evidence rejects the report. Each included label must be current and
+unique, and human results still require attributed human confirmation.
+Report pending human acceptance as `blocked` so other proven ACs can synchronize.
+
+For example, submit just the passing `documented-contract` entry from the report
+below while the journey is still pending. Only that checkbox is synchronized;
+the issue state is unchanged and the returned job remains `verifying`. This is
+accepted progress, not verified completion. Retry a failed/interrupted sync with
+`job closeout JOB_ID`, which revalidates the stored partial report first.
+
+Progress synchronization retains the current issue/AC binding, merged-source,
+independent-reviewer, owner-hold and applicable serving-version gates. A deployed
+job still rechecks its observed serving version, but a partial report containing
+only local/code evidence does not need a fabricated journey. Included journey
+or version-bound evidence must match the actual observed deployment.
+
+Final completion requires one complete passing report covering every current
+AC, including applicable deployed journey evidence. Reports are not accumulated
+to infer completion: existing checked boxes and passes from earlier submissions
+cannot fill gaps in the latest report. Only then does workit resolve the
+issue's actual team's active `completed` workflow state and confirm checklist
+and state by readback before marking the job `verified`. No extra per-issue
+approval is needed for this validated managed path. Existing completed states
+are retained; canceled/duplicate states never count as successful completion.
+If a team has several completed states, the first by workflow position (then ID)
+is selected. GitHub behavior is unchanged: close the issue under repository
+policy before submitting; workit does not mutate its body or state.
+
+Linear closeout requires `LINEAR_API_KEY` and uses the supported public
+[GraphQL issueUpdate API](https://linear.app/developers/graphql) with
+`IssueUpdateInput.description` or `stateId`. It does not depend on CLI-specific
+full-description helpers or an invented compare-and-swap parameter.
+
+The job stores the latest accepted progress/completion report and each mutation
+intent before sending it. A subsequent report can update more ACs without
+repeating already-applied results.
+After a failure or interruption, inspect status and retry only that job:
+
+```bash
+workit job status JOB_ID
+workit job closeout JOB_ID
+```
+
+`closeout` revalidates stored independent evidence against current ACs, GitHub
+merged source and, where applicable, the actual serving version. It reads the
+tracker before retrying an uncertain mutation, skips effects already confirmed,
+and never claims a newly verified job while either effect is unconfirmed.
+It also reconciles a job marked `verified` by older workit versions; that job
+returns to `verifying` until revalidation and readbacks succeed. No bulk job
+migration runs automatically. Missing/stale reports require fresh independent
+evidence and `job verify --report PATH`.
+
+Checkbox synchronization matches unique stable labels in a fresh Acceptance
+Criteria section and changes only the evidenced pass/fail checkbox character,
+retaining all other description bytes, other checklists and current human edits.
+A second read compares description, `updatedAt`, team, state and hold labels immediately before
+each mutation. Changed AC content invalidates the report. Changed snapshots
+abort before writing; post-write readback must match the intended description.
+On an ambiguous pending checklist conflict, inspect Linear's current description
+and activity history, merge/restore the checkbox-only change without removing
+human edits, then retry `job closeout`. Workit does not blindly restore an old
+full description. Lost responses are reconciled even when the API reported an
+error; retries do not repeat an effect already present.
+
+Linear does not expose a conditional description/state update. These reads
+detect observable conflicts but cannot eliminate edits or holds arriving between
+the last read and mutation, or an edit overwritten in that window. Local SQLite
+claims serialize workit processes in one state directory, not other clients or
+hosts. Human writers should avoid concurrent description edits during closeout;
+inspect activity history if a race is suspected. Workit preserves concurrent
+local pauses/checkpoints and never clears an explicit hold to finish closeout.
+Readback also cannot rule out a timed-out request committing later; a retry sends
+the same field value, but Linear may record another activity or notification.
+
+Paused, human-blocked and canceled jobs cannot close out. Linear archived or
+snoozed issues, states named `On Hold`, `Hold`, `Paused` or `Blocked`, and labels
+`owner-hold`, `owner hold`, `on-hold`, `on hold`, `hold`, `paused` or `blocked`
+also block mutations until explicitly released. Represent owner holds through
+these controls rather than relying on prose in the description.
 
 Example report (labels and hashes must match job status):
 
@@ -189,11 +272,18 @@ Example report (labels and hashes must match job status):
 
 AC labels use `[test:journey-contract]`-style tags. Unlabeled checkboxes receive
 stable content hashes shown in job status. Checked/unchecked changes preserve
-the AC hash; contract edits invalidate it. Every AC must occur exactly once with
-passing evidence. Deployed acceptance needs applicable journey evidence bound to
-the observed target/version. Completion rechecks the merged PR, current ACs,
-tracker completion and serving deployment. A changed serving version requires
+the AC hash; contract edits invalidate it. For final completion, every AC must
+occur exactly once with passing evidence. Deployed acceptance needs applicable
+journey evidence bound to the observed target/version. Completion rechecks the
+merged PR, current ACs, tracker completion and serving deployment. A changed serving version requires
 fresh applicable evidence.
+
+Every `[human:label]` (or `[human]`) AC additionally requires evidence with
+`kind: "human"`, a nonempty `confirmedBy` naming the actual human, and a
+`reference` to that person's explicit confirmation. An agent must not fabricate
+this attestation; ordinary test evidence and existing checked boxes do not waive
+human acceptance. The validator checks the attestation structure, while the
+independent verifier owns its truth.
 
 The validator checks completeness and provenance bindings, not the semantic
 truth of observations. The independent verifier/repository tools still own
@@ -204,6 +294,9 @@ verified. Verified/cancelled jobs stop scheduling after their final Banyan
 projection is delivered. Banyan shows an independent workflow badge and offers
 **Close verified sessions**. Repository merge/deployment authorization remains
 in force throughout.
+Automatic tracker completion grants no verifier-dispatch, merge, deployment,
+runtime-configuration or external-messaging authority. It changes the former
+human-only Linear Done policy only for this validated managed closeout path.
 
 ## Development verification
 
