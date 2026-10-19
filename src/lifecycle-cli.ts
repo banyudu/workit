@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, checkpoint, controlCommand, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, checkpoint, controlCommand, parseVerificationMode, setVerificationMode, stages, tick, verificationInstructions, type Job, type Stage } from "./lifecycle.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
 import { heartbeatCLI } from "./heartbeat.js";
 
@@ -27,16 +27,17 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
     console.log(`workit tick [--job ID]
 workit job list
 workit job status ID
-workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS]
+workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS] [--verification local|deployed] [--tracker-completion human|automatic]
 workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
 workit job cancel ID --detail TEXT
-workit job resume ID [--detail TEXT]
+workit job resume ID [--detail TEXT] [--verification local|deployed]
 workit job reconcile ID --delivery delivered|not-delivered --detail TEXT
+workit job refresh-deployment ID
 workit job verify ID --report PATH
 workit job closeout ID
 workit heartbeat install [--interval 60] | uninstall | status
 Stages: ${stages.join(", ")}
-Managed launches: workit --managed ISSUE (Banyan only)
+Managed launches: workit --managed [--verification local|deployed] ISSUE (Banyan only)
 State: $WORKIT_STATE_DIR/lifecycle.sqlite; python3 + sqlite3 required.
 The heartbeat never grants merge/deployment authority.`);
     console.log(`Verification report contract (see docs/managed-delivery.md):
@@ -49,7 +50,9 @@ Partial reports leave the issue state unchanged and job verifying; completion st
 Deployed acceptance requires journey evidence bound to the observed serving version.
 Human ACs require human evidence with confirmedBy and a reference to actual confirmation.
 Validated Linear closeout automatically checks proven ACs and completes the actual team workflow.
-Retry/reconcile one job with job closeout ID; stored evidence is revalidated against current AC/source/version.`);
+Retry/reconcile one job with job closeout ID; stored evidence is revalidated against current AC/source/version.
+Local acceptance skips deployment checks and still requires complete independent AC evidence.
+--verification overrides this job only; include local acceptance coverage in --detail when correcting a job.`);
     return;
   }
   const store = new JobStore();
@@ -68,10 +71,12 @@ Retry/reconcile one job with job closeout ID; stored evidence is revalidated aga
     case "status":
       only(values, []); job = store.get(id); break;
     case "checkpoint":
-      only(values, ["--stage", "--detail", "--pr", "--merge-sha", "--after"]);
+      only(values, ["--stage", "--detail", "--pr", "--merge-sha", "--after", "--verification", "--tracker-completion"]);
       if (!values["--stage"] || !values["--detail"]?.trim()) throw new Error("checkpoint requires --stage and --detail");
       job = checkpoint(store, id, { stage: values["--stage"] as Stage, detail: values["--detail"],
         pr: values["--pr"], mergeSha: values["--merge-sha"],
+        verification: values["--verification"] === undefined ? undefined : parseVerificationMode(values["--verification"]),
+        trackerCompletion: values["--tracker-completion"] as "human" | "automatic" | undefined,
         after: values["--after"] === undefined ? undefined : Number(values["--after"]) });
       await project(store, adapter, job); break;
     case "pause":
@@ -84,10 +89,12 @@ Retry/reconcile one job with job closeout ID; stored evidence is revalidated aga
         expectedSessionID: values["--expected-session-id"] });
       await project(store, adapter, job); break;
     case "resume":
-      only(values, ["--detail"]);
+      only(values, ["--detail", "--verification"]);
+      if (values["--verification"] !== undefined && !values["--detail"]?.trim()) throw new Error("--detail must explain the verification-mode correction");
       job = store.update(id, current => {
         if (!["paused", "needs-you"].includes(current.stage)) throw new Error("Only paused/human-blocked jobs can be resumed");
         if (current.wake) throw new Error("Pending wake requires inspected job reconcile before resume");
+        if (values["--verification"] !== undefined) setVerificationMode(current, values["--verification"]);
         current.stage = current.deployment || (current.mergeSha && current.config.verification === "local") ? "verifying"
           : current.mergeSha ? "waiting-deploy" : current.pr ? "waiting-ci" : "implementing";
         current.detail = values["--detail"] ?? "Explicitly resumed";
@@ -110,6 +117,31 @@ Retry/reconcile one job with job closeout ID; stored evidence is revalidated aga
         current.lastRecovery = { wakeID: expected.wake!.id, outcome, detail: values["--detail"], at: new Date().toISOString() };
         delete current.wake; current.errors = 0;
         current.detail = "Wake reconciled; explicit job resume is still required";
+      });
+      await project(store, adapter, job); break;
+    }
+    case "refresh-deployment": {
+      only(values, []);
+      const expected = store.get(id);
+      if (!["waiting-deploy", "verifying"].includes(expected.stage) || expected.wake || expected.claim)
+        throw new Error("Deployment refresh requires an unheld post-merge job without a pending wake or claim");
+      if (expected.config.verification === "local") throw new Error("Local verification has no serving deployment");
+      const pr = await adapter.pr(expected);
+      if (!pr.merged || pr.mergeSha !== expected.mergeSha)
+        throw new Error("GitHub does not establish the expected merged source");
+      const deployment = await adapter.deployment(expected);
+      if (!deployment || !await adapter.containsMerge(expected, deployment.sourceSha))
+        throw new Error("Serving deployment does not establish the merged source");
+      job = store.update(id, current => {
+        if (current.revision !== expected.revision || current.stage !== expected.stage ||
+            current.pr !== expected.pr || current.mergeSha !== expected.mergeSha || current.wake || current.claim)
+          throw new Error("Job changed during deployment refresh; reread and retry");
+        current.deployment = deployment;
+        current.stage = "verifying";
+        delete current.verification;
+        delete current.closeout;
+        delete current.trackerDone;
+        current.detail = "Trusted serving deployment refreshed; independent acceptance evidence is still required";
       });
       await project(store, adapter, job); break;
     }
@@ -136,7 +168,8 @@ export function managedInstructions(job: Job): string[] {
   return [
     `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
     `You own managed workit job ${job.id} through verified issue completion, not just a PR. Banyan session: ${job.sessionID}.`,
-    "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, await the scheduled deployment, then independently verify the applicable deployed journeys.",
+    "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, then independently verify the applicable acceptance criteria.",
+    ...verificationInstructions(job),
     "Do not create a native goal or scheduled task for this managed issue: workit owns continuation and its heartbeat. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
     `Use workit job status ${job.id} to read durable state. Before ending a turn, use workit job checkpoint ${job.id} --stage STAGE --detail TEXT, with --pr URL and --merge-sha FULL_SHA when known.`,
     "Use waiting-ci or waiting-deploy for external waits; use needs-you for missing authority, auth, tools, ambiguous recovery or irreducible human acceptance. Do not leave an active goal repeatedly polling an external wait.",

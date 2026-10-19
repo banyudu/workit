@@ -45,6 +45,20 @@ if (name === "banyanctl") {
   else if (args[0] === "api") output = {status: "ahead"};
   else if (args[0] === "issue") output = fixture.issue;
   else process.exit(2);
+} else if (name === "linear") {
+  if (args[1] === "view") output = fixture.issue;
+  else if (args[1] === "update") {
+    const state = value("--state");
+    fixture.stateUpdates.push(state);
+    if (state === "Done" && fixture.failDone) {
+      fs.writeFileSync(file, JSON.stringify(fixture));
+      process.exit(1);
+    }
+    if (!(state === "Done" && fixture.ignoreDone)) {
+      fixture.issue.state = {name: state, type: state === "Done" ? "completed" : "started"};
+    }
+    output = {success: true};
+  } else process.exit(2);
 } else output = fixture.deployment;
 fs.writeFileSync(file, JSON.stringify(fixture));
 process.stdout.write(JSON.stringify(output));
@@ -97,7 +111,7 @@ test("real CLI/adapters drive deployment wait, version invalidation and evidence
     }] })) };
   const reportPath = join(directory, "verification.json");
   writeFileSync(reportPath, JSON.stringify(report));
-  await assert.rejects(lifecycleCLI(["job", "verify", job.id, "--report", reportPath]), /close it/);
+  await assert.rejects(lifecycleCLI(["job", "verify", job.id, "--report", reportPath]), /close it under repository policy/);
   const moved = JSON.parse(readFileSync(file, "utf8"));
   moved.deployment.version = "version-2";
   moved.issue.state = "CLOSED";
@@ -119,6 +133,105 @@ test("GitHub remote normalization strips .git without losing repository scope", 
   assert.equal(githubRepository("git@github.com:example/project.git"), "example/project");
   assert.equal(githubRepository("https://github.com/example/project"), "example/project");
   assert.throws(() => githubRepository("https://example.invalid/project"));
+});
+
+for (const outcome of ["immediately", "after retrying a tracker failure", "after retrying an unconfirmed write"]) {
+  test(`accepted Linear verification closes the issue ${outcome}`, async t => {
+    const f = await linearFixture(t);
+    const pending = outcome !== "immediately";
+    if (pending) f.effects.modes.state = outcome.includes("unconfirmed") ? "ignore" : "reject";
+    const goodRun = f.report.reviewer.runID;
+    f.report.reviewer.runID = f.job.sessionID;
+    await assert.rejects(f.verify(), /independent reviewer/);
+    assert.deepEqual(f.effects.writes, []);
+    f.report.reviewer.runID = goodRun;
+    if (pending) {
+      await assert.rejects(f.verify(), /state.*(failed|confirmed)/i);
+      assert.equal(f.store.get(f.job.id).stage, "verifying");
+      assert.equal(f.linear.state.name, "In Review");
+      delete f.effects.modes.state;
+      const beforeRetry = f.effects.writes.length;
+      const originalBody = f.linear.description;
+      f.linear.description += "\n- [ ] `[test:added]` A new requirement.\n";
+      // Change an AC inside its section, rather than unrelated delivery notes.
+      f.linear.description = f.linear.description.replace("Expected behavior.", "Changed behavior.");
+      const adapter = new BanyanLifecycleAdapter();
+      const retry = () => tick(f.store, adapter, { jobID: f.job.id, now: new Date(Date.now() + 61_000) });
+      await retry();
+      assert.equal(f.effects.writes.length, beforeRetry, "changed ACs invalidate automatic closure");
+      f.linear.description = originalBody;
+      const review = f.linear.state;
+      f.linear.state = { ...review, name: "On Hold", type: "backlog" };
+      await retry();
+      assert.equal(f.effects.writes.length, beforeRetry, "human holds remain authoritative");
+      f.linear.state = review;
+      await retry();
+    } else await f.verify();
+    assert.equal(f.linear.state.type, "completed");
+    assert.equal(f.store.get(f.job.id).stage, "verified");
+    assert.equal(f.store.get(f.job.id).trackerDone, true);
+  });
+}
+
+test("a deployment-blocked local issue can correct its own mode and complete without executing a probe", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "workit-local-"));
+  const savedEnv = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    rmSync(directory, { recursive: true, force: true });
+  });
+  for (const name of ["gh", "banyanctl"]) {
+    writeFileSync(join(directory, name), fake, { mode: 0o700 });
+  }
+  const file = join(directory, "fixture.json");
+  Object.assign(process.env, { PATH: directory + ":" + process.env.PATH, WORKIT_FIXTURE_FILE: file,
+    WORKIT_STATE_DIR: join(directory, "state"), WORKIT_BANYANCTL: join(directory, "banyanctl") });
+  const logs: string[] = [];
+  t.mock.method(console, "log", (value: string) => logs.push(value));
+  const issue = { backend: "github" as const, identifier: "7", number: 7,
+    title: "Local CLI", body: "## Acceptance Criteria\n- [ ] `[test:local]` Local tests pass.\n- [ ] `[code:layout]` Output uses the new layout.",
+    labels: [], url: "https://github.com/example/project/issues/7" };
+  const job = createJob({ issue, repoRoot: directory, worktree: directory, githubRepo: "example/project",
+    agent: "codex", config: { deploymentProbe: [join(directory, "must-not-run")] } });
+  const store = new JobStore();
+  store.insert(job);
+  const mergeSha = "a".repeat(40);
+  checkpoint(store, job.id, { stage: "needs-you", detail: "Local feature blocked by inherited deployment mode",
+    pr: "https://github.com/example/project/pull/8", mergeSha });
+  writeFileSync(file, JSON.stringify({ issue: { ...issue, state: "CLOSED" }, mergeSha,
+    session: { id: job.sessionID, cwd: directory, status: "idle" }, wakes: [] }));
+  await lifecycleCLI(["job", "checkpoint", job.id, "--stage", "needs-you", "--verification", "local",
+    "--detail", "All ACs have local test/code evidence; deployment is outside scope"]);
+  assert.equal(store.get(job.id).stage, "needs-you");
+  assert.equal(store.get(job.id).config.verification, "local");
+  assert.equal(store.get(job.id).nextWakeAt, undefined);
+  await lifecycleCLI(["job", "checkpoint", job.id, "--stage", "needs-you", "--verification", "deployed", "--detail", "Restore mode to test atomic resume correction"]);
+  const held = store.get(job.id);
+  await assert.rejects(lifecycleCLI(["job", "resume", job.id, "--verification", "local"]), /--detail/);
+  await assert.rejects(lifecycleCLI(["job", "resume", job.id, "--verification", "invalid", "--detail", "Invalid correction"]), /local or deployed/);
+  assert.deepEqual(store.get(job.id), held);
+  await lifecycleCLI(["job", "resume", job.id, "--verification", "local", "--detail", "All ACs have local test/code acceptance"]);
+  const resumed = new JobStore().get(job.id);
+  assert.equal(resumed.stage, "verifying");
+  assert.equal(resumed.config.verification, "local");
+  assert.equal(resumed.sessionID, job.sessionID);
+  assert.equal(resumed.deployment, undefined);
+  const report: VerificationReport = { jobID: job.id, issueURL: issue.url, acHash: job.acHash, mergeSha,
+    checkedAt: new Date().toISOString(), reviewer: { runID: job.sessionID, independent: true },
+    criteria: job.acLabels.map(label => ({ label, status: "pass", evidence: [{
+      kind: "test", reference: "artifact://local-results", observed: "Expected CLI output and passing tests on the merge commit",
+    }] })) };
+  const reportPath = join(directory, "report.json");
+  writeFileSync(reportPath, JSON.stringify(report));
+  await assert.rejects(lifecycleCLI(["job", "verify", job.id, "--report", reportPath]), /independent reviewer/);
+  report.reviewer.runID = "independent-local-verifier";
+  writeFileSync(reportPath, JSON.stringify(report));
+  await lifecycleCLI(["job", "verify", job.id, "--report", reportPath]);
+  assert.equal(store.get(job.id).stage, "verified");
+  assert.equal(store.get(job.id).nextWakeAt, undefined);
+  assert.equal(JSON.parse(logs.at(-1)!).verification.deployment, undefined);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).session.workflow.state, "verified");
 });
 
 test("real adapter refusals survive restart, appear in status and heartbeat logs, and retry the same wake", async t => {
@@ -608,4 +721,14 @@ test("deployed progress can sync code evidence while journey acceptance remains 
   f.report.criteria[0].evidence = [{ kind: "journey", reference: "artifact://serving-journey", observed: "Journey passed", deployment }];
   await f.verify();
   assert.equal(f.store.get(f.job.id).stage, "verified");
+});
+
+
+test("a human tracker-completion hold prevents state mutation even with complete independent evidence", async t => {
+  const f = await linearFixture(t);
+  f.store.update(f.job.id, job => { job.config.trackerCompletion = "human"; });
+  await assert.rejects(f.verify(), /authorized human/);
+  assert.equal(f.linear.state.name, "In Review");
+  assert.ok(f.effects.writes.every(write => write.stateId === undefined));
+  assert.equal(f.store.get(f.job.id).stage, "verifying");
 });

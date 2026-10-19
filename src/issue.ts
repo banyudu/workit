@@ -70,6 +70,18 @@ function commandJson(
   }
 }
 
+/** Run a mutating CLI command whose success output is human text, not JSON. */
+function commandQuiet(command: string, args: string[], cwd: string): void {
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", CLICOLOR: "0" };
+    delete env.CLICOLOR_FORCE; delete env.FORCE_COLOR; delete env.GH_FORCE_TTY;
+    execFileSync(command, args, { env, cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to update the issue with ${command}: ${detail}`);
+  }
+}
+
 export function fetchGithubIssue(
   identifier: string,
   config: WorkitConfig,
@@ -232,25 +244,91 @@ export async function fetchIssue(
     : fetchLinearIssue(identifier, config, cwd);
 }
 
+interface LinearTransition {
+  /** Workflow states this handoff is allowed to leave. */
+  from: readonly string[];
+  /** Target workflow state, matched by name. */
+  to: string;
+}
+
+/**
+ * Tracker handoffs workit owns. `inProgress` is the launch-time claim on queued
+ * work; `inReview` is the post-merge handoff; `done` follows accepted independent
+ * verification. A hold or reopened issue is not overridden by completion sync.
+ */
+const linearTransitions: Record<"inProgress" | "inReview" | "done", LinearTransition> = {
+  inProgress: { from: ["backlog", "todo", "on hold"], to: "In Progress" },
+  inReview: { from: ["in progress", "rework", "merging"], to: "In Review" },
+  done: { from: ["in review"], to: "Done" },
+};
+
+const LINEAR_STATE_QUERY =
+  `query IssueState($id: String!) { issue(id: $id) { id state { name } team { states { nodes { id name } } } } }`;
+const LINEAR_STATE_MUTATION =
+  `mutation UpdateIssue($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`;
+
+/**
+ * Move a Linear issue between workflow states, leaving it alone unless it
+ * currently sits in one of the transition's source states. Returns the previous
+ * state name when a transition happened. Prefers the authenticated `linear` CLI
+ * when no API key is present, so the launchd heartbeat works without one.
+ */
+async function setLinearState(
+  config: WorkitConfig,
+  identifier: string,
+  transition: LinearTransition,
+  cwd: string,
+): Promise<string | undefined> {
+  if (process.env.LINEAR_API_KEY) {
+    const data = await linearApi(config, LINEAR_STATE_QUERY, { id: identifier });
+    const current = data?.issue;
+    const previous = String(current?.state?.name ?? "");
+    if (!current?.id || !transition.from.includes(previous.toLowerCase())) return undefined;
+    const next = current.team?.states?.nodes?.find((state: { name?: string }) => state.name === transition.to);
+    if (!next?.id) return undefined;
+    await linearApi(config, LINEAR_STATE_MUTATION, { id: current.id, stateId: next.id });
+    return previous;
+  }
+  const value = commandJson(
+    "linear",
+    ["issue", "view", identifier, "--json", "--no-download"],
+    cwd,
+  ) as { state?: { name?: string } };
+  const previous = String(value?.state?.name ?? "");
+  if (!previous || !transition.from.includes(previous.toLowerCase())) return undefined;
+  commandQuiet("linear", ["issue", "update", identifier, "--state", transition.to], cwd);
+  return previous;
+}
+
+/** Launch-time claim: queued work becomes In Progress before an agent starts. */
 export async function transitionLinearIssue(
   issue: IssueDetails,
   config: WorkitConfig,
+  cwd = process.cwd(),
 ): Promise<void> {
-  if (issue.backend !== "linear" || !process.env.LINEAR_API_KEY) return;
-  const data = await linearApi(
-    config,
-    `query IssueState($id: String!) { issue(id: $id) { id state { name } team { states { nodes { id name } } } } }`,
-    { id: issue.identifier },
-  );
-  const current = data?.issue;
-  const currentName = String(current?.state?.name ?? "").toLowerCase();
-  if (!current?.id || !["backlog", "todo", "on hold"].includes(currentName)) return;
-  const next = current.team?.states?.nodes?.find((state: { name?: string }) => state.name === "In Progress");
-  if (!next?.id) return;
-  await linearApi(
-    config,
-    `mutation UpdateIssue($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`,
-    { id: current.id, stateId: next.id },
-  );
-  console.log(`  → Status: ${current.state.name} → In Progress`);
+  if (issue.backend !== "linear") return;
+  const previous = await setLinearState(config, issue.identifier, linearTransitions.inProgress, cwd);
+  if (previous) console.log(`  → Status: ${previous} → In Progress`);
+}
+
+/**
+ * Post-merge handoff. Merge alone does not establish acceptance.
+ */
+export async function markLinearIssueInReview(
+  issue: IssueDetails,
+  config: WorkitConfig,
+  cwd = process.cwd(),
+): Promise<void> {
+  if (issue.backend !== "linear") return;
+  await setLinearState(config, issue.identifier, linearTransitions.inReview, cwd);
+}
+
+/** Called only after workit accepts independent verification evidence. */
+export async function markLinearIssueDone(
+  issue: IssueDetails,
+  config: WorkitConfig,
+  cwd = process.cwd(),
+): Promise<void> {
+  if (issue.backend !== "linear") return;
+  await setLinearState(config, issue.identifier, linearTransitions.done, cwd);
 }

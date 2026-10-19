@@ -143,6 +143,7 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
       }
       if (provenChecklist(issue.body, job.acLabels) !== issue.body) throw new Error("Checklist changed before completion; retry job closeout");
       if (!issueFinished(issue)) {
+        if (job.config.trackerCompletion === "human") throw new Error("Tracker completion requires the authorized human to close the issue");
         issue = await unchanged(issue);
         const stateId = issue.linear!.completedStateID!;
         save(current => { current.closeout!.stateID = stateId; current.closeout!.stateConfirmed = false; });
@@ -164,6 +165,7 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
       throw new Error("Final tracker checklist/state readback is incomplete; retry job closeout");
     }
     save(current => {
+      if (current.issue.backend === "linear") current.trackerDone = true;
       current.stage = "verified"; current.detail = "Every current AC has independent passing evidence; tracker completion confirmed";
       delete current.nextWakeAt; delete current.claim;
     });

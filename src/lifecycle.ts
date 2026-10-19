@@ -8,15 +8,18 @@ import type { IssueDetails } from "./types.js";
 export const stages = ["implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
 export type Stage = typeof stages[number];
+export type VerificationMode = "deployed" | "local";
 export interface Deployment {
   environment: string; target: string; sourceSha: string; version: string;
 }
 export interface LifecycleConfig {
+  /** Preserve an issue's explicit human-only closeout authorization. */
+  trackerCompletion?: "human" | "automatic";
   enabled?: boolean;
   intervalSeconds?: number;
   maxWakeups?: number;
   maxErrors?: number;
-  verification?: "deployed" | "local";
+  verification?: VerificationMode;
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
 }
@@ -29,6 +32,10 @@ export interface Job {
   controlCommand?: string[]; stateDirectory?: string;
   createdAt: string; updatedAt: string; nextWakeAt?: string;
   pr?: string; mergeSha?: string; deployment?: Deployment;
+  /** Tracker handoff recorded once the merged PR was handed to human review. */
+  inReview?: boolean;
+  /** Readback confirmed the verified Linear issue reached Done. */
+  trackerDone?: boolean;
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
   // Older pending wakes already charged wakeups when they were reserved.
@@ -121,6 +128,31 @@ export function checklistChanges(report: VerificationReport): ChecklistChange[] 
     .map(item => ({ label: item.label, checked: item.status === "pass" }));
 }
 
+export function parseVerificationMode(value: unknown): VerificationMode {
+  if (value !== "local" && value !== "deployed") throw new Error("Verification mode must be local or deployed");
+  return value;
+}
+
+function validateVerificationMode(config: LifecycleConfig, body: string): void {
+  const mode = parseVerificationMode(config.verification);
+  if (mode === "deployed" && !config.deploymentProbe?.length) {
+    throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
+  }
+  if (mode === "local" && acceptanceCriteria(body).some(line => /\[deploy(?::[a-z0-9-]+)?\]/.test(line))) {
+    throw new Error("Local verification cannot satisfy a deployment Acceptance Criterion");
+  }
+}
+
+/** Issue-scoped correction; repository defaults and human holds stay intact. */
+export function setVerificationMode(job: Job, value: unknown): void {
+  const config = { ...job.config, verification: parseVerificationMode(value) };
+  validateVerificationMode(config, job.issue.body);
+  if (config.verification === job.config.verification) return;
+  if (job.wake) throw new Error("Pending wake requires inspected job reconcile before changing verification mode");
+  job.config = config;
+  delete job.deployment; delete job.verification; delete job.closeout; delete job.trackerDone;
+}
+
 export function workflowState(stage: Stage): string {
   if (stage.startsWith("waiting-")) return "waiting";
   if (["needs-you", "paused", "cancelled", "verified"].includes(stage)) return stage;
@@ -137,14 +169,11 @@ export function createJob(input: {
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
-  if (!["deployed", "local"].includes(config.verification)) throw new Error("Invalid lifecycle.verification");
   if (config.deploymentProbe && (!Array.isArray(config.deploymentProbe) || !config.deploymentProbe.length ||
       config.deploymentProbe.some(arg => typeof arg !== "string" || !arg || arg.includes("\0")))) {
     throw new Error("lifecycle.deploymentProbe must be non-empty argv");
   }
-  if (config.verification === "deployed" && !config.deploymentProbe) {
-    throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
-  }
+  validateVerificationMode(config, input.issue.body);
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
     sessionID: "workit-" + id, agent: input.agent, stage: "implementing", detail: "",
@@ -192,7 +221,7 @@ export class JobStore {
       JobStore.python ??= execFileSync("python3", ["-c", "import sys; print(sys.executable)"],
         { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] }).trim();
       output = execFileSync(JobStore.python, ["-c", SQLITE, this.path, operation],
-      { input: JSON.stringify(input), encoding: "utf8", timeout: 15_000, stdio: ["pipe", "pipe", "pipe"] }); }
+      { input: JSON.stringify(input), encoding: "utf8", timeout: 15_000, maxBuffer: 64 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] }); }
     catch { throw new Error("Workit lifecycle storage failed; python3 with sqlite3 and a writable state directory are required"); }
     chmodSync(this.path, 0o600);
     return JSON.parse(output) as T;
@@ -231,9 +260,13 @@ export function processIsAlive(identity: string): boolean {
 
 export function checkpoint(store: JobStore, id: string, patch: {
   stage: Stage; detail: string; after?: number; pr?: string; mergeSha?: string;
+  verification?: VerificationMode;
+  trackerCompletion?: "human" | "automatic";
   expectedRevision?: number; expectedSessionID?: string;
 }, now = new Date()): Job {
   if (!stages.includes(patch.stage)) throw new Error("Unknown lifecycle stage");
+  if (patch.trackerCompletion !== undefined && !["human", "automatic"].includes(patch.trackerCompletion))
+    throw new Error("Tracker completion must be human or automatic");
   if (patch.stage === "verified") throw new Error("Use job verify with a verification report");
   if (patch.after !== undefined && (!Number.isSafeInteger(patch.after) || patch.after < 1)) throw new Error("--after must be positive seconds");
   if (patch.mergeSha !== undefined && !sha(patch.mergeSha)) throw new Error("--merge-sha must be a full commit SHA");
@@ -246,11 +279,13 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (["paused", "needs-you"].includes(job.stage) && !["paused", "needs-you", "cancelled"].includes(patch.stage)) {
       throw new Error("Use job resume to release a pause or human gate");
     }
+    if (patch.verification !== undefined) setVerificationMode(job, patch.verification);
+    if (patch.trackerCompletion !== undefined) job.config = { ...job.config, trackerCompletion: patch.trackerCompletion };
     if (patch.pr !== undefined) {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.closeout;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.closeout; delete job.inReview; delete job.trackerDone;
       }
       job.pr = patch.pr;
     }
@@ -260,6 +295,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
     }
     if (patch.stage === "waiting-ci" && !job.pr) throw new Error("waiting-ci requires a PR");
     if (["waiting-deploy", "verifying"].includes(patch.stage) && (!job.pr || !job.mergeSha)) throw new Error("Post-merge stages require PR and merge SHA");
+    if (patch.stage === "waiting-deploy" && job.config.verification === "local") throw new Error("Local verification proceeds directly to verifying after merge");
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
@@ -275,6 +311,7 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
   const report = value as VerificationReport;
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
+  validateVerificationMode(job.config, currentBody);
   if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
       [job.id, job.sessionID].includes(report.reviewer.runID)) {
     throw new Error("Verification needs the merged source and an independent reviewer run");
@@ -353,6 +390,26 @@ export interface LifecycleAdapter {
   pr(job: Job): Promise<PRSnapshot>;
   deployment(job: Job): Promise<Deployment | undefined>;
   containsMerge(job: Job, sourceSha: string): Promise<boolean>;
+  /** Hand the merged tracker issue to human review; a no-op for other backends. */
+  markInReview(job: Job): Promise<void>;
+  /** Close a verified Linear issue; false preserves a later human state change. */
+  markDone(job: Job): Promise<boolean>;
+}
+
+/** Persisted acceptance survives tracker outages; the heartbeat retries sync. */
+export async function syncVerifiedIssue(store: JobStore, adapter: LifecycleAdapter, job: Job): Promise<Job> {
+  if (job.config.trackerCompletion === "human") return job;
+  if (!["verified", "verifying"].includes(job.stage) || job.issue.backend !== "linear" ||
+      !job.verification || !reportComplete(job, job.verification) || job.closeout?.stateConfirmed || job.trackerDone) return job;
+  const target = adapter as LifecycleAdapter & Partial<import("./lifecycle-closeout.js").CloseoutAdapter>;
+  if (!target.currentIssue || !target.updateIssue) return job;
+  try {
+    const { closeoutJob } = await import("./lifecycle-closeout.js");
+    return await closeoutJob(store, target as import("./lifecycle-closeout.js").CloseoutAdapter, job.id, { reconcile: true });
+  } catch (error) {
+    console.warn(`workit: tracker closeout for ${job.id} is pending and will be retried: ${error instanceof Error ? error.message : String(error)}`);
+    return store.get(job.id);
+  }
 }
 
 function available(session: Session): boolean {
@@ -367,6 +424,18 @@ export function controlCommand(job: Job): string {
   const prefix = job.stateDirectory ? "env WORKIT_STATE_DIR=" + quote(job.stateDirectory) + " " : "";
   return prefix + (job.controlCommand ?? ["workit"]).map(quote).join(" ");
 }
+
+export function verificationInstructions(job: Job): string[] {
+  return [
+    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. Choose acceptance scope from the current ACs; the repository setting is a default.`,
+    `When every AC can be reliably proven locally (for example a local CLI, tooling or documentation change), select local with this CLI's job checkpoint ${job.id} --stage STAGE --verification local --detail TEXT and explain the local acceptance coverage. Keep deployed for ACs that require a serving environment; never downgrade a deployment AC to local. A local-only issue does not need deployment authorization or a deployment wait to complete.`,
+    job.config.verification === "local"
+      ? "After an authorized merge, proceed directly to verifying and obtain independent evidence for every AC against the merged source locally. Local verification requires no deployment probe, serving version or deployed journey evidence."
+      : "In deployed mode, await the scheduled deployment after an authorized merge, then independently verify applicable journeys against the actual serving source/version. If the serving version changes, checkpoint waiting-deploy and rerun the affected acceptance probes.",
+    "Use workit job --help for the report contract. Both verification modes require a merged PR and complete independent AC evidence accepted by job verify --report.",
+  ];
+}
+
 function prompt(job: Job, reason: string): string {
   return [
     `Continue managed workit job ${job.id} for ${job.issue.url}. Reason: ${reason}.`,
@@ -374,7 +443,8 @@ function prompt(job: Job, reason: string): string {
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
     "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
-    "Own implementation, preverification, review repair, merge when authorized, deployed acceptance and any follow-up fix. Do not stop at merge.",
+    "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
+    ...verificationInstructions(job),
     "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
     `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
     "Submit independent partial AC results with workit job verify --report to synchronize proven Linear checkbox states while leaving the issue state unchanged.",
@@ -390,10 +460,14 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
   const owner = options.process ?? processIdentity();
   const alive = options.alive ?? processIsAlive;
   const results: Array<{ id: string; result: string; detail?: string }> = [];
-  for (const candidate of store.list()) {
+  for (let candidate of store.list()) {
     if (options.jobID && candidate.id !== options.jobID) continue;
     // Project pause/cancel/completion too; it must survive an app outage.
-    if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you") {
+    const pendingCloseout = candidate.stage === "verifying" && candidate.closeout && candidate.verification &&
+      reportComplete(candidate, candidate.verification) &&
+      (!candidate.nextWakeAt || Date.parse(candidate.nextWakeAt) <= now.getTime());
+    if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you" || pendingCloseout) {
+      candidate = await syncVerifiedIssue(store, adapter, candidate);
       if (candidate.projectedRevision !== candidate.revision) {
         try { await adapter.project(candidate); store.acknowledgeProjection(candidate); } catch { /* durable job remains authoritative */ }
       }
@@ -466,6 +540,17 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           save(current => { current.deployment = deployment; current.stage = "verifying"; });
           reason = "deployment containing the merged change is ready; run applicable journeys";
         }
+      }
+      // The tracker handoff belongs to workit rather than to an agent turn: hand a
+      // merged issue to human review as soon as the merge is known, and retry a
+      // failed handoff on a later tick instead of blocking delivery on the tracker.
+      if (job.mergeSha && !job.inReview) {
+        let settled = false;
+        try { await adapter.markInReview(job); settled = true; }
+        catch (error) {
+          console.warn(`workit: review handoff for ${job.id} will be retried: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (settled) save(current => { current.inReview = true; });
       }
       if (!actionable) {
         save(current => { current.errors = 0; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });

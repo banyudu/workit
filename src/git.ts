@@ -4,14 +4,19 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
+  realpathSync,
+  rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { DependencyMode, ResolvedConfig, WorkitConfig, WorktreeResult } from "./types.js";
+import { registerWorktree } from "./gc/engine.js";
 
 function git(args: string[], cwd: string, allowFailure = false): string {
   try {
@@ -181,6 +186,7 @@ export function createOrResumeWorktree(
     (record) => record.branch === branch || record.branch?.match(new RegExp(`^${escapeRegExp(branch)}-[0-9a-f]{6}$`)),
   );
   if (existing?.branch) {
+    registerWorktree(existing.path, { role: "implementation", pid: process.pid, phase: "preparing" });
     allowDirenv(existing.path);
     return {
       path: existing.path,
@@ -214,6 +220,13 @@ export function createOrResumeWorktree(
 }
 
 function packageManager(root: string): string | undefined {
+  const manifest = join(root, "package.json");
+  if (existsSync(manifest)) {
+    const declared = JSON.parse(readFileSync(manifest, "utf8")).packageManager as unknown;
+    if (typeof declared === "string" && /^(bun|pnpm|yarn|npm)@/.test(declared)) {
+      return declared.split("@")[0];
+    }
+  }
   if (existsSync(join(root, "bun.lockb")) || existsSync(join(root, "bun.lock"))) return "bun";
   if (existsSync(join(root, "pnpm-lock.yaml"))) return "pnpm";
   if (existsSync(join(root, "yarn.lock"))) return "yarn";
@@ -323,15 +336,111 @@ function linkWorkspaceNodeModules(root: string, target: string): void {
 }
 
 function runInstall(target: string, manager: string): void {
+  const manifest = join(target, "package.json");
+  const declared = existsSync(manifest)
+    ? String(JSON.parse(readFileSync(manifest, "utf8")).packageManager ?? "")
+    : "";
+  const modernYarn = /^yarn@(\d+)/.exec(declared)?.[1];
   const args = manager === "bun"
     ? ["install", "--frozen-lockfile", "--ignore-scripts"]
     : manager === "pnpm"
-      ? ["install", "--recursive", "--prefer-offline", "--ignore-scripts"]
+      ? ["install", "--frozen-lockfile", "--prefer-offline", "--ignore-scripts"]
       : manager === "yarn"
-        ? ["install", "--prefer-offline", "--ignore-scripts"]
-        : ["install"];
-  const result = spawnSync(manager, args, { cwd: target, stdio: "inherit" });
+        ? (Number(modernYarn) >= 2 || existsSync(join(target, ".yarnrc.yml")))
+          ? ["install", "--immutable", "--mode=skip-build"]
+          : ["install", "--frozen-lockfile", "--ignore-scripts"]
+        : existsSync(join(target, "package-lock.json")) || existsSync(join(target, "npm-shrinkwrap.json"))
+          ? ["ci", "--ignore-scripts", "--prefer-offline"]
+          : ["install", "--ignore-scripts"];
+  // Use the checkout's pinned toolchain when it has a direnv environment.
+  const useDirenv = existsSync(join(target, ".envrc")) &&
+    spawnSync("direnv", ["version"], { stdio: "ignore" }).status === 0;
+  const result = useDirenv
+    ? spawnSync("direnv", ["exec", target, manager, ...args], { cwd: target, stdio: "inherit" })
+    : spawnSync(manager, args, { cwd: target, stdio: "inherit" });
   if (result.status !== 0) throw new Error(`${manager} install failed`);
+}
+
+function dependencyDirectories(target: string): string[] {
+  const realTarget = realpathSync(target);
+  return [target, ...workspaceDirectories(target)]
+    .filter((directory) => isWithin(target, directory) && isWithin(realTarget, realpathSync(directory)))
+    .map((directory) => join(directory, "node_modules"));
+}
+
+function sameDependencyInputs(root: string, target: string): boolean {
+  const files = [
+    "package.json", "bun.lock", "bun.lockb", "bunfig.toml", "pnpm-lock.yaml",
+    "pnpm-workspace.yaml", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", ".yarnrc.yml", ".npmrc",
+    ...dependencyDirectories(target).slice(1).map((directory) => join(relative(target, dirname(directory)), "package.json")),
+  ];
+  return files.every((file) => {
+    const source = join(root, file);
+    const destination = join(target, file);
+    if (!existsSync(source) || !existsSync(destination)) return !existsSync(source) && !existsSync(destination);
+    return readFileSync(source).equals(readFileSync(destination));
+  });
+}
+
+function isWithin(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (!rel.startsWith("../") && rel !== ".." && !rel.startsWith("/"));
+}
+
+function rebaseDependencyLinks(directory: string, root: string, target: string): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      const link = readlinkSync(path);
+      if (link.startsWith("/") && isWithin(root, link)) {
+        unlinkSync(path);
+        symlinkSync(relative(dirname(path), join(target, relative(root, link))), path);
+      }
+    } else if (entry.isDirectory()) {
+      rebaseDependencyLinks(path, root, target);
+    }
+  }
+}
+
+function dependencyLinksStayLocal(directory: string, target: string): boolean {
+  return readdirSync(directory, { withFileTypes: true }).every((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      try {
+        return isWithin(target, realpathSync(path));
+      } catch {
+        return false;
+      }
+    }
+    return !entry.isDirectory() || dependencyLinksStayLocal(path, target);
+  });
+}
+
+function cloneDependencies(root: string, target: string): boolean {
+  if (!directoryExists(join(root, "node_modules")) || !sameDependencyInputs(root, target)) return false;
+  const created: string[] = [];
+  try {
+    for (const destination of dependencyDirectories(target)) {
+      if (pathExists(destination)) continue;
+      const source = join(root, relative(target, destination));
+      if (!directoryExists(source)) continue;
+      const args = process.platform === "darwin"
+        ? ["-cR", realpathSync(source), destination]
+        : ["--reflink=always", "-R", realpathSync(source), destination];
+      created.push(destination);
+      const result = spawnSync("cp", args, { stdio: "ignore" });
+      if (result.status !== 0) return false;
+    }
+    for (const directory of created) rebaseDependencyLinks(directory, root, target);
+    if (!created.every((directory) => dependencyLinksStayLocal(directory, realpathSync(target)))) return false;
+    // All copies succeeded. Only newly-created directories are rolled back on failure.
+    created.length = 0;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    for (const directory of created) rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 export function prepareDependencies(
@@ -340,21 +449,42 @@ export function prepareDependencies(
   mode: DependencyMode,
 ): void {
   if (mode === "none") return;
+  if (realpathSync(root) === realpathSync(target)) {
+    throw new Error("Dependency preparation requires a separate worktree");
+  }
   const source = join(root, "node_modules");
   if (mode === "symlink" && existsSync(source)) {
     linkWorkspaceNodeModules(root, target);
     return;
   }
-  if (pathExists(join(target, "node_modules"))) return;
-  if (mode === "clone" && existsSync(source)) {
-    const result = spawnSync("cp", ["-cR", source, join(target, "node_modules")], {
-      cwd: target,
-      stdio: "inherit",
-    });
-    if (result.status === 0) return;
+  // An explicit clone/install must upgrade old symlink-based worktrees. Unlink
+  // only the redirect; never remove the source checkout's dependencies.
+  for (const directory of dependencyDirectories(target)) {
+    if (pathExists(directory) && lstatSync(directory).isSymbolicLink()) unlinkSync(directory);
+    else if (directoryExists(directory) && !dependencyLinksStayLocal(directory, realpathSync(target))) {
+      rmSync(directory, { recursive: true, force: true });
+    }
   }
-  const manager = packageManager(root);
+  if (mode === "clone" && cloneDependencies(root, target)) return;
+  const manager = packageManager(target);
   if (manager) runInstall(target, manager);
+  for (const directory of dependencyDirectories(target)) {
+    if (directoryExists(directory) && !dependencyLinksStayLocal(directory, realpathSync(target))) {
+      throw new Error(`Dependencies still resolve outside the worktree or contain broken links: ${directory}`);
+    }
+  }
+}
+
+/** Prepare a linked worktree without fetching or mutating an issue. */
+export function prepareExistingWorktree(target: string, config: WorkitConfig, mode: DependencyMode): void {
+  const root = repositoryRoot(target);
+  const top = git(["rev-parse", "--show-toplevel"], target);
+  if (realpathSync(top) !== realpathSync(target) || realpathSync(root) === realpathSync(target)) {
+    throw new Error("--worktree must name the root of a linked Git worktree");
+  }
+  copyEnvFiles(root, target, config);
+  allowDirenv(target);
+  prepareDependencies(root, target, mode);
 }
 
 function escapeRegExp(value: string): string {
