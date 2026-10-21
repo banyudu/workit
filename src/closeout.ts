@@ -1,11 +1,11 @@
 import { QueueStore } from "./queue-store.js";
 import { assertVerificationSource, assertVerificationDeployment, investigation, verificationSource, VerificationReadError, observe } from "./verification-source.js";
 import { selectDeploymentTarget } from "./deployment-target.js";
-import { assertTracker } from "./tracker-policy.js";
+import { assertTracker, TrackerHoldError } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
+import { SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateProgressReport, reportComplete, validateReport,
   type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
@@ -107,7 +107,12 @@ export function jobBlockers(job: Job): Blocker[] {
   if (job.facts?.error) result.push(blocker(job, "runner-error", "system", job.facts.error, "next-fact-refresh"));
   if (job.blocker) result.push(["paused", "needs-you"].includes(job.stage)
     ? { ...job.blocker, nextAction: job.blocker.nextAction + "; explicitly resume only after inspecting and releasing the hold" } : job.blocker);
-  else if (job.mergeSha || (investigation(job) && ["waiting-deploy", "verifying"].includes(job.stage))) {
+  else if (job.verifier?.state === "report-ready" && job.verifier.handoff && job.verification) {
+    result.push(blocker(job, job.verifier.handoff === "repair" ? "acceptance-repair" : "tracker-closeout", "worker",
+      job.verifier.handoff === "repair" ? "Read the retained independent report; repair proven failures or supply missing evidence within this issue's scope"
+        : "Use the retained passing evidence to finish tracker closeout under current repository policy",
+      "original-worker-checkpoint"));
+  } else if (job.mergeSha || (investigation(job) && ["waiting-deploy", "verifying"].includes(job.stage))) {
     if (job.config.verification !== "local" && !job.deployment) result.push(blocker(job, "external-wait", "external",
       "Wait for the authorized deployment and its serving source/version probe", "deployment-probe-change",
       dependencyIdentity(job, "deployment")));
@@ -143,7 +148,7 @@ export function readableAttention(view: ReturnType<typeof attention>): string {
   return [...facts, ...items].join("\n") || "No unfinished closeout dependencies.";
 }
 
-export async function checkVerification(adapter: LifecycleAdapter, expected: Job, value: unknown, now = new Date()): Promise<{ report: VerificationReport; finished: boolean }> {
+export async function checkVerification(adapter: LifecycleAdapter, expected: Job, value: unknown, now = new Date(), progress = false): Promise<{ report: VerificationReport; finished: boolean; complete: boolean; humanPending: boolean }> {
   if (expected.stage !== "verifying") throw new Error("Job must be in verifying before completion");
   if (expected.verifier && ["reserved", "running", "uncertain", "invalidated", "report-ready"].includes(expected.verifier.state) &&
       (expected.verifier.state === "invalidated" || (value as VerificationReport)?.reviewer?.runID !== expected.verifier.id)) throw new Error("Reconcile the existing verifier before replacing its report or identity");
@@ -152,7 +157,11 @@ export async function checkVerification(adapter: LifecycleAdapter, expected: Job
   await assertVerificationDeployment(adapter, expected);
   const issue = await observe(() => adapter.currentIssue!(expected));
   assertTracker(expected, issue);
-  return { report: validateReport(expected, value, issue.body, now), finished: issueFinished(issue) && (issue.backend !== "linear" || provenChecklist(issue.body, expected.acLabels) === issue.body) };
+  const report = (progress ? validateProgressReport : validateReport)(expected, value, issue.body, now);
+  const complete = reportComplete(expected, report);
+  const humanPending = acceptanceCriteria(issue.body).some((criterion, index) => requiresHuman(criterion) &&
+    report.criteria.find(item => item.label === expected.acLabels[index])?.status !== "pass");
+  return { report, complete, humanPending, finished: complete && issueFinished(issue) && (issue.backend !== "linear" || provenChecklist(issue.body, expected.acLabels) === issue.body) };
 }
 export function completeVerification(store: JobStore, expected: Job, report: VerificationReport, now = new Date()): Job {
   return store.update(expected.id, current => {
@@ -172,7 +181,7 @@ function readArtifact(path: string): unknown {
 }
 
 /** Called only under the ordinary per-job heartbeat claim. No implementer replay. */
-export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date, dispatchNow: () => Date = () => new Date()): Promise<string | undefined> {
+export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date, dispatchNow: () => Date = () => new Date(), readExistingOnly = false): Promise<string | undefined> {
   let job = expected;
   const save = (change: (current: Job) => void) => {
     job = store.update(job.id, current => {
@@ -188,6 +197,16 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
     });
     return result;
   };
+  const ownerHold = (completedOutcome = false) => {
+    save(current => {
+      if (completedOutcome && current.verifier) current.verifier.state = "report-ready";
+      current.stage = "needs-you"; current.holdDetail = "Current tracker issue has an explicit owner hold";
+      current.detail = "Retained verifier outcome; release the tracker hold and explicitly resume before continuing";
+      current.blocker = { reason: "owner-hold", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "owner-hold-released", nextAction: "Release the actual issue hold and explicitly resume; do not rerun verification to bypass it" };
+      delete current.nextWakeAt;
+    });
+    return "owner-hold";
+  };
   const uncertain = () => {
     save(current => {
       if (current.verifier && current.verifier.state !== "invalidated") current.verifier.state = "uncertain";
@@ -197,6 +216,13 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
     });
     return "verifier-uncertain";
   };
+  if (job.verifier?.state === "report-ready" && job.verifier.binding !== verifierBinding(job)) {
+    save(current => {
+      (current.verifierHistory ??= []).push(current.verifier!); delete current.verifier;
+      delete current.verification; delete current.closeout; delete current.trackerDone;
+    });
+    if (readExistingOnly) return "verifier-binding-refreshed";
+  }
   const run = job.verifier;
   if (run && ["reserved", "uncertain", "invalidated"].includes(run.state)) return uncertain();
   if (run && ["running", "report-ready"].includes(run.state)) {
@@ -217,11 +243,31 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
       try {
         const value = readArtifact(run.reportPath) as VerificationReport;
         if (value?.reviewer?.runID !== run.id) throw new Error("Verifier identity mismatch");
-        const checked = await checkVerification(adapter, job, value, now);
+        const checked = await checkVerification(adapter, job, value, now, true);
         if (checked.finished) { job = completeVerification(store, job, checked.report, now); return "verified"; }
-        save(current => { current.verifier!.state = "report-ready"; current.verification = checked.report; if (current.issue.backend === "linear") current.closeout ??= {}; });
-        return wait("tracker-closeout", "owner", "Independent evidence passed; reconcile the issue checklist and completed state under repository policy", "tracker-state-change", "awaiting-tracker-closeout");
+        save(current => {
+          current.verifier!.state = "report-ready"; current.verification = checked.report;
+          if (checked.complete && current.issue.backend === "linear") current.closeout ??= {};
+          if (!checked.complete) {
+            if (!checked.humanPending) current.verifier!.handoff = "repair";
+            current.detail = "Independent report retained; inspect failed, blocked or missing evidence and continue this issue under its existing scope";
+            current.stage = checked.humanPending ? "needs-you" : investigation(current) ? "investigating" : "fixing";
+            if (checked.humanPending) {
+              current.holdDetail = "Current acceptance requires actual human confirmation";
+              current.blocker = { reason: "acceptance-decision", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "human-acceptance-evidence", nextAction: "Obtain the required actual human confirmation before explicitly resuming" };
+              delete current.nextWakeAt;
+            } else delete current.blocker;
+          }
+        });
+        if (!checked.complete) return checked.humanPending ? "owner-acceptance-required" : undefined;
+        if (job.issue.backend === "linear" || job.config.trackerCompletion === "human")
+          return wait("tracker-closeout", "owner", "Independent evidence passed; reconcile the issue checklist and completed state under repository policy", "tracker-state-change", "awaiting-tracker-closeout");
+        // The ordinary worker owns policy-sensitive tracker closeout. Return to
+        // its normal wake path, which still checks liveness and queue authority.
+        save(current => { current.verifier!.handoff = "tracker"; current.detail = "Independent acceptance passed; close the GitHub issue only under repository policy, then reconcile this report"; });
+        return undefined;
       } catch (error) {
+        if (error instanceof TrackerHoldError) return ownerHold(true);
         if (error instanceof SourceProvenanceError) return wait("source-provenance", "external", "Repair the actual serving source/version binding before accepting evidence", "serving-provenance-repaired", "serving-binding-stale");
         if (error instanceof VerificationReadError) {
           return wait("runner-error", "system", "Current issue, PR or deployment facts are unavailable; retain this verifier report and retry the read", "fact-reader-recovered", "verifier-facts-unavailable");
@@ -234,6 +280,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
     if (now.getTime() > Date.parse(run.reservedAt) + (run.timeoutSeconds + 60) * 1000) return uncertain();
     return wait("external-wait", "verifier", "Wait for the existing bounded verifier report and outcome", "verifier-outcome", "verifier-running");
   }
+  if (readExistingOnly) return "verifier-awaiting-original-session";
   const plan = await adapter.verifierPlan!(job);
   if (!plan.enabled) {
     wait("missing-verifier", "verifier", "Dispatch is disabled; submit an independent report with job verify or explicitly opt in in trusted configuration", "independent-report-or-config-change", "verifier-disabled");
@@ -246,6 +293,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   if (!adapter.currentIssue) return wait("runner-error", "system", "Repair the current issue reader before dispatching verification", "tool-repaired", "verifier-unavailable");
   const issue = await adapter.currentIssue(job);
   if (issue.url !== job.issue.url || acceptance(issue.body).acHash !== job.acHash) return wait("acceptance-decision", "owner", "Current ACs changed; review and correct the acceptance plan against the current binding", "audited-acceptance-correction", "acceptance-stale");
+  try { assertTracker(job, issue); } catch (error) { if (error instanceof TrackerHoldError) return ownerHold(); throw error; }
   if (job.config.verification === "local") assertLocalAcceptance(issue.body);
   if (acceptanceCriteria(issue.body).some(requiresHuman)) return wait("acceptance-decision", "owner", "Obtain the explicit human acceptance required by the current ACs, then submit independent complete evidence", "human-acceptance-evidence", "owner-acceptance-required");
   try { await assertVerificationSource(adapter, job); }

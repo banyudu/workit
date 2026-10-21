@@ -5,7 +5,7 @@ export type WorkGroup = "working" | "waiting" | "needs-you" | "paused" | "verifi
 export function workGroup(job: Job): WorkGroup {
   if (["needs-you", "paused", "verified", "cancelled"].includes(job.stage)) return job.stage as WorkGroup;
   if (jobBlockers(job).some(item => item.owner === "owner")) return "needs-you";
-  if (job.stage.startsWith("waiting-") || job.verifier?.state === "running" || job.verifier?.state === "report-ready") return "waiting";
+  if (job.stage.startsWith("waiting-") || job.verifier?.state === "running" || (job.verifier?.state === "report-ready" && !job.verifier.handoff && job.stage === "verifying")) return "waiting";
   return "working";
 }
 function webLink(value?: string): string | undefined {

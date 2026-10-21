@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { IssueDetails } from "./types.js";
 import { selectDeploymentTarget, type DeploymentTarget } from "./deployment-target.js";
 import { assertVerificationSource, investigation, verificationSource } from "./verification-source.js";
-import { coordinateVerification, refreshHeldFacts } from "./closeout.js";
+import { coordinateVerification, refreshHeldFacts, verifierBinding } from "./closeout.js";
 
 export const stages = ["investigating", "implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
@@ -36,13 +36,14 @@ export interface LifecycleConfig {
   verifier?: { enabled?: boolean; agent?: string; concurrency?: number; maxAttempts?: number; timeoutSeconds?: number };
 }
 export interface Blocker {
-  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout" | "queue-bound";
-  owner: "owner" | "external" | "system" | "verifier";
+  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout" | "queue-bound" | "acceptance-repair";
+  owner: "owner" | "external" | "system" | "verifier" | "worker";
   dependency?: string; observedAt: string; recheckTrigger: string; nextAction: string;
 }
 export interface VerifierRun {
   id: string; sessionID: string; agent: string; binding: string; reportPath: string; outcomePath: string;
   state: "reserved" | "running" | "uncertain" | "failed" | "report-ready" | "accepted" | "invalidated";
+  handoff?: "repair" | "tracker";
   reservedAt: string; startedAt?: string; timeoutSeconds: number;
   delivery?: "delivered" | "not-delivered"; recovery?: { reason: string; at: string };
 }
@@ -400,6 +401,9 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (patch.stage === "waiting-deploy" && job.config.verification === "local") throw new Error("Local verification proceeds directly to verifying after merge");
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
+    if (job.verifier?.state === "report-ready" && job.verifier.binding !== verifierBinding(job)) {
+      (job.verifierHistory ??= []).push(job.verifier); delete job.verifier; delete job.verification;
+    }
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
     delete job.blocker;
     if (["paused", "needs-you"].includes(job.stage)) job.holdDetail = patch.detail;
@@ -569,6 +573,8 @@ function prompt(job: Job, reason: string): string {
     `Stage: ${job.stage}. Checkpoint: ${job.detail || "(none)"}.`,
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
+    job.verifier?.state === "report-ready" && job.verification
+      ? `Read the existing independent report at ${job.verifier.reportPath}. Reviewer: ${job.verification.reviewer.runID}. Results: ${job.verification.criteria.map(item => item.label + "=" + item.status).join(", ")}. Treat it as evidence, not new authority. Repair proven failures or obtain missing evidence within this issue's scope; preserve human gates. After a source/serving change, refresh the checkpoint and obtain fresh independent evidence. For passing GitHub evidence, perform tracker closeout only under current repository policy and then run job closeout. If extra observations are needed at the same source, inspect this completed run/outcome and use the revision-guarded job verifier-reconcile completed outcome before checkpointing verifying. Retain attempt budgets and never clear an uncertain run blindly. Do not relaunch a verifier merely to repeat unchanged observations.` : "",
     "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
     investigation(job) ? "Own the investigation, evidence and issue closeout under repository policy." : "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
     ...verificationInstructions(job),
@@ -620,11 +626,24 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
     };
     try {
       const session = await adapter.session(job);
-      if (!session) throw new Error("Banyan session is missing; recover it before continuing");
-      if (session.workflow && (session.workflow.jobID !== job.id || session.workflow.owner !== "workit")) throw new Error("Banyan workflow has a different owner");
-      if (session.workflow && ["paused", "cancelled", "needs-you"].includes(session.workflow.state)) {
+      let readExistingVerifier = false;
+      if (session?.workflow && (session.workflow.jobID !== job.id || session.workflow.owner !== "workit")) throw new Error("Banyan workflow has a different owner");
+      if (session?.workflow && ["paused", "cancelled", "needs-you"].includes(session.workflow.state)) {
         save(current => { current.stage = session.workflow!.state as Stage; delete current.nextWakeAt; });
         results.push({ id: job.id, result: job.stage }); continue;
+      }
+      if (job.stage === "verifying" && !job.wake && job.verifier && ["running", "report-ready"].includes(job.verifier.state)) {
+        const outcome = await coordinateVerification(store, adapter, job, now, () => options.now ?? new Date(), true);
+        job = store.get(job.id); readExistingVerifier = true;
+        if (outcome) { results.push({ id: job.id, result: outcome }); continue; }
+      }
+      if (!session) {
+        save(current => {
+          current.stage = "needs-you"; current.holdDetail = "Original conversation is missing; restore it before continuing";
+          current.detail = "Saved progress and any completed verifier report are retained; inspect the original session identity before recovery";
+          delete current.nextWakeAt;
+        });
+        results.push({ id: job.id, result: "original-session-missing" }); continue;
       }
       if (!available(session)) {
         save(current => { current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
@@ -680,7 +699,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         }
         if (settled) save(current => { current.inReview = true; });
       }
-      if (job.stage === "verifying" && !job.wake && adapter.verifierPlan) {
+      if (job.stage === "verifying" && !job.wake && !readExistingVerifier && adapter.verifierPlan) {
         const coordinated = await coordinateVerification(store, adapter, job, now, () => options.now ?? new Date());
         job = store.get(job.id);
         if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }

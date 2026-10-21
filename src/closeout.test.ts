@@ -7,12 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobStore, SourceProvenanceError, acceptance, checkpoint, createJob, tick, validateReport,
   assertLocalAcceptance, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun, type VerificationReport } from "./lifecycle.js";
+import { overview } from "./overview.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier, verifierBinding } from "./closeout.js";
 
 const at = new Date("2026-01-02T00:00:00Z");
 const mergeSha = "a".repeat(40);
 const body = "## Acceptance Criteria\n- [ ] `[test:cli]` The CLI command passes its isolated fixtures.\n- [ ] `[code:types]` The exported type contract is documented.";
-const issue = { backend: "github" as const, identifier: "23", title: "CLI and types", body, labels: [], url: "https://github.com/example/project/issues/23" };
+const issue = { backend: "github" as const, identifier: "23", title: "CLI and types", body, labels: [] as string[], url: "https://github.com/example/project/issues/23" };
 const deployment: Deployment = { environment: "fixture", target: "widget", sourceSha: "b".repeat(40), version: "serving-1" };
 class Adapter implements LifecycleAdapter {
   wakes: string[] = []; launches: VerifierRun[] = []; sessions = 0; projections = 0; reads = 0;
@@ -23,7 +24,7 @@ class Adapter implements LifecycleAdapter {
   async markInReview() {}
   async markDone() { return false; }
   async project() { this.projections++; }
-  async wake(_job: Job, id: string) { this.wakes.push(id); }
+  async wake(_job: Job, id: string, _text: string) { this.wakes.push(id); }
   async pr() { this.reads++; return this.snapshot; }
   async deployment() { return this.deploy; }
   async containsMerge() { return true; }
@@ -234,7 +235,7 @@ test("verified-closeout: deployed evidence stays unfinished until actual serving
   adapter.issue.state = "OPEN";
   await run();
   const verifier = store.get(job.id).verifier!;
-  const local = report(job, verifier.id);
+  const local = report(job, verifier.id); local.deployment = { ...deployment, version: "wrong-serving-version" };
   handoff(verifier, local);
   await run(new Date(at.getTime() + 120_000));
   assert.equal(store.get(job.id).stage, "verifying");
@@ -250,13 +251,13 @@ test("verified-closeout: deployed evidence stays unfinished until actual serving
   await run(new Date(at.getTime() + 240_000));
   assert.equal(store.get(job.id).stage, "verifying");
   assert.equal(store.get(job.id).verifier!.state, "report-ready");
-  assert.equal(store.get(job.id).blocker!.reason, "tracker-closeout");
+  assert.equal(store.get(job.id).blocker, undefined);
   assert.equal(adapter.issue.state, "OPEN");
   adapter.issue.state = "CLOSED";
   await run(new Date(at.getTime() + 300_000));
   assert.equal(store.get(job.id).stage, "verified");
   assert.equal(adapter.launches.length, 2);
-  assert.equal(adapter.wakes.length, 0);
+  assert.equal(adapter.wakes.length, 1);
 });
 
 test("acceptance changes invalidate cached report/deployment/dispatch while retaining explicit pause and uncertain identity", async t => {
@@ -463,4 +464,80 @@ test("local launch and report validation preserve deployed obligations under tes
     agent: job.agent, acceptance: "local" }), /deployment Acceptance Criterion/);
   const legacy = { ...job, issue: runtime, ...acceptance(runtime.body) };
   assert.throws(() => validateReport(legacy, report(legacy), runtime.body, new Date(at.getTime() + 60_000)), /deployment Acceptance Criterion/);
+});
+
+
+test("valid failed independent observations return to the original worker and retire after a fresh source checkpoint", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  await run();
+  const verifier = store.get(job.id).verifier!;
+  const value = report(job, verifier.id); value.criteria[0].status = "fail";
+  value.criteria[0].evidence[0].observed = "Expected retry failed in the isolated fixture";
+  handoff(verifier, value);
+  const prompts: string[] = []; adapter.wake = async (_job, id, text) => { adapter.wakes.push(id); prompts.push(text); };
+  await run(new Date(at.getTime() + 120_000));
+  assert.equal(store.get(job.id).stage, "fixing");
+  assert.deepEqual(store.get(job.id).verification, value);
+  assert.equal(store.get(job.id).verifier!.state, "report-ready");
+  assert.equal(overview([store.get(job.id)]).jobs[0].group, "working");
+  assert.match(overview([store.get(job.id)]).jobs[0].nextAction, /retained independent report/);
+  assert.equal(adapter.wakes.length, 1); assert.match(prompts[0], /cli=fail/); assert.ok(prompts[0].includes(verifier.reportPath));
+  await run(new Date(at.getTime() + 180_000)); assert.equal(adapter.launches.length, 1);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Follow-up fix ready", pr: "https://github.com/example/project/pull/43" }, new Date(at.getTime() + 200_000));
+  assert.equal(store.get(job.id).verifier, undefined); assert.equal(store.get(job.id).verification, undefined);
+  assert.equal(store.get(job.id).verifierHistory?.at(-1)?.id, verifier.id);
+  adapter.snapshot.mergeSha = "c".repeat(40);
+  await run(new Date(at.getTime() + 300_000)); assert.equal(adapter.launches.length, 2);
+  assert.notEqual(adapter.launches[1].binding, verifier.binding);
+});
+
+test("passing GitHub evidence hands closeout to its worker while an explicit human completion gate remains held", async t => {
+  for (const human of [false, true]) {
+    const { store, job, adapter, run } = fixture(t); adapter.issue.state = "OPEN";
+    if (human) store.update(job.id, current => { current.config.trackerCompletion = "human"; }, at);
+    await run(); const verifier = store.get(job.id).verifier!; handoff(verifier, report(job, verifier.id));
+    await run(new Date(at.getTime() + 120_000));
+    assert.equal(adapter.wakes.length, human ? 0 : 1);
+    assert.equal(store.get(job.id).stage, "verifying"); assert.equal(adapter.launches.length, 1);
+    if (human) assert.equal(store.get(job.id).blocker?.reason, "tracker-closeout");
+    adapter.issue.state = "CLOSED"; await run(new Date(at.getTime() + 180_000));
+    assert.equal(store.get(job.id).stage, "verified");
+  }
+});
+
+test("completed outcomes survive a missing original worker without recreating it or releasing holds", async t => {
+  for (const fail of [false, true]) {
+    const { store, job, adapter, run } = fixture(t); await run();
+    const verifier = store.get(job.id).verifier!, value = report(job, verifier.id);
+    if (fail) value.criteria[0].status = "fail";
+    handoff(verifier, value);
+    const missing: LifecycleAdapter = { ...adapter, session: async () => undefined, project: adapter.project.bind(adapter),
+      wake: adapter.wake.bind(adapter), pr: adapter.pr.bind(adapter), deployment: adapter.deployment.bind(adapter), containsMerge: adapter.containsMerge.bind(adapter),
+      currentIssue: adapter.currentIssue.bind(adapter), markInReview: adapter.markInReview.bind(adapter), markDone: adapter.markDone.bind(adapter) };
+    await tick(store, missing, { now: new Date(at.getTime() + 120_000), process: "fixture:owner", alive: () => true });
+    assert.equal(store.get(job.id).stage, fail ? "needs-you" : "verified");
+    assert.deepEqual(store.get(job.id).verification, value);
+    assert.equal(adapter.wakes.length, 0); assert.equal(adapter.launches.length, 1);
+  }
+  const { store, job, adapter, run } = fixture(t); await run();
+  const verifier = store.get(job.id).verifier!; handoff(verifier, report(job, verifier.id));
+  checkpoint(store, job.id, { stage: "paused", detail: "Owner pause" }, at);
+  await run(new Date(at.getTime() + 120_000));
+  assert.equal(store.get(job.id).stage, "paused"); assert.equal(store.get(job.id).verification, undefined);
+});
+
+
+test("current GitHub owner holds retain completed verifier outcomes without waking or spending another attempt", async t => {
+  for (const failed of [false, true]) {
+    const { store, job, adapter, run } = fixture(t); adapter.issue.state = "OPEN";
+    await run(); const verifier = store.get(job.id).verifier!, value = report(job, verifier.id);
+    if (failed) value.criteria[0].status = "fail"; handoff(verifier, value);
+    adapter.issue.labels = ["owner-hold"];
+    await run(new Date(at.getTime() + 120_000)); await run(new Date(at.getTime() + 180_000));
+    assert.equal(store.get(job.id).stage, "needs-you"); assert.equal(store.get(job.id).verifier!.id, verifier.id);
+    assert.notEqual(store.get(job.id).verifier!.state, "failed");
+    assert.equal(adapter.wakes.length, 0); assert.equal(adapter.launches.length, 1);
+  }
+  const { store, job, adapter, run } = fixture(t); adapter.issue.labels = ["owner-hold"];
+  await run(); assert.equal(store.get(job.id).stage, "needs-you"); assert.equal(adapter.launches.length, 0);
 });
