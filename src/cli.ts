@@ -1,3 +1,6 @@
+import { assertQueueIssue } from "./queue.js";
+import { queueCLI, queueLaunchBinding } from "./queue-cli.js";
+import { QueueStore } from "./queue-store.js";
 import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -7,7 +10,7 @@ import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
 import { DEFAULT_LAUNCH_INSTRUCTIONS, MANAGED_OWNED_INSTRUCTION_PREFIXES, allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, prepareExistingWorktree, repositoryRoot } from "./git.js";
-import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
+import { fetchLinearCloseoutIssue, fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
 import { headlessPromptCommand, launch, runHere } from "./launch.js";
 import {
   DEFAULT_WORKIT_MAP,
@@ -39,6 +42,7 @@ Usage:
   workit [options] <issue> [issue ...]
   workit run [--tag <tag>] [--agent <name>] [--workdir <dir>] [--here] <prompt words...>
   workit sync [--check]
+  workit queue create|list|status|start|pause|cancel|reconcile (see workit queue --help)
   workit tick [--job ID]
   workit job list|status|checkpoint|pause|resume|cancel|verify (see workit job --help)
   workit heartbeat install|uninstall|status
@@ -512,6 +516,7 @@ function configProvider(options: CliOptions, configured: ProviderMode | undefine
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "queue") { await queueCLI(process.argv.slice(3)); return; }
   if (["tick", "job", "heartbeat"].includes(process.argv[2])) {
     await lifecycleCLI(process.argv.slice(2));
     return;
@@ -786,7 +791,7 @@ async function main(): Promise<void> {
     }
     await ensureSynced(resolved, options.verbose);
 
-    const issue = options.dryRun
+    let issue = options.dryRun
       ? {
           backend,
           identifier,
@@ -803,7 +808,11 @@ async function main(): Promise<void> {
       : (prefetched && backend === "linear"
           ? prefetched
           : await fetchIssue(backend, identifier, config, root));
-    if (!options.dryRun) await transitionLinearIssue(issue, config, root);
+    if (!options.dryRun && process.env.WORKIT_QUEUE_ID) {
+      if (issue.backend === "linear") issue = await fetchLinearCloseoutIssue(issue.identifier, config);
+      assertQueueIssue(issue);
+    }
+    if (!options.dryRun && !process.env.WORKIT_QUEUE_ID) await transitionLinearIssue(issue, config, root);
 
     const branch = branchForIssue(issue.backend, issue.identifier, issue.title, config);
     if (!options.dryRun) pressureGC(root);
@@ -857,7 +866,8 @@ async function main(): Promise<void> {
       if (jobStore.list().some(existing => existing.id === job!.id)) {
         throw new Error(`Managed job ${job.id} already exists; use workit job status/resume instead of replaying the launch`);
       }
-      jobStore.insert(job);
+      job = await queueLaunchBinding(jobStore, job);
+      issue = job.issue;
       console.log(`  Managed job: ${job.id}`);
     }
     try {
@@ -880,6 +890,7 @@ async function main(): Promise<void> {
       throw error;
     }
     if (job && jobStore) {
+      if (job.queue) new QueueStore(jobStore).confirm(job.queue.id, job.id, job.queue.launchID);
       try {
         await new BanyanLifecycleAdapter().project(job);
         jobStore.acknowledgeProjection(job);

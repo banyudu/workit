@@ -179,3 +179,32 @@ test("managed investigation CLI pins observed source and verifies without any PR
   await assert.rejects(lifecycleCLI(["job", "closeout", job.id]), /Investigation source changed/);
   assert.equal(store.get(job.id).stage, "verifying");
 });
+
+
+test("queue CLI creates a paused plan and the ordinary heartbeat launches its reserved issue exactly once", async t => {
+  const { directory, file, read, store } = fixture(t);
+  const git = (args: string[]) => execFileSync("git", args, { cwd: directory, stdio: "pipe" });
+  git(["init", "-b", "main"]);
+  writeFileSync(join(directory, ".workit.yml"), JSON.stringify({ codingAgents: null, provider: "github", default: "fixture",
+    agents: { fixture: { command: "fixture-implementer", weight: 1 } },
+    launch: { target: "banyan", dependencies: "none", logFile: join(directory, "launch.log"), instructions: [] },
+    worktree: { copyEnv: false, baseBranch: "main" }, lifecycle: { verification: "local" } }));
+  git(["add", ".workit.yml"]);
+  git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-m", "fixture queue source"]);
+  git(["remote", "add", "origin", "https://github.com/example/project.git"]);
+  writeFileSync(file, JSON.stringify({ issue: { ...issue, state: "OPEN" }, source, calls: [] }));
+  const manifest = join(directory, "plan.json");
+  writeFileSync(manifest, JSON.stringify({ title: "Fixture queue", outcome: "Complete the fixture issue", deadline: new Date(Date.now() + 3600_000).toISOString(),
+    maxConcurrent: 1, maxStarts: 1, maxContinuations: 1, items: [{ key: "fixture", repo: directory, issue: "23", agent: "fixture" }] }));
+  const cli = (...args: string[]) => execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), fileURLToPath(new URL("./cli.ts", import.meta.url)), ...args],
+    { cwd: directory, encoding: "utf8", stdio: "pipe", env: process.env });
+  const queued = JSON.parse(cli("queue", "create", manifest));
+  assert.equal(queued.state, "paused"); assert.equal(store.list().length, 0);
+  cli("tick"); assert.equal(store.list().length, 0);
+  cli("queue", "start", queued.id, "--expected-revision", String(queued.revision));
+  cli("tick"); cli("tick");
+  assert.equal(store.list().length, 1); assert.equal(store.list()[0].queue?.id, queued.id);
+  const status = JSON.parse(cli("queue", "status", queued.id));
+  assert.equal(status.items[0].state, "launched"); assert.equal(status.starts, 1);
+  assert.equal(read().calls.filter((call: string[]) => call[0] === "banyanctl" && call[1] === "session" && call[2] === "new").length, 1);
+});
