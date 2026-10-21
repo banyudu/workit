@@ -72,8 +72,9 @@ incompatible options.
 `--acceptance local|deployed` overrides the configured profile for one managed
 launch. Select local only after reviewing **all current ACs** and establishing
 local acceptance probes for each. Workit rejects local scope when an AC requires
-deployment or human acceptance. Scope is never inferred from changed filenames.
-Local reports still need a merged source, an independent reviewer and complete
+deployment. Human ACs still require actual attributed confirmation; profile
+correction refuses to narrow an outstanding human requirement. Scope is never inferred from changed filenames.
+Local implementation reports still need a merged source, an independent reviewer and complete
 criterion evidence; they need no fabricated deployment or journey evidence.
 
 For an unfinished job launched with the wrong profile, inspect its current plan
@@ -93,7 +94,8 @@ Deployment and human requirements cannot be waived by choosing local. Use
 explicit AC tags and clear requirements; the verifier remains responsible for
 proving the meaning of each criterion.
 
-Corrections append an audit entry with old/new profile and AC hash, reason,
+Corrections append an audit entry with old/new profile, delivery kind, target,
+prior PR/source and AC hash, reason,
 revision and time. They invalidate cached deployment, report and dispatch
 bindings and require evidence observed after the correction. Active or uncertain
 verifier identities remain in the audit and retain their capacity slot until
@@ -469,3 +471,50 @@ claims and unchanged polling do not update it. Older records omit that timestamp
 until their next meaningful change. `generatedAt` means the local snapshot read
 time, not a fresh tracker or deployment observation. Clients must show truncation
 and keep previous results visibly stale if refresh fails.
+
+## Investigation outcomes and named serving targets
+
+Implementation is the default delivery kind and still requires an authorized
+merged PR. A diagnosis-only issue can instead use:
+
+```bash
+workit --managed --delivery investigation --verification local 23
+```
+
+Workit pins the prepared worktree's clean tracked source at launch. Investigate
+that source, then checkpoint `verifying` when the findings are ready. Independent
+reports bind `sourceSha` to `observedSourceSha` from job status, instead of
+`mergeSha`. Every current AC, human confirmation and tracker closeout gate still
+applies. The verifier cannot invent a PR or change the source to bypass evidence.
+A changed or dirty tracked worktree blocks acceptance. An investigation may also
+use deployed acceptance; its serving source must contain the pinned observation.
+
+Choose a service with a named entry in trusted configuration:
+
+```yaml
+lifecycle:
+  deploymentTargets:
+    backup:
+      probe: ["/absolute/path/read-backup-version"]
+      environment: lab
+      target: backup
+      dependency: backup-lab
+```
+
+`--deployment-target backup` snapshots that probe and expected environment/target.
+The probe must return the normal ready/source/version contract and matching
+names. Existing `deploymentProbe` configurations continue to work. Issue text,
+reports and ordinary checkpoints cannot supply executable probe commands.
+
+Correct a target, delivery kind, or observed source only after inspecting the
+current issue and saved job:
+
+```bash
+workit job acceptance JOB_ID
+workit job acceptance JOB_ID --delivery investigation --target backup --profile deployed --reason "This issue investigates the backup service" --expected-revision 12 --expected-ac-hash CURRENT_AC_HASH
+```
+
+Correction reads the current trusted target configuration and clean worktree
+source, records an audit entry, and invalidates old reports/deployment bindings.
+Existing pauses, pending wake receipts and uncertain verifiers remain held.
+Changing delivery kind or target grants no new deployment or merge authority.

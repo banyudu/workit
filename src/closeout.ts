@@ -1,14 +1,17 @@
+import { assertVerificationSource, assertVerificationDeployment, investigation, verificationSource, VerificationReadError, observe } from "./verification-source.js";
+import { selectDeploymentTarget } from "./deployment-target.js";
 import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
-  type Blocker, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
+import { SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
+  type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
 export function correctAcceptance(store: JobStore, id: string, input: {
   profile: "local" | "deployed"; reason: string; expectedRevision: number; expectedAcHash: string;
-}, issue: IssueDetails, now = new Date()): Job {
+  delivery?: DeliveryKind; target?: string; observedSourceSha?: string;
+}, issue: IssueDetails, now = new Date(), trustedConfig?: LifecycleConfig): Job {
   if (!["local", "deployed"].includes(input.profile) || !input.reason?.trim() ||
       !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) throw new Error("Acceptance correction requires a profile, reason and expected revision");
   const binding = acceptance(issue.body);
@@ -17,11 +20,26 @@ export function correctAcceptance(store: JobStore, id: string, input: {
   return store.update(id, current => {
     if (current.revision !== input.expectedRevision) throw new Error("Job revision mismatch; reread before correcting acceptance");
     if (terminalStage(current.stage) || current.issue.url !== issue.url) throw new Error("Acceptance correction needs the current unfinished issue");
-    if (input.profile === "deployed" && !current.config.deploymentProbe?.length) throw new Error("Deployed acceptance requires a trusted deployment probe");
+    const fromDelivery = current.config.delivery ?? "implementation";
+    const delivery = input.delivery ?? fromDelivery;
+    if (!["implementation", "investigation"].includes(delivery)) throw new Error("Unknown delivery kind");
+    if (delivery === "investigation" && !sha(input.observedSourceSha)) throw new Error("Investigation correction needs a freshly observed source SHA");
+    const target = input.target ? selectDeploymentTarget(trustedConfig ?? {}, input.target) : undefined;
+    const nextConfig = { ...current.config, ...(target ? { deploymentTarget: target.deploymentTarget,
+      deploymentProbe: target.deploymentProbe, deploymentBinding: target.deploymentBinding,
+      deploymentDependency: target.deploymentDependency } : {}), delivery, verification: input.profile };
+    if (input.profile === "deployed" && !nextConfig.deploymentProbe?.length) throw new Error("Deployed acceptance requires a trusted deployment probe");
     (current.acceptanceHistory ??= []).push({ from: current.config.verification ?? "deployed", to: input.profile,
       reason: input.reason.trim(), at: now.toISOString(), revision: current.revision + 1,
-      oldAcHash: current.acHash, acHash: binding.acHash });
-    current.config.verification = input.profile;
+      oldAcHash: current.acHash, acHash: binding.acHash, fromDelivery, toDelivery: delivery,
+      fromTarget: current.config.deploymentTarget, toTarget: nextConfig.deploymentTarget,
+      priorPR: current.pr, priorSourceSha: verificationSource(current) });
+    current.config = nextConfig;
+    if (delivery === "investigation") {
+      current.observedSourceSha = input.observedSourceSha;
+      // This delivery contract records observations, not an implementation PR.
+      delete current.pr; delete current.mergeSha; delete current.inReview;
+    } else delete current.observedSourceSha;
     current.issue = issue; Object.assign(current, binding); current.acceptanceChangedAt = now.toISOString();
     delete current.deployment; delete current.verification; delete current.closeout; delete current.trackerDone; delete current.fingerprint; delete current.blocker;
     // Retain active/uncertain delivery audit and capacity until explicitly inspected.
@@ -35,7 +53,10 @@ export function correctAcceptance(store: JobStore, id: string, input: {
       current.detail = "Acceptance corrected; inspect pending delivery before explicitly resuming";
     }
     if (runnableStage(current.stage)) {
-      current.stage = current.mergeSha ? (input.profile === "local" ? "verifying" : "waiting-deploy") : current.stage;
+      const ready = !investigation(current) ? !!current.mergeSha
+        : fromDelivery === "investigation" && ["verifying", "waiting-deploy"].includes(current.stage);
+      current.stage = ready ? (input.profile === "local" ? "verifying" : "waiting-deploy")
+        : investigation(current) ? "investigating" : "implementing";
       current.nextWakeAt = now.toISOString();
       current.detail = "Acceptance plan corrected; fresh independent evidence is required";
     } else delete current.nextWakeAt;
@@ -85,7 +106,7 @@ export function jobBlockers(job: Job): Blocker[] {
   if (job.facts?.error) result.push(blocker(job, "runner-error", "system", job.facts.error, "next-fact-refresh"));
   if (job.blocker) result.push(["paused", "needs-you"].includes(job.stage)
     ? { ...job.blocker, nextAction: job.blocker.nextAction + "; explicitly resume only after inspecting and releasing the hold" } : job.blocker);
-  else if (job.mergeSha) {
+  else if (job.mergeSha || (investigation(job) && ["waiting-deploy", "verifying"].includes(job.stage))) {
     if (job.config.verification !== "local" && !job.deployment) result.push(blocker(job, "external-wait", "external",
       "Wait for the authorized deployment and its serving source/version probe", "deployment-probe-change",
       dependencyIdentity(job, "deployment")));
@@ -121,23 +142,13 @@ export function readableAttention(view: ReturnType<typeof attention>): string {
   return [...facts, ...items].join("\n") || "No unfinished closeout dependencies.";
 }
 
-class VerificationReadError extends Error {}
-async function observe<T>(read: () => Promise<T>): Promise<T> {
-  try { return await read(); } catch { throw new VerificationReadError("Current verification facts unavailable"); }
-}
-
 export async function checkVerification(adapter: LifecycleAdapter, expected: Job, value: unknown, now = new Date()): Promise<{ report: VerificationReport; finished: boolean }> {
   if (expected.stage !== "verifying") throw new Error("Job must be in verifying before completion");
   if (expected.verifier && ["reserved", "running", "uncertain", "invalidated", "report-ready"].includes(expected.verifier.state) &&
       (expected.verifier.state === "invalidated" || (value as VerificationReport)?.reviewer?.runID !== expected.verifier.id)) throw new Error("Reconcile the existing verifier before replacing its report or identity");
   if (!adapter.currentIssue) throw new Error("Current issue reader unavailable");
-  const pr = await observe(() => adapter.pr(expected));
-  if (!pr.merged || pr.mergeSha !== expected.mergeSha) throw new Error("GitHub does not establish the expected merged source");
-  if (expected.config.verification !== "local") {
-    const deployment = await observe(() => adapter.deployment(expected));
-    if (!deployment || JSON.stringify(deployment) !== JSON.stringify(expected.deployment) ||
-        !await observe(() => adapter.containsMerge(expected, deployment.sourceSha))) throw new Error("Serving deployment changed; rerun applicable verification");
-  }
+  await assertVerificationSource(adapter, expected);
+  await assertVerificationDeployment(adapter, expected);
   const issue = await observe(() => adapter.currentIssue!(expected));
   assertTracker(expected, issue);
   return { report: validateReport(expected, value, issue.body, now), finished: issueFinished(issue) && (issue.backend !== "linear" || provenChecklist(issue.body, expected.acLabels) === issue.body) };
@@ -152,7 +163,7 @@ export function completeVerification(store: JobStore, expected: Job, report: Ver
 }
 
 export function verifierBinding(job: Job): string {
-  return digest(JSON.stringify([job.acHash, job.mergeSha, job.config.verification, job.acceptanceChangedAt, job.deployment]));
+  return digest(JSON.stringify([job.acHash, verificationSource(job), job.config.delivery, job.config.deploymentTarget, job.config.verification, job.acceptanceChangedAt, job.deployment]));
 }
 function readArtifact(path: string): unknown {
   if (statSync(path).size > 4 * 1024 * 1024) throw new Error("Verifier artifact exceeds the bounded report size");
@@ -210,6 +221,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
         save(current => { current.verifier!.state = "report-ready"; current.verification = checked.report; if (current.issue.backend === "linear") current.closeout ??= {}; });
         return wait("tracker-closeout", "owner", "Independent evidence passed; reconcile the issue checklist and completed state under repository policy", "tracker-state-change", "awaiting-tracker-closeout");
       } catch (error) {
+        if (error instanceof SourceProvenanceError) return wait("source-provenance", "external", "Repair the actual serving source/version binding before accepting evidence", "serving-provenance-repaired", "serving-binding-stale");
         if (error instanceof VerificationReadError) {
           return wait("runner-error", "system", "Current issue, PR or deployment facts are unavailable; retain this verifier report and retry the read", "fact-reader-recovered", "verifier-facts-unavailable");
         }
@@ -235,11 +247,15 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   if (issue.url !== job.issue.url || acceptance(issue.body).acHash !== job.acHash) return wait("acceptance-decision", "owner", "Current ACs changed; review and correct the acceptance plan against the current binding", "audited-acceptance-correction", "acceptance-stale");
   if (job.config.verification === "local") assertLocalAcceptance(issue.body);
   if (acceptanceCriteria(issue.body).some(requiresHuman)) return wait("acceptance-decision", "owner", "Obtain the explicit human acceptance required by the current ACs, then submit independent complete evidence", "human-acceptance-evidence", "owner-acceptance-required");
-  const pr = await adapter.pr(job);
-  if (!pr.merged || pr.mergeSha !== job.mergeSha) return wait("runner-error", "system", "Refresh the merged PR source before dispatching verification", "github-fact-change", "source-unestablished");
-  if (job.config.verification !== "local") {
-    const deployment = await adapter.deployment(job);
-    if (!deployment || JSON.stringify(deployment) !== JSON.stringify(job.deployment) || !await adapter.containsMerge(job, deployment.sourceSha)) return wait("source-provenance", "external", "Repair the actual serving source/version binding and refresh waiting-deploy before verifying", "serving-provenance-repaired", "serving-binding-stale");
+  try { await assertVerificationSource(adapter, job); }
+  catch (error) {
+    if (error instanceof VerificationReadError) throw error;
+    return wait("runner-error", "system", "Refresh the expected source before dispatching verification", "source-fact-change", "source-unestablished");
+  }
+  try { await assertVerificationDeployment(adapter, job); }
+  catch (error) {
+    if (error instanceof VerificationReadError) throw error;
+    return wait("source-provenance", "external", "Repair the actual serving source/version binding and refresh waiting-deploy before verifying", "serving-provenance-repaired", "serving-binding-stale");
   }
   const id = "workit-verifier-" + randomUUID();
   const artifacts = join(dirname(store.path), "verifiers", id);

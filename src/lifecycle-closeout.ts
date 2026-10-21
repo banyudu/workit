@@ -1,3 +1,4 @@
+import { assertVerificationSource, assertVerificationDeployment } from "./verification-source.js";
 import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import type { TrackerIssue } from "./issue.js";
@@ -45,14 +46,8 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
   };
   const source = async () => {
     assertOwned();
-    const pr = await adapter.pr(job);
-    if (!pr.merged || pr.mergeSha !== job.mergeSha) throw new Error("GitHub does not establish the expected merged source");
-    if (job.config.verification !== "local") {
-      const deployment = await adapter.deployment(job);
-      if (!deployment || !job.deployment ||
-          !(["environment", "target", "sourceSha", "version"] as const).every(key => deployment[key] === job.deployment![key]) ||
-          !await adapter.containsMerge(job, deployment.sourceSha)) throw new Error("Serving deployment changed; rerun applicable verification");
-    }
+    await assertVerificationSource(adapter, job);
+    await assertVerificationDeployment(adapter, job);
     assertOwned();
   };
   const read = async () => {

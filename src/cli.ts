@@ -2,10 +2,10 @@ import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
-import { JobStore, createJob, parseVerificationMode } from "./lifecycle.js";
+import { JobStore, createJob, parseVerificationMode, parseDeliveryKind } from "./lifecycle.js";
 import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
-import { MANAGED_OWNED_INSTRUCTION_PREFIXES, allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
+import { DEFAULT_LAUNCH_INSTRUCTIONS, MANAGED_OWNED_INSTRUCTION_PREFIXES, allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
 import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, prepareExistingWorktree, repositoryRoot } from "./git.js";
 import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
 import { headlessPromptCommand, launch, runHere } from "./launch.js";
@@ -115,6 +115,8 @@ Options:
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
+  --delivery implementation|investigation  Managed delivery contract (default implementation)
+  --deployment-target NAME             Select a named trusted probe/environment
   --acceptance local|deployed           Explicit per-job acceptance profile (managed only)
   --verification local|deployed         Override managed verification for these issues
   --review / --no-review               Include/skip design guidance
@@ -174,6 +176,10 @@ function parseArgs(argv: string[]): CliOptions {
       case "--managed":
         options.managed = true;
         break;
+      case "--delivery":
+        options.delivery = parseDeliveryKind(next()); break;
+      case "--deployment-target":
+        options.deploymentTarget = next(); break;
       case "--acceptance":
         options.acceptance = next() as "local" | "deployed";
         if (!["local", "deployed"].includes(options.acceptance)) throw new Error("--acceptance requires local or deployed");
@@ -770,7 +776,7 @@ async function main(): Promise<void> {
       throw new Error("Managed jobs require a prompted agent in Banyan");
     }
     if (options.acceptance && options.verification && options.acceptance !== options.verification) throw new Error("--acceptance and --verification must agree");
-    if ((options.acceptance || options.verification) && !managed) throw new Error("--verification requires a managed launch");
+    if ((options.acceptance || options.verification || options.delivery || options.deploymentTarget) && !managed) throw new Error("--verification requires a managed launch");
 
     if (options.verbose && resolved.configFiles.length) {
       console.log(`Config: ${resolved.configFiles.join(", ")}`);
@@ -839,9 +845,13 @@ async function main(): Promise<void> {
     if (managed && !options.dryRun) {
       await new BanyanLifecycleAdapter().requireWorkflowSupport(root);
       jobStore = new JobStore();
+      const lifecycle = { ...config.lifecycle, ...(options.verification ? { verification: options.verification } : {}),
+        ...(options.delivery ? { delivery: options.delivery } : {}),
+        ...(options.deploymentTarget ? { deploymentTarget: options.deploymentTarget } : {}) };
       job = createJob({ issue, repoRoot: root, worktree: worktree.path,
+        observedSourceSha: lifecycle.delivery === "investigation" ? await new BanyanLifecycleAdapter().observedSource({ worktree: worktree.path }) : undefined,
         githubRepo: githubRepository(remote), agent: selected.name, acceptance: options.acceptance,
-        config: { ...config.lifecycle, ...(options.verification ? { verification: options.verification } : {}) } });
+        config: lifecycle });
       job.controlCommand = [process.execPath, resolve(process.argv[1])];
       job.stateDirectory = dirname(jobStore.path);
       if (jobStore.list().some(existing => existing.id === job!.id)) {
@@ -855,7 +865,8 @@ async function main(): Promise<void> {
         ...options,
         instructions: job
           ? [
-              ...instructions.filter(line => !MANAGED_OWNED_INSTRUCTION_PREFIXES.some(prefix => line.startsWith(prefix))),
+              ...instructions.filter(line => !MANAGED_OWNED_INSTRUCTION_PREFIXES.some(prefix => line.startsWith(prefix)) &&
+                !(job!.config.delivery === "investigation" && DEFAULT_LAUNCH_INSTRUCTIONS.includes(line))),
               ...managedInstructions(job),
             ]
           : instructions,
