@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 
 for (const scenario of [
   { name: "explicit missing parent", session: "caller-session", override: "missing-parent", parent: "missing-parent", fallback: true },
-  { name: "inherited missing parent", session: "missing-parent", override: undefined, parent: "missing-parent", fallback: true },
+  { name: "inherited missing parent", session: "missing-parent", override: undefined, parent: "", fallback: false },
   { name: "inherited active parent", session: "caller-session", override: undefined, parent: "caller-session", fallback: false },
   { name: "explicit active parent", session: "caller-session", override: "chosen-parent", parent: "chosen-parent", fallback: false },
   { name: "outside Banyan", session: undefined, override: undefined, parent: "", fallback: false },
@@ -23,6 +23,15 @@ for (const scenario of [
     writeFileSync(join(directory, "Banyan/control-token"), "fixture-token", { mode: 0o600 });
     const requests: Array<{ token?: string; body: Record<string, string> }> = [];
     const server = createServer(async (request, response) => {
+      if (request.method === "GET") {
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        const id = url.searchParams.get("id") ?? scenario.session ?? "";
+        const status = id === "missing-parent" ? "closed" : "need-input";
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ apiVersion: "v1", ok: true,
+          data: { sessions: id ? [{ id, status }] : [], shellAvailable: true, puckAvailable: false } }));
+        return;
+      }
       let text = "";
       for await (const chunk of request) text += chunk;
       const body = JSON.parse(text) as Record<string, string>;
@@ -51,9 +60,22 @@ for (const scenario of [
   `;
     const result = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
       timeout: 15_000,
-      env: { ...process.env, WORKIT_PARENT_FIXTURE: directory, WORKIT_BANYANCTL: process.env.WORKIT_TEST_BANYANCTL,
-        BANYAN_SESSION_ID: scenario.session, BANYAN_PARENT_SESSION_ID: scenario.override,
-        BANYAN_FIXTURE_DATA_HOME: directory, BANYAN_FIXTURE_CONTROL_URL: `http://127.0.0.1:${address.port}` },
+      env: (() => {
+        const environment: NodeJS.ProcessEnv = {
+          ...process.env,
+          WORKIT_PARENT_FIXTURE: directory,
+          WORKIT_BANYANCTL: process.env.WORKIT_TEST_BANYANCTL,
+          BANYAN_FIXTURE_DATA_HOME: directory,
+          BANYAN_FIXTURE_CONTROL_URL: `http://127.0.0.1:${address.port}`,
+        };
+        delete environment.TMUX;
+        delete environment.TMUX_PANE;
+        delete environment.BANYAN_SESSION_ID;
+        delete environment.BANYAN_PARENT_SESSION_ID;
+        if (scenario.session !== undefined) environment.BANYAN_SESSION_ID = scenario.session;
+        if (scenario.override !== undefined) environment.BANYAN_PARENT_SESSION_ID = scenario.override;
+        return environment;
+      })(),
     });
     if (scenario.fallback) assert.match(result.stderr, /is inactive; launching a top-level session/);
     else assert.doesNotMatch(result.stderr, /is inactive; launching a top-level session/);

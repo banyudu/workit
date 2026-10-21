@@ -70,11 +70,15 @@ const missingParent = (parent = "missing-parent"): Reply => ({
   stderr: "banyanctl: server returned HTTP 400\n",
 });
 
-function banyanFixture(t: TestContext, replies: Reply[] = [{ status: 0 }]) {
+function banyanFixture(
+  t: TestContext,
+  replies: Reply[] = [{ status: 0 }],
+  fixtureOptions: { activeSessionIDs?: string[] } = {},
+) {
   const directory = mkdtempSync(join(tmpdir(), "workit-parent-"));
   const log = join(directory, "calls.jsonl");
   const cli = join(directory, "banyanctl");
-  const keys = ["WORKIT_BANYANCTL", "BANYAN_SESSION_ID", "BANYAN_PARENT_SESSION_ID"];
+  const keys = ["WORKIT_BANYANCTL", "BANYAN_SESSION_ID", "BANYAN_PARENT_SESSION_ID", "TMUX", "TMUX_PANE", "PATH"];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => {
     for (const key of keys) {
@@ -87,8 +91,20 @@ function banyanFixture(t: TestContext, replies: Reply[] = [{ status: 0 }]) {
 const fs = require('node:fs');
 const log = ${JSON.stringify(log)};
 const replies = ${JSON.stringify(replies)};
-const count = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\\n').length : 0;
-fs.appendFileSync(log, JSON.stringify({ args: process.argv.slice(2), session: process.env.BANYAN_SESSION_ID ?? null, parent: process.env.BANYAN_PARENT_SESSION_ID ?? null }) + '\\n');
+const activeSessionIDs = ${JSON.stringify(fixtureOptions.activeSessionIDs ?? ["caller-session"])};
+const entries = fs.existsSync(log)
+  ? fs.readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean).map(line => JSON.parse(line))
+  : [];
+const args = process.argv.slice(2);
+fs.appendFileSync(log, JSON.stringify({ args, session: process.env.BANYAN_SESSION_ID ?? null, parent: process.env.BANYAN_PARENT_SESSION_ID ?? null }) + '\\n');
+if (args[0] === 'session' && args[1] === 'list') {
+  const idIndex = args.indexOf('--id');
+  const id = idIndex >= 0 ? args[idIndex + 1] : '';
+  const status = activeSessionIDs.includes(id) ? 'need-input' : 'closed';
+  process.stdout.write(JSON.stringify({ sessions: id ? [{ id, status }] : [], shellAvailable: true, puckAvailable: false }));
+  process.exit(0);
+}
+const count = entries.filter(entry => entry.args[0] === 'session' && entry.args[1] === 'new').length;
 const reply = replies[Math.min(count, replies.length - 1)];
 if (reply.stdout) process.stdout.write(reply.stdout);
 if (reply.stderr) process.stderr.write(reply.stderr);
@@ -96,15 +112,21 @@ process.exit(reply.status);
 `, { mode: 0o755 });
   Object.assign(process.env, { WORKIT_BANYANCTL: cli, BANYAN_SESSION_ID: "caller-session" });
   delete process.env.BANYAN_PARENT_SESSION_ID;
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
   const resolved: ResolvedConfig = {
     config: { launch: { logFile: join(directory, "launch.log") } },
     root: directory, configFiles: [], aliasIndex: {},
   };
   return {
+    directory,
     resolved,
     run: (overrides: Partial<CliOptions> = {}) => launch(resolved, issue, worktree, "fixture",
       { command: "fixture-agent" }, options({ prompt: false, sessionID: "managed-fixture", ...overrides })),
-    calls: (): Call[] => readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line)),
+    allCalls: (): Call[] => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)),
+    calls(): Call[] {
+      return this.allCalls().filter(call => call.args[0] === "session" && call.args[1] === "new");
+    },
   };
 }
 
@@ -147,6 +169,37 @@ test("a blank parent override falls back to the trimmed calling session identity
   process.env.BANYAN_SESSION_ID = " caller-session ";
   f.run();
   assert.deepEqual(f.calls()[0].args.slice(-2), ["--parent", "caller-session"]);
+});
+
+test("a live tmux session overrides a stale inherited session id", t => {
+  const f = banyanFixture(t, [{ status: 0 }], { activeSessionIDs: [] });
+  writeFileSync(join(f.directory, "tmux"), "#!/bin/sh\nprintf '%s\\n' 'banyan-session-current'\n", { mode: 0o755 });
+  process.env.PATH = `${f.directory}:${process.env.PATH ?? ""}`;
+  process.env.TMUX = "/tmp/stale-tmux,1,0";
+  process.env.TMUX_PANE = "%1";
+  process.env.BANYAN_SESSION_ID = "session-stale";
+
+  f.run();
+
+  const [call] = f.calls();
+  assert.deepEqual(call.args.slice(-2), ["--parent", "session-current"]);
+  assert.equal(f.allCalls().length, 1, "the live tmux identity does not need server validation");
+});
+
+test("a closed inherited session id is ignored instead of triggering a fallback warning", t => {
+  const f = banyanFixture(t, [{ status: 0 }], { activeSessionIDs: [] });
+  process.env.BANYAN_SESSION_ID = "session-closed";
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  t.after(() => { console.warn = warn; });
+
+  f.run();
+
+  const [call] = f.calls();
+  assert.deepEqual(call.args.at(-1), "--no-parent");
+  assert.equal(f.allCalls().length, 2, "the inherited id is checked before launch");
+  assert.deepEqual(warnings, []);
 });
 
 test("a missing inherited parent falls back once without retargeting the launch", t => {

@@ -291,12 +291,14 @@ source and independent evidence for every AC.
 Repositories without Superdog can replace the guidance below with their own
 review policy.
 
-Banyan launches inherit the calling session from `BANYAN_SESSION_ID`. Set
-`BANYAN_PARENT_SESSION_ID` to nest under a different session. Workit resolves
-the parent before clearing the child CLI's identity variables, and uses
-`--no-parent` when neither variable contains an ID. If the parent is missing or closed,
-workit retries once as a top-level session after a confirmed HTTP 400
-missing-parent rejection. Other errors are reported without retrying.
+Banyan launches inherit the live enclosing `banyan-<id>` tmux session first,
+then fall back to `BANYAN_SESSION_ID` after checking that it is still open. Set
+`BANYAN_PARENT_SESSION_ID` to override both. Workit resolves the parent before
+clearing the child CLI's identity variables, and uses `--no-parent` when no
+current session is found. A closed inherited ID is ignored without launching a
+stale parent. If an explicit parent is missing or closed, workit retries once
+as a top-level session after a confirmed HTTP 400 missing-parent rejection;
+other errors are reported without retrying.
 Set `launch.parentFallback: false` or pass `--no-parent-fallback` to require the
 parent; `--parent-fallback` enables fallback for a single run.
 

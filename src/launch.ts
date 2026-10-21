@@ -19,6 +19,69 @@ function findBanyanctl(): string {
   }
 }
 
+type TmuxSessionResolution =
+  | { kind: "found"; sessionID: string }
+  | { kind: "foreign" }
+  | { kind: "unavailable" }
+  | { kind: "absent" };
+
+function resolveTmuxSession(): TmuxSessionResolution {
+  if (!process.env.TMUX && !process.env.TMUX_PANE) return { kind: "absent" };
+  const socket = process.env.TMUX?.split(",")[0];
+  const args = socket
+    ? ["-S", socket, "display-message", "-p", "#{session_name}"]
+    : ["-L", process.env.BANYAN_TMUX_SOCKET?.trim() || "banyan", "display-message", "-p", "#{session_name}"];
+  const result = spawnSync("tmux", args, {
+    env: process.env,
+    encoding: "utf8",
+    timeout: 2_000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.error || result.status !== 0) return { kind: "unavailable" };
+  const name = String(result.stdout ?? "").trim();
+  const prefix = "banyan-";
+  if (!name.startsWith(prefix)) return { kind: "foreign" };
+  const sessionID = name.slice(prefix.length).trim();
+  return sessionID ? { kind: "found", sessionID } : { kind: "foreign" };
+}
+
+function banyanSessionIsActive(banyanctl: string, sessionID: string): boolean | undefined {
+  const result = spawnSync(banyanctl, ["session", "list", "--id", sessionID], {
+    env: process.env,
+    encoding: "utf8",
+    timeout: 5_000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.error || result.status !== 0) return undefined;
+  try {
+    const response = JSON.parse(String(result.stdout ?? ""));
+    if (!Array.isArray(response?.sessions)) return undefined;
+    return response.sessions.some((session: { id?: unknown; status?: unknown }) =>
+      session?.id === sessionID && session?.status !== "closed");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The live pane is the authority on where a child belongs. A long-lived agent
+ * or app-server can inherit BANYAN_SESSION_ID from a session (or tmux server)
+ * that has since gone away, so only fall back to that value after checking it.
+ * An explicit parent override remains unconditional.
+ */
+function resolveBanyanParent(banyanctl: string): string | undefined {
+  const explicit = process.env.BANYAN_PARENT_SESSION_ID?.trim();
+  if (explicit) return explicit;
+
+  const tmux = resolveTmuxSession();
+  if (tmux.kind === "found") return tmux.sessionID;
+
+  const inherited = process.env.BANYAN_SESSION_ID?.trim();
+  if (!inherited) return undefined;
+  if (banyanSessionIsActive(banyanctl, inherited) === false) return undefined;
+  return inherited;
+}
+
 export function promptFor(
   issue: IssueDetails,
   worktree: WorktreeResult,
@@ -152,9 +215,9 @@ function runBanyan(
     "--cwd", worktree.path,
   ];
   if (command) args.push("--command", `cd ${shellQuote(worktree.path)} && ${command}`);
-  // A launch inside Banyan inherits its calling session unless an explicit
+  // A launch inside Banyan inherits its current session unless an explicit
   // override is set. Resolve it before clearing the child CLI's identity.
-  const parent = process.env.BANYAN_PARENT_SESSION_ID?.trim() || process.env.BANYAN_SESSION_ID?.trim();
+  const parent = resolveBanyanParent(banyanctl);
   const environment = { ...process.env };
   delete environment.BANYAN_SESSION_ID;
   delete environment.BANYAN_PARENT_SESSION_ID;
