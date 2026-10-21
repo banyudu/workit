@@ -4,6 +4,7 @@ import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IssueDetails } from "./types.js";
+import { coordinateVerification, refreshHeldFacts } from "./closeout.js";
 
 export const stages = ["implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
@@ -22,7 +23,22 @@ export interface LifecycleConfig {
   verification?: VerificationMode;
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
+  /** Trusted grouping key. Attention views expose only its digest. */
+  deploymentDependency?: string;
+  verifier?: { enabled?: boolean; agent?: string; concurrency?: number; maxAttempts?: number; timeoutSeconds?: number };
 }
+export interface Blocker {
+  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout";
+  owner: "owner" | "external" | "system" | "verifier";
+  dependency?: string; observedAt: string; recheckTrigger: string; nextAction: string;
+}
+export interface VerifierRun {
+  id: string; sessionID: string; agent: string; binding: string; reportPath: string; outcomePath: string;
+  state: "reserved" | "running" | "uncertain" | "failed" | "report-ready" | "accepted" | "invalidated";
+  reservedAt: string; startedAt?: string; timeoutSeconds: number;
+  delivery?: "delivered" | "not-delivered"; recovery?: { reason: string; at: string };
+}
+export interface VerifierPlan { enabled: boolean; agent?: string; command?: string; concurrency: number; maxAttempts: number; timeoutSeconds: number }
 export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
   schema: 1; id: string; revision: number; projectedRevision?: number;
@@ -30,7 +46,7 @@ export interface Job {
   repoRoot: string; worktree: string; sessionID: string; githubRepo: string;
   agent: string; stage: Stage; detail: string; config: LifecycleConfig;
   controlCommand?: string[]; stateDirectory?: string;
-  createdAt: string; updatedAt: string; nextWakeAt?: string;
+  createdAt: string; updatedAt: string; lastProgressAt?: string; nextWakeAt?: string;
   pr?: string; mergeSha?: string; deployment?: Deployment;
   /** Tracker handoff recorded once the merged PR was handed to human review. */
   inReview?: boolean;
@@ -39,13 +55,19 @@ export interface Job {
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
   // Older pending wakes already charged wakeups when they were reserved.
-  wake?: { id: string; reason: string; revision: number; counted?: boolean };
+  wake?: { id: string; reason: string; revision: number; counted?: boolean; delivery?: "not-delivered" };
   verification?: VerificationReport;
   closeout?: {
     checklist?: { before: string; after: string; issueID: string; teamID: string; changes?: ChecklistChange[] };
     checklistConfirmed?: boolean; stateID?: string; stateConfirmed?: boolean;
   };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
+  acceptanceChangedAt?: string;
+  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string }>;
+  holdDetail?: string;
+  blocker?: Blocker;
+  facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
+  verifier?: VerifierRun; verifierHistory?: VerifierRun[]; verifierAttempts?: number;
 }
 export interface VerificationReport {
   jobID: string; issueURL: string; acHash: string; mergeSha: string; checkedAt: string;
@@ -59,6 +81,16 @@ export const digest = (value: string): string => createHash("sha256").update(val
 export const terminalStage = (stage: Stage): boolean => ["verified", "cancelled"].includes(stage);
 export const runnableStage = (stage: Stage): boolean => !terminalStage(stage) && !["paused", "needs-you"].includes(stage);
 export const sha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{40}$/i.test(value);
+export function dependencyIdentity(job: Job, kind: "deployment" | "provenance"): string | undefined {
+  const key = job.config.deploymentDependency;
+  return typeof key === "string" && key.trim() ? digest(kind + "\n" + key).slice(0, 20) : undefined;
+}
+export function sanitizedDetail(value: string): string {
+  return value.replace(/https?:\/\/[^\s]+/gi, "[URL]")
+    .replace(/(?:bearer\s+|(?:token|secret|password|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, "[credential]")
+    .replace(/(?:\/[\w.@~%-]+){2,}/g, "[path]")
+    .replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 600);
+}
 
 function checklistCriteria(body: string) {
   const heading = /^##[ \t]+Acceptance Criteria[ \t]*\r?$/im.exec(body);
@@ -90,7 +122,7 @@ function checklistCriteria(body: string) {
   finish();
   return criteria.map(item => ({ ...item,
     label: item.text.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(item.text).slice(0, 12),
-    human: /\[human(?::[a-z0-9-]+)?\]/.test(item.text) }));
+    human: requiresHuman(item.text) }));
 }
 
 // Keep the text-only parser contract shared with acceptance planning (#10).
@@ -138,7 +170,7 @@ function validateVerificationMode(config: LifecycleConfig, body: string): void {
   if (mode === "deployed" && !config.deploymentProbe?.length) {
     throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
   }
-  if (mode === "local" && acceptanceCriteria(body).some(line => /\[deploy(?::[a-z0-9-]+)?\]/.test(line))) {
+  if (mode === "local" && acceptanceCriteria(body).some(requiresDeployed)) {
     throw new Error("Local verification cannot satisfy a deployment Acceptance Criterion");
   }
 }
@@ -153,6 +185,31 @@ export function setVerificationMode(job: Job, value: unknown): void {
   delete job.deployment; delete job.verification; delete job.closeout; delete job.trackerDone;
 }
 
+function localContractDescription(criterion: string): boolean {
+  const description = criterion.replace(/`?\[(?:test|code):[a-z0-9-]+\]`?/g, "").trim();
+  return /^(?:tests? (?:cover|reject|reconcile|group|establish|enforce|preserve)|a fixture\b|documentation (?:describes|documents|explains|lists)|document\b|describe\b)/i.test(description);
+}
+export function requiresDeployed(criterion: string): boolean {
+  if (/\[deploy(?::|\])/i.test(criterion)) return true;
+  // A fixture/documentation contract can describe deployed behavior without
+  // requiring runtime execution. Direct runtime instructions still take priority.
+  const directRuntime = /\b(?:run|runs|execute|executed|exercise|verify|verified|probe)\b[^.\n]{0,80}\b(?:deployed|production|staging|live runtime)\b/i.test(criterion);
+  const runtimeObligation = /\b(?:deployed|production|staging|serving[ -](?:version|bound|source|runtime))\b[^.\n]{0,100}\b(?:must|shall|required|passes?|succeeds?|completes?)\b|\b(?:must|shall|required)\b[^.\n]{0,100}\b(?:deployed|production|staging|serving)\b/i.test(criterion);
+  if (localContractDescription(criterion) && !directRuntime && !runtimeObligation) return false;
+  return /\[deploy(?::|\])|\bdeployed\b|\bserving[ -](?:version|source|bound|runtime)\b|\b(?:production|staging|live runtime)\b|\b(?:dev|development|remote|live) (?:environment|runtime|service|deployment)\b|\bjourney\b[^.\n]*\b(?:environment|deployment|runtime)\b/i.test(criterion);
+}
+export function requiresHuman(criterion: string): boolean {
+  if (/\[human(?::|\])/i.test(criterion)) return true;
+  if (localContractDescription(criterion) && !/\b(?:obtain|requires?|required|record|recorded|must|shall)\b[^.\n]{0,80}\b(?:human|owner|user) (?:acceptance|approval)\b|\b(?:human|owner|user) (?:acceptance|approval)\b[^.\n]{0,80}\b(?:must|shall|required)\b|\b(?:owner|human|operator|user) (?:approves|accepts|signs off)\b/i.test(criterion)) return false;
+  return /\[human(?::|\])|\b(?:human|manual|user) acceptance\b|\b(?:owner|human|operator|user) (?:approval|acceptance|approves|accepts|sign.off)\b/i.test(criterion);
+}
+export function assertLocalAcceptance(body: string): void {
+  acceptance(body);
+  if (acceptanceCriteria(body).some(line => requiresDeployed(line) || requiresHuman(line))) {
+    throw new Error("Local acceptance cannot bypass a current deployed or human AC; preserve its scope");
+  }
+}
+
 export function workflowState(stage: Stage): string {
   if (stage.startsWith("waiting-")) return "waiting";
   if (["needs-you", "paused", "cancelled", "verified"].includes(stage)) return stage;
@@ -162,10 +219,12 @@ export function workflowState(stage: Stage): string {
 export function createJob(input: {
   issue: IssueDetails; repoRoot: string; worktree: string; githubRepo: string; agent: string;
   config?: LifecycleConfig; now?: Date;
+  acceptance?: "local" | "deployed";
 }): Job {
   const now = (input.now ?? new Date()).toISOString();
   const id = digest(input.repoRoot + "\n" + input.issue.url).slice(0, 24);
-  const config = { verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config };
+  const config = { verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config,
+    ...(input.acceptance ? { verification: input.acceptance } : {}) };
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
@@ -177,7 +236,7 @@ export function createJob(input: {
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
     sessionID: "workit-" + id, agent: input.agent, stage: "implementing", detail: "",
-    config, createdAt: now, updatedAt: now,
+    config, createdAt: now, updatedAt: now, lastProgressAt: now,
     nextWakeAt: new Date(Date.parse(now) + config.intervalSeconds * 1000).toISOString(), errors: 0, wakeups: 0 };
 }
 
@@ -204,6 +263,19 @@ with sqlite3.connect(db, timeout=10) as connection:
         cursor = connection.execute("UPDATE jobs SET revision=?,data=? WHERE id=? AND revision=?",
             (job["revision"], json.dumps(job), job["id"], request["expected"]))
         print("true" if cursor.rowcount == 1 else "false")
+    elif op == "reserve-verifier":
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT data FROM jobs WHERE id=?", (request["job"]["id"],)).fetchone()
+        current = json.loads(row[0]) if row else None
+        active = sum(1 for row in connection.execute("SELECT data FROM jobs")
+            if json.loads(row[0]).get("verifier", {}).get("state") in ["reserved", "running", "uncertain", "invalidated"])
+        job = request["job"]
+        if current and current["revision"] == request["expected"] and active < request["limit"]:
+            connection.execute("UPDATE jobs SET revision=?,data=? WHERE id=? AND revision=?",
+                (job["revision"], json.dumps(job), job["id"], request["expected"]))
+            print("true")
+        else:
+            print("false")
 `;
 
 export class JobStore {
@@ -229,14 +301,26 @@ export class JobStore {
   list(): Job[] { return this.call("list", {}); }
   get(id: string): Job { const job = this.call<Job | null>("get", { id }); if (!job) throw new Error(`Unknown job '${id}'`); return job; }
   insert(job: Job): void { this.call("insert", { job }); }
-  acknowledgeProjection(job: Job): void {
-    this.call("cas", { expected: job.revision, job: { ...job, projectedRevision: job.revision } });
+  reserveVerifier(expected: Job, run: VerifierRun, concurrency: number, maxAttempts: number, now: Date): Job | undefined {
+    if (!runnableStage(expected.stage) || expected.stage !== "verifying" || expected.wake ||
+        (expected.verifier && expected.verifier.state !== "failed") || (expected.verifierAttempts ?? 0) >= maxAttempts) return undefined;
+    const job = structuredClone(expected);
+    if (job.verifier) (job.verifierHistory ??= []).push(job.verifier);
+    job.verifier = run; job.verifierAttempts = (job.verifierAttempts ?? 0) + 1;
+    job.revision++; job.updatedAt = now.toISOString();
+    return this.call<boolean>("reserve-verifier", { job, expected: expected.revision, limit: concurrency }) ? job : undefined;
+  }
+  acknowledgeProjection(job: Job): boolean {
+    return this.call("cas", { expected: job.revision, job: { ...job, projectedRevision: job.revision } });
   }
   update(id: string, change: (job: Job) => void, now = new Date()): Job {
     for (let attempt = 0; attempt < 10; attempt++) {
       const job = this.get(id);
       const expected = job.revision;
+      const progress = (value: Job) => JSON.stringify([value.stage, value.detail, value.pr, value.mergeSha, value.deployment, value.verification, value.acHash]);
+      const before = progress(job);
       change(job);
+      if (progress(job) !== before) job.lastProgressAt = now.toISOString();
       job.revision++;
       job.updatedAt = now.toISOString();
       if (this.call<boolean>("cas", { expected, job })) return job;
@@ -285,7 +369,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.closeout; delete job.inReview; delete job.trackerDone;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.facts; delete job.closeout; delete job.inReview; delete job.trackerDone;
       }
       job.pr = patch.pr;
     }
@@ -299,8 +383,10 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
+    delete job.blocker;
+    if (["paused", "needs-you"].includes(job.stage)) job.holdDetail = patch.detail;
     delete job.fingerprint; delete job.claim;
-    // Retain uncertain delivery evidence while the operator holds the job.
+    // A hold must retain pending delivery evidence for inspected recovery.
     if (runnableStage(job.stage)) delete job.wake;
     if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? 60) * 1000).toISOString();
     else delete job.nextWakeAt;
@@ -309,6 +395,10 @@ export function checkpoint(store: JobStore, id: string, patch: {
 
 export function validateProgressReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
   const report = value as VerificationReport;
+  if (job.verifier && ["reserved", "running", "uncertain", "invalidated", "report-ready"].includes(job.verifier.state) &&
+      (job.verifier.state === "invalidated" || report?.reviewer?.runID !== job.verifier.id)) {
+    throw new Error("Reconcile the existing verifier before replacing its report or identity");
+  }
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
   validateVerificationMode(job.config, currentBody);
@@ -317,7 +407,7 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
     throw new Error("Verification needs the merged source and an independent reviewer run");
   }
   const checked = Date.parse(report.checkedAt);
-  if (!Number.isFinite(checked) || checked < Date.parse(job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
+  if (!Number.isFinite(checked) || checked < Date.parse(job.acceptanceChangedAt ?? job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
   if (!Array.isArray(report.criteria) || !report.criteria.length || report.criteria.length > job.acLabels.length ||
       new Set(report.criteria.map(item => item?.label)).size !== report.criteria.length ||
       report.criteria.some(item => !item || !job.acLabels.includes(item.label) || !["pass", "fail", "blocked"].includes(item.status) || !Array.isArray(item.evidence))) {
@@ -345,6 +435,12 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
         }
       }
     }
+    acceptanceCriteria(currentBody).forEach((criterion, index) => {
+      const item = report.criteria.find(item => item.label === job.acLabels[index]);
+      if (requiresDeployed(criterion) && item?.status === "pass" && !item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment))) {
+        throw new Error("Every deployed AC needs its own serving-bound journey evidence");
+      }
+    });
   }
   return report;
 }
@@ -378,11 +474,12 @@ export interface Session {
   needsRecovery?: boolean;
   workflow?: { owner: string; jobID: string; revision: number; state: string; wake?: { id: string; status: string } };
 }
-export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean }
+export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean; headSha?: string; mergeState?: string; checks?: "pending" | "pass" | "fail" }
 export class WorkflowRefusedError extends Error {
   readonly code = "workflow_refused";
   override name = "WorkflowRefusedError";
 }
+export class SourceProvenanceError extends Error {}
 export interface LifecycleAdapter {
   session(job: Job): Promise<Session | undefined>;
   project(job: Job): Promise<void>;
@@ -390,6 +487,9 @@ export interface LifecycleAdapter {
   pr(job: Job): Promise<PRSnapshot>;
   deployment(job: Job): Promise<Deployment | undefined>;
   containsMerge(job: Job, sourceSha: string): Promise<boolean>;
+  currentIssue?(job: Job): Promise<IssueDetails>;
+  verifierPlan?(job: Job): Promise<VerifierPlan>;
+  launchVerifier?(job: Job, run: VerifierRun, plan: VerifierPlan): Promise<void>;
   /** Hand the merged tracker issue to human review; a no-op for other backends. */
   markInReview(job: Job): Promise<void>;
   /** Close a verified Linear issue; false preserves a later human state change. */
@@ -467,6 +567,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       reportComplete(candidate, candidate.verification) &&
       (!candidate.nextWakeAt || Date.parse(candidate.nextWakeAt) <= now.getTime());
     if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you" || pendingCloseout) {
+      if (["paused", "needs-you"].includes(candidate.stage)) candidate = await refreshHeldFacts(store, adapter, candidate, now);
       candidate = await syncVerifiedIssue(store, adapter, candidate);
       if (candidate.projectedRevision !== candidate.revision) {
         try { await adapter.project(candidate); store.acknowledgeProjection(candidate); } catch { /* durable job remains authoritative */ }
@@ -509,7 +610,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         if (receipt?.id === job.wake.id && receipt.status === "delivered") {
           save(current => {
             if (current.wake?.counted === false) current.wakeups++;
-            delete current.wake; current.errors = 0;
+            delete current.wake; delete current.blocker; current.errors = 0;
           });
           results.push({ id: job.id, result: "wake-reconciled" }); continue;
         }
@@ -520,6 +621,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         reason = job.wake.reason;
       } else if (job.stage === "waiting-ci") {
         const pr = await adapter.pr(job);
+        save(current => { current.facts = { pr, observedAt: now.toISOString(), nextCheckAt: new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString() }; });
         if (pr.closed && !pr.merged) throw new Error("PR was closed without merging");
         if (pr.merged) {
           if (!sha(pr.mergeSha)) throw new Error("Merged PR has no exact merge SHA");
@@ -552,8 +654,13 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         }
         if (settled) save(current => { current.inReview = true; });
       }
+      if (job.stage === "verifying" && !job.wake && adapter.verifierPlan) {
+        const coordinated = await coordinateVerification(store, adapter, job, now);
+        job = store.get(job.id);
+        if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
+      }
       if (!actionable) {
-        save(current => { current.errors = 0; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
+        save(current => { current.errors = 0; delete current.blocker; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
         results.push({ id: job.id, result: "unchanged" }); continue;
       }
       if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
@@ -562,15 +669,21 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;
-        delete current.wake; current.errors = 0;
+        delete current.wake; delete current.blocker; current.errors = 0;
         current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
       });
       results.push({ id: job.id, result: "woken" });
     } catch (error) {
       try {
         save(current => {
-          current.detail = error instanceof Error ? error.message : "Heartbeat failed";
+          current.detail = sanitizedDetail(error instanceof Error ? error.message : "Heartbeat failed");
+          current.blocker = { reason: error instanceof SourceProvenanceError ? "source-provenance" : /uncertain/.test(current.detail) ? "uncertain-delivery" : "runner-error",
+            owner: error instanceof SourceProvenanceError ? "external" : /uncertain/.test(current.detail) ? "owner" : "system",
+            dependency: error instanceof SourceProvenanceError ? dependencyIdentity(current, "provenance") : undefined,
+            observedAt: now.toISOString(), recheckTrigger: error instanceof SourceProvenanceError ? "serving-provenance-repaired" : "tool-repaired-or-inspected-recovery",
+            nextAction: error instanceof SourceProvenanceError ? "Repair the runtime's actual serving source/version probe; health alone cannot establish acceptance" : "Inspect tool authentication, local logs and delivery receipts before retrying" };
           if (error instanceof WorkflowRefusedError) {
+            if (current.wake) current.wake.delivery = "not-delivered";
             current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
             return;
           }
@@ -584,7 +697,12 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           : { id: job.id, result: job.stage === "needs-you" ? "needs-you" : "retry" });
       } catch { results.push({ id: candidate.id, result: "checkpoint-changed" }); }
     } finally {
-      try { save(current => { delete current.claim; }); await adapter.project(job); store.acknowledgeProjection(job); } catch { /* next tick reconciles projection */ }
+      try {
+        const latest = store.get(job.id);
+        if (latest.claim?.token === token) save(current => { delete current.claim; });
+        else job = latest;
+        await adapter.project(job); store.acknowledgeProjection(job);
+      } catch { /* next tick reconciles projection */ }
     }
   }
   return results;

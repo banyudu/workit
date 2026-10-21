@@ -7,6 +7,7 @@ tracker handoff and verified issue closeout. They are opt-in:
 ```bash
 workit --managed 23
 workit --managed TASK-123
+workit --managed --acceptance local 23
 workit job list
 workit job status JOB_ID
 ```
@@ -66,6 +67,41 @@ an inherited default after reading the actual ACs.
 current-terminal launches remain unmanaged. Explicit `--managed` rejects
 incompatible options.
 
+## Acceptance planning and correction
+
+`--acceptance local|deployed` overrides the configured profile for one managed
+launch. Select local only after reviewing **all current ACs** and establishing
+local acceptance probes for each. Workit rejects local scope when an AC requires
+deployment or human acceptance. Scope is never inferred from changed filenames.
+Local reports still need a merged source, an independent reviewer and complete
+criterion evidence; they need no fabricated deployment or journey evidence.
+
+For an unfinished job launched with the wrong profile, inspect its current plan
+and live issue binding, then explicitly correct it:
+
+```bash
+workit job acceptance JOB_ID
+workit job acceptance JOB_ID --profile local --reason "All current CLI/type ACs have isolated local probes" --expected-revision 12 --expected-ac-hash CURRENT_AC_HASH
+```
+
+Inspection is read-only and returns the job revision, saved/current AC hashes,
+current labels and local eligibility. The correction requires a reason, the
+displayed revision and the hash of the **current** ACs. A stale revision or live
+hash fails without mutation. Reviewing an intentional AC change and supplying
+its new hash reconciles the saved binding; Workit never edits the issue ACs.
+Deployment and human requirements cannot be waived by choosing local. Use
+explicit AC tags and clear requirements; the verifier remains responsible for
+proving the meaning of each criterion.
+
+Corrections append an audit entry with old/new profile and AC hash, reason,
+revision and time. They invalidate cached deployment, report and dispatch
+bindings and require evidence observed after the correction. Active or uncertain
+verifier identities remain in the audit and retain their capacity slot until
+inspected reconciliation. Pending wakes also remain held for inspection.
+Existing pauses and human holds stay held; use `job resume` separately after
+resolving them. Correction is never permission to merge, deploy or close an issue.
+No SQLite edits or automatic migration of existing jobs are needed.
+
 ## Heartbeat
 
 Build/install the compiled CLI, then explicitly install its per-user LaunchAgent:
@@ -91,9 +127,8 @@ restarts. Use an always-on host for unattended operation.
 Ticks cheaply inspect due jobs, skip busy/parked/frozen/human-blocked sessions,
 and continue the same conversation only when actionable. Unchanged CI/deployment
 waits consume no agent turn. Readiness wakes an agent to assess repository
-policy; it does not authorize a merge/deployment. There is no global verification
-lease or stability sleep. Isolated journeys can remain concurrent with their
-relevant runtime/version evidence.
+policy; it does not authorize a merge/deployment. There is no global stability
+sleep. Optional verifier capacity is reserved in the same durable store.
 
 Use one scheduler per issue. Managed guidance suppresses the built-in Codex
 goal instruction and asks agents not to add native goals or schedules. Handle an
@@ -184,14 +219,6 @@ Stages: `implementing`, `preverifying`, `reviewing`, `waiting-ci`,
 checkpoints cannot bypass pause/human gates. Pause/cancel stop future automatic
 continuations; use Banyan's interrupt control to stop an active turn. They do not
 roll back completed effects.
-
-Banyan's **Pause and Close** uses `workit job pause JOB_ID --detail TEXT
---expected-revision N --expected-session-id SESSION_ID`. Both optional guards
-are checked inside the atomic job update; stale revisions or session bindings
-leave the job unchanged. The JSON acknowledgement identifies the paused job,
-session and newer revision. Configure Banyan's trusted invocation and owning
-state directory in `~/.banyan/workit.json`. A pause retains pending wake
-evidence; inspect and reconcile that delivery before explicitly resuming.
 
 Jobs live in private `~/.local/state/workit/lifecycle.sqlite`, independently of
 worktree GC. `WORKIT_STATE_DIR` selects an alternative. SQLite transactions and
@@ -373,6 +400,10 @@ The validator checks completeness and provenance bindings, not the semantic
 truth of observations. The independent verifier/repository tools still own
 observations, human acceptance and deferred-scope tracking.
 
+Each explicitly deployed AC needs its own serving-bound journey evidence, and
+human ACs need explicit `human` evidence. Changing checkbox check marks preserves
+the binding; changes to indented criterion requirements also invalidate it.
+
 Process exit, merge, healthy deployment and agent claims do not mark jobs
 verified. Verified/cancelled jobs stop scheduling after their final Banyan
 projection is delivered. Banyan shows an independent workflow badge and offers
@@ -395,3 +426,46 @@ WORKIT_TEST_BANYANCTL=/absolute/path/to/banyan/.build/debug/banyanctl bun run te
 That test uses a disposable authenticated local HTTP fixture, isolated token
 storage, and an absent fixture daemon socket. It does not control a user session
 or execute an agent/deployment.
+
+The closeout suites use disposable SQLite stores, a local Git repository,
+GitHub/Banyan command fixtures and a fake bounded review command. They cover
+explicit local launch/correction, scope rejection, held merge/conflict refresh,
+dependency grouping, competing processes, restart and uncertain-delivery
+recovery, dispatch budgets, local/deployed closeout and the exact owner-pause
+argv. They do not migrate live jobs, enable dispatch on the developer host or
+replace a running CLI. Banyan owns the companion UI and terminal close; its owner
+pause integration must observe the matching projected pause before closing.
+
+### Optional closeout coordination
+
+`workit job attention --format text` groups unfinished dependencies and shows the
+next action. `--format json` is available for clients. Paused jobs may refresh
+read-only PR facts; a newer merge never releases the saved hold.
+
+Independent verifier dispatch is opt-in in trusted configuration:
+
+```yaml
+lifecycle:
+  verifier:
+    enabled: true
+    agent: local-review  # a review-tagged entry in the trusted agent registry
+    concurrency: 1
+    maxAttempts: 2
+    timeoutSeconds: 300
+```
+
+Workit persists the verifier identity before launch, bounds simultaneous runs and
+attempts, and consumes its report through the normal source/AC/deployment gates.
+An unavailable fact reader retains the report for retry. A lost launch response
+requires inspected `job verifier-reconcile`; it never triggers blind replay.
+When dispatch is disabled, ordinary managed continuation remains available.
+These limits count dispatches and elapsed verifier time, not tokens or dollars.
+
+`workit job overview --format json [--limit 1..1000]` is the version 1 display
+contract for the Banyan Work sidebar. It includes all job states, regardless of
+conversation availability, with capped text, links, AC counts and next actions.
+`lastProgressAt` records meaningful checkpoint/source/evidence changes; heartbeat
+claims and unchanged polling do not update it. Older records omit that timestamp
+until their next meaningful change. `generatedAt` means the local snapshot read
+time, not a fresh tracker or deployment observation. Clients must show truncation
+and keep previous results visibly stale if refresh fails.

@@ -115,6 +115,7 @@ Options:
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
+  --acceptance local|deployed           Explicit per-job acceptance profile (managed only)
   --verification local|deployed         Override managed verification for these issues
   --review / --no-review               Include/skip design guidance
   --instructions <text>                Append guidance to the issue prompt (repeatable)
@@ -172,6 +173,10 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--managed":
         options.managed = true;
+        break;
+      case "--acceptance":
+        options.acceptance = next() as "local" | "deployed";
+        if (!["local", "deployed"].includes(options.acceptance)) throw new Error("--acceptance requires local or deployed");
         break;
       case "--unmanaged":
         options.managed = false;
@@ -764,7 +769,8 @@ async function main(): Promise<void> {
         (options.target ?? config.launch?.target ?? "banyan") !== "banyan")) {
       throw new Error("Managed jobs require a prompted agent in Banyan");
     }
-    if (options.verification && !managed) throw new Error("--verification requires a managed launch");
+    if (options.acceptance && options.verification && options.acceptance !== options.verification) throw new Error("--acceptance and --verification must agree");
+    if ((options.acceptance || options.verification) && !managed) throw new Error("--verification requires a managed launch");
 
     if (options.verbose && resolved.configFiles.length) {
       console.log(`Config: ${resolved.configFiles.join(", ")}`);
@@ -834,7 +840,7 @@ async function main(): Promise<void> {
       await new BanyanLifecycleAdapter().requireWorkflowSupport(root);
       jobStore = new JobStore();
       job = createJob({ issue, repoRoot: root, worktree: worktree.path,
-        githubRepo: githubRepository(remote), agent: selected.name,
+        githubRepo: githubRepository(remote), agent: selected.name, acceptance: options.acceptance,
         config: { ...config.lifecycle, ...(options.verification ? { verification: options.verification } : {}) } });
       job.controlCommand = [process.execPath, resolve(process.argv[1])];
       job.stateDirectory = dirname(jobStore.path);

@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, checkpoint, controlCommand, parseVerificationMode, setVerificationMode, stages, tick, verificationInstructions, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, parseVerificationMode, setVerificationMode, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
+import { overview } from "./overview.js";
 import { heartbeatCLI } from "./heartbeat.js";
 
 function options(args: string[]): Record<string, string> {
@@ -17,9 +19,12 @@ function options(args: string[]): Record<string, string> {
 function only(values: Record<string, string>, allowed: string[]): void {
   for (const key of Object.keys(values)) if (!allowed.includes(key)) throw new Error("Unknown option " + key);
 }
-async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<void> {
-  try { await adapter.project(job); store.acknowledgeProjection(job); }
-  catch { console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); }
+async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Job): Promise<"confirmed" | "pending"> {
+  try {
+    await adapter.project(job);
+    if (store.acknowledgeProjection(job)) { job.projectedRevision = job.revision; return "confirmed"; }
+  } catch { /* durable change retained */ }
+  console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); return "pending";
 }
 export async function lifecycleCLI(args: string[]): Promise<void> {
   if (args[0] === "heartbeat") { heartbeatCLI(args.slice(1)); return; }
@@ -27,6 +32,11 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
     console.log(`workit tick [--job ID]
 workit job list
 workit job status ID
+workit job overview [--format json] [--limit 1..1000]
+workit job attention [--format json|text]
+workit job acceptance ID
+workit job acceptance ID --profile local|deployed --reason TEXT --expected-revision N --expected-ac-hash HASH
+workit job verifier-reconcile ID --run-id ID --outcome delivered|not-delivered|completed --reason TEXT --expected-revision N
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS] [--verification local|deployed] [--tracker-completion human|automatic]
 workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
 workit job cancel ID --detail TEXT
@@ -64,12 +74,47 @@ Local acceptance skips deployment checks and still requires complete independent
   }
   const [action, id, ...rest] = args.slice(1);
   if (action === "list" && !id) { console.log(JSON.stringify(store.list(), null, 2)); return; }
+  if (action === "overview") {
+    const values = options(args.slice(2)); only(values, ["--format", "--limit"]);
+    if (values["--format"] && values["--format"] !== "json") throw new Error("overview supports --format json");
+    console.log(JSON.stringify(overview(store.list(), values["--limit"] === undefined ? undefined : Number(values["--limit"])))); return;
+  }
+  if (action === "attention") {
+    const values = options(args.slice(2)); only(values, ["--format"]);
+    if (values["--format"] && !["json", "text"].includes(values["--format"])) throw new Error("attention --format requires json or text");
+    const view = attention(store.list());
+    console.log(values["--format"] === "text" ? readableAttention(view) : JSON.stringify(view, null, 2)); return;
+  }
   if (!id) throw new Error("workit job requires an action and job ID; see workit job --help");
   const values = options(rest);
   let job: Job;
+  let projection: "confirmed" | "pending" | undefined;
   switch (action) {
     case "status":
       only(values, []); job = store.get(id); break;
+    case "acceptance": {
+      only(values, ["--profile", "--reason", "--expected-revision", "--expected-ac-hash"]);
+      if (!Object.keys(values).length) {
+        const current = store.get(id);
+        const issue = await adapter.currentIssue(current);
+        let localEligible = true;
+        try { assertLocalAcceptance(issue.body); } catch { localEligible = false; }
+        console.log(JSON.stringify({ jobID: id, revision: current.revision, profile: current.config.verification,
+          boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
+      }
+      if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("acceptance requires --expected-revision N");
+      const expected = store.get(id);
+      if (expected.revision !== Number(values["--expected-revision"])) throw new Error("Job revision mismatch; reread before correcting acceptance");
+      const issue = await adapter.currentIssue(expected);
+      job = correctAcceptance(store, id, { profile: values["--profile"] as "local" | "deployed", reason: values["--reason"],
+        expectedRevision: Number(values["--expected-revision"]), expectedAcHash: values["--expected-ac-hash"] }, issue);
+      await project(store, adapter, job); break;
+    }
+    case "verifier-reconcile":
+      only(values, ["--run-id", "--outcome", "--reason", "--expected-revision"]);
+      if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("verifier-reconcile requires --expected-revision N");
+      job = reconcileVerifier(store, id, { runID: values["--run-id"], outcome: values["--outcome"], reason: values["--reason"], expectedRevision: Number(values["--expected-revision"]) });
+      await project(store, adapter, job); break;
     case "checkpoint":
       only(values, ["--stage", "--detail", "--pr", "--merge-sha", "--after", "--verification", "--tracker-completion"]);
       if (!values["--stage"] || !values["--detail"]?.trim()) throw new Error("checkpoint requires --stage and --detail");
@@ -87,19 +132,20 @@ Local acceptance skips deployment checks and still requires complete independent
       job = checkpoint(store, id, { stage: action === "pause" ? "paused" : "cancelled", detail: values["--detail"],
         expectedRevision: values["--expected-revision"] === undefined ? undefined : Number(values["--expected-revision"]),
         expectedSessionID: values["--expected-session-id"] });
-      await project(store, adapter, job); break;
+      projection = await project(store, adapter, job); break;
     case "resume":
       only(values, ["--detail", "--verification"]);
       if (values["--verification"] !== undefined && !values["--detail"]?.trim()) throw new Error("--detail must explain the verification-mode correction");
       job = store.update(id, current => {
         if (!["paused", "needs-you"].includes(current.stage)) throw new Error("Only paused/human-blocked jobs can be resumed");
         if (current.wake) throw new Error("Pending wake requires inspected job reconcile before resume");
+        if (current.verifier && ["reserved", "uncertain", "invalidated"].includes(current.verifier.state)) throw new Error("Pending verifier requires inspected job verifier-reconcile before resume");
         if (values["--verification"] !== undefined) setVerificationMode(current, values["--verification"]);
         current.stage = current.deployment || (current.mergeSha && current.config.verification === "local") ? "verifying"
           : current.mergeSha ? "waiting-deploy" : current.pr ? "waiting-ci" : "implementing";
         current.detail = values["--detail"] ?? "Explicitly resumed";
         current.nextWakeAt = new Date().toISOString(); current.errors = 0; current.wakeups = 0;
-        delete current.claim;
+        delete current.claim; delete current.holdDetail; delete current.blocker;
       });
       await project(store, adapter, job); break;
     case "reconcile": {
@@ -161,7 +207,7 @@ Local acceptance skips deployment checks and still requires complete independent
     }
     default: throw new Error("Unknown job action; see workit job --help");
   }
-  console.log(JSON.stringify(job, null, 2));
+  console.log(JSON.stringify(projection ? { ...job, projection: { status: projection, sessionID: job.sessionID, revision: job.revision } } : job, null, 2));
 }
 
 export function managedInstructions(job: Job): string[] {
