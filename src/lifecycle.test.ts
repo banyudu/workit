@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, WorkflowRefusedError, acceptance, checkpoint, createJob, tick, validateReport, workflowState,
+import { JobStore, WorkflowRefusedError, acceptance, checkpoint, checklistChanges, createJob, issueFinished, provenChecklist, synchronizeChecklist, tick, validateProgressReport, validateReport, workflowState,
   type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerificationReport } from "./lifecycle.js";
 import { heartbeatPlist } from "./heartbeat.js";
+import { managedInstructions } from "./lifecycle-cli.js";
 
 const now = new Date("2026-01-02T00:00:00Z");
 const mergeSha = "a".repeat(40), deployedSha = "b".repeat(40);
@@ -29,6 +30,8 @@ class FakeAdapter implements LifecycleAdapter {
   current: Session; wakes: string[] = []; projections = 0; deploy?: Deployment;
   snapshot: PRSnapshot = { fingerprint: "pending", ready: false, merged: false };
   contains = true; failSession = false; loseResponse = false;
+  reviews = 0; failReview = false;
+  prompts: string[] = []; deploymentCalls = 0;
   constructor(job: Job) { this.current = { id: job.sessionID, status: "idle" }; }
   async session() { if (this.failSession) throw new Error("offline"); return this.current; }
   async project(job: Job) {
@@ -36,15 +39,28 @@ class FakeAdapter implements LifecycleAdapter {
     this.current.workflow = { owner: "workit", jobID: job.id, revision: job.revision,
       state: workflowState(job.stage), wake: this.current.workflow?.wake };
   }
-  async wake(_job: Job, wakeID: string) {
+  async wake(_job: Job, wakeID: string, text: string) {
+    this.prompts.push(text);
     if (this.current.workflow?.wake?.id !== wakeID) this.wakes.push(wakeID);
     this.current.workflow!.wake = { id: wakeID, status: "delivered" };
     if (this.loseResponse) throw new Error("lost response");
   }
   async pr() { return this.snapshot; }
-  async deployment() { return this.deploy; }
+  async deployment() { this.deploymentCalls++; return this.deploy; }
   async containsMerge() { return this.contains; }
+  async markInReview() { this.reviews++; if (this.failReview) throw new Error("tracker offline"); }
+  async markDone() { return true; }
 }
+
+test("lifecycle state larger than Node's default output buffer stays readable and writable", t => {
+  const { store, job } = fixture(t);
+  const detail = "x".repeat(1100 * 1024);
+  store.update(job.id, current => { current.detail = detail; }, now);
+  assert.equal(store.list()[0].detail, detail);
+  assert.equal(store.get(job.id).detail, detail);
+  store.update(job.id, current => { current.detail += "updated"; }, now);
+  assert.equal(store.get(job.id).detail, detail + "updated");
+});
 
 test("job identity is repository-scoped, checkpoints persist across restart, and checked boxes preserve AC binding", t => {
   const { directory, store, job } = fixture(t);
@@ -83,6 +99,70 @@ test("merged source waits for an actual containing deployment before verificatio
   assert.deepEqual(store.get(job.id).deployment, deployment);
 });
 
+test("local jobs verify merged source directly and launch/heartbeat guidance respects the issue's mode", async t => {
+  const { store, job, adapter, run } = fixture(t, { verification: "local" });
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Review pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { merged: true, mergeSha, ready: true, fingerprint: "merged" };
+  await run();
+  assert.equal(store.get(job.id).stage, "verifying");
+  assert.equal(store.get(job.id).mergeSha, mergeSha);
+  assert.equal(store.get(job.id).deployment, undefined);
+  assert.equal(adapter.deploymentCalls, 0);
+  assert.equal(adapter.wakes.length, 1);
+  for (const prompt of [managedInstructions(job).join("\n"), adapter.prompts[0]]) {
+    assert.match(prompt, /Verification mode for this issue: local/);
+    assert.match(prompt, /every AC against the merged source locally/);
+    assert.match(prompt, /complete independent AC evidence/);
+    assert.doesNotMatch(prompt, /await the scheduled deployment|actual serving source\/version/i);
+  }
+  assert.throws(() => checkpoint(store, job.id, { stage: "waiting-deploy", detail: "Unnecessary wait" }, now), /directly to verifying/);
+});
+
+test("verification corrections are issue-scoped, clear stale evidence, and preserve human holds", t => {
+  const { store, job } = fixture(t);
+  job.mergeSha = mergeSha;
+  job.deployment = deployment;
+  job.verification = report(job);
+  store.update(job.id, current => Object.assign(current, { deployment, verification: report(job) }), now);
+  const local = checkpoint(store, job.id, { stage: "preverifying", verification: "local", detail: "All ACs cover local tooling" }, now);
+  assert.equal(local.config.verification, "local");
+  assert.equal(local.deployment, undefined);
+  assert.equal(local.verification, undefined);
+  assert.equal(job.config.verification, "deployed");
+  const guidance = managedInstructions(job).join("\n");
+  assert.match(guidance, /repository setting is a default/);
+  assert.match(guidance, /--verification local/);
+  for (const stage of ["paused", "needs-you"] as const) {
+    checkpoint(store, job.id, { stage, detail: "Hold" }, now);
+    const held = checkpoint(store, job.id, { stage, verification: "deployed", detail: "ACs require serving acceptance" }, now);
+    assert.equal(held.stage, stage);
+    assert.equal(held.nextWakeAt, undefined);
+    assert.throws(() => checkpoint(store, job.id, { stage: "implementing", verification: "local", detail: "Bypass hold" }, now), /Use job resume/);
+    assert.equal(store.get(job.id).config.verification, "deployed");
+  }
+});
+
+test("local verification rejects deployment ACs, pending delivery corrections and terminal rewrites", t => {
+  const { store, job, directory } = fixture(t);
+  for (const tag of ["[deploy:serving-version]", "[deploy]"]) {
+    const deployedIssue = { ...issue, body: body + `\n- [ ] \`${tag}\` Verify the serving version.` };
+    assert.throws(() => createJob({ issue: deployedIssue, repoRoot: directory, worktree: directory,
+      githubRepo: "example/project", agent: "codex", config: { verification: "local" }, now }), /deployment Acceptance Criterion/);
+    store.update(job.id, current => { current.issue = deployedIssue; }, now);
+    const before = store.get(job.id);
+    assert.throws(() => checkpoint(store, job.id, { stage: "preverifying", verification: "local", detail: "Skip deployment" }, now), /deployment Acceptance Criterion/);
+    assert.deepEqual(store.get(job.id), before);
+  }
+  store.update(job.id, current => {
+    current.issue = issue;
+    current.wake = { id: "pending-wake", revision: current.revision, reason: "Inspect first" };
+  }, now);
+  assert.throws(() => checkpoint(store, job.id, { stage: "needs-you", verification: "local", detail: "Correct scope" }, now), /Pending wake/);
+  assert.equal(store.get(job.id).wake?.id, "pending-wake");
+  checkpoint(store, job.id, { stage: "cancelled", detail: "Cancelled" }, now);
+  assert.throws(() => checkpoint(store, job.id, { stage: "cancelled", verification: "local", detail: "Rewrite" }, now), /Finished jobs/);
+});
+
 test("wrong deployment ancestry never wakes a verifier", async t => {
   const { store, job, adapter, run } = fixture(t);
   checkpoint(store, job.id, { stage: "waiting-deploy", detail: "Waiting", pr: "https://github.com/example/project/pull/9", mergeSha }, now);
@@ -92,6 +172,55 @@ test("wrong deployment ancestry never wakes a verifier", async t => {
   assert.equal(adapter.wakes.length, 0);
   assert.equal(store.get(job.id).stage, "waiting-deploy");
   assert.match(store.get(job.id).detail, /does not contain/);
+});
+
+test("a merge hands the tracker issue to review once, without blocking delivery on a tracker outage", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  const warnings: string[] = []; const savedWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  t.after(() => { console.warn = savedWarn; });
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { merged: true, mergeSha, ready: true, fingerprint: "merged" };
+  adapter.failReview = true;
+  await run();
+  assert.equal(adapter.reviews, 1);
+  assert.equal(store.get(job.id).inReview, undefined);
+  assert.equal(adapter.wakes.length, 1);
+  assert.equal(store.get(job.id).stage, "waiting-deploy");
+  assert.match(warnings.join("\n"), /review handoff/);
+  adapter.failReview = false;
+  await run(new Date(now.getTime() + 120_000));
+  assert.equal(adapter.reviews, 2);
+  assert.equal(store.get(job.id).inReview, true);
+  await run(new Date(now.getTime() + 180_000));
+  assert.equal(adapter.reviews, 2);
+});
+
+test("a follow-up PR re-arms the tracker handoff", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { merged: true, mergeSha, ready: true, fingerprint: "merged" };
+  await run();
+  assert.equal(store.get(job.id).inReview, true);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Follow-up fix", pr: "https://github.com/example/project/pull/10" }, now);
+  assert.equal(store.get(job.id).inReview, undefined);
+  adapter.snapshot = { merged: true, mergeSha: "c".repeat(40), ready: true, fingerprint: "merged-again" };
+  await run(new Date(now.getTime() + 120_000));
+  assert.equal(adapter.reviews, 2);
+  assert.equal(store.get(job.id).inReview, true);
+});
+
+test("Linear completion requires the completed workflow after evidence-backed closeout", () => {
+  const linear = { ...issue, backend: "linear" as const, identifier: "ENG-1", url: "https://linear.app/2en/issue/ENG-1" };
+  assert.equal(issueFinished({ ...linear, state: "In Review", stateType: "started" }), false);
+  assert.equal(issueFinished({ ...linear, state: "Done", stateType: "completed" }), true);
+  assert.equal(issueFinished({ ...linear, state: "In Progress", stateType: "started" }), false);
+  assert.equal(issueFinished({ ...issue, state: "OPEN" }), false);
+  assert.equal(issueFinished({ ...issue, state: "CLOSED" }), true);
+  const guidance = managedInstructions(createJob({ issue: linear, repoRoot: "/tmp/repo", worktree: "/tmp/tree",
+    githubRepo: "example/project", agent: "codex", config: { verification: "local" }, now })).join("\n");
+  assert.match(guidance, /automatically synchronizes proven Linear AC checkboxes/);
+  assert.doesNotMatch(guidance, /Done stays a human-only transition/);
 });
 
 test("competing ticks claim the same job only once", async t => {
@@ -295,6 +424,7 @@ test("completion rejects stale ACs, failed/missing evidence, unmerged source, se
     (value: VerificationReport) => { value.criteria[0].status = "fail"; },
     (value: VerificationReport) => { value.criteria[0].evidence = []; },
     (value: VerificationReport) => { value.reviewer.independent = false; },
+    (value: VerificationReport) => { (value.reviewer as unknown as { independent: string }).independent = "false"; },
     (value: VerificationReport) => { value.mergeSha = "c".repeat(40); },
     (value: VerificationReport) => { value.deployment!.version = "old"; },
     (value: VerificationReport) => { value.criteria[0].evidence[0].deployment!.version = "old"; value.criteria[1].evidence = []; },
@@ -305,13 +435,70 @@ test("completion rejects stale ACs, failed/missing evidence, unmerged source, se
   assert.throws(() => validateReport(job, valid, body + "\n- [ ] New AC", now), /stale/);
 });
 
-test("local-only acceptance is explicit and still needs complete independent AC evidence", t => {
+test("local-only acceptance needs no probe and still needs complete independent AC evidence", t => {
+  const noProbe = createJob({ issue, repoRoot: "/tmp/local-repo", worktree: "/tmp/local-tree", githubRepo: "example/project",
+    agent: "codex", config: { verification: "local" }, now });
+  assert.equal(noProbe.config.deploymentProbe, undefined);
   const { job } = fixture(t, { verification: "local" }); job.mergeSha = mergeSha;
   const valid = report(job); delete valid.deployment;
   valid.criteria.forEach(item => item.evidence.forEach(entry => { entry.kind = "test"; delete entry.deployment; }));
   validateReport(job, valid, body, now);
   const deployed = { ...job, config: { ...job.config, verification: "deployed" as const } };
   assert.throws(() => validateReport(deployed, valid, body, now), /journey/);
+});
+
+test("independent partial reports sync only evidenced results without satisfying completion", t => {
+  const { job } = fixture(t, { verification: "local" }); job.mergeSha = mergeSha;
+  const partial = report(job); partial.criteria.pop();
+  validateProgressReport(job, partial, body, now);
+  assert.throws(() => validateReport(job, partial, body, now), /every AC/);
+  const after = synchronizeChecklist(body, checklistChanges(partial));
+  assert.equal(after, body.replace("[ ] `[test:behavior]`", "[x] `[test:behavior]`"));
+  partial.criteria[0].status = "fail";
+  validateProgressReport(job, partial, after, now);
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), body);
+  partial.criteria[0].evidence = [];
+  validateProgressReport(job, partial, after, now);
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), after, "unproven failure cannot clear a checkbox");
+  partial.criteria[0].status = "blocked";
+  assert.equal(synchronizeChecklist(after, checklistChanges(partial)), after);
+});
+
+test("stable-label synchronization preserves all other bytes, including CRLF, notes and other checklists", () => {
+  const original = "## Notes\r\n- [ ] Unrelated task\r\n" + body.replaceAll("\n", "\r\n") +
+    "\r\n  A human note.\r\n## Delivery\r\n- [ ] Another task\r\n";
+  const after = provenChecklist(original, ["contract"]);
+  assert.equal(after, original.replace("[ ] `[code:contract]`", "[x] `[code:contract]`"));
+  assert.deepEqual(acceptance(after), acceptance(original));
+  assert.equal(provenChecklist(after, ["contract"]), after);
+  assert.throws(() => provenChecklist(body + "\n- [ ] `[code:contract]` Duplicate", ["contract"]), /unique/);
+});
+
+test("indented multiline AC edits invalidate evidence and unlabeled checkboxes still synchronize", t => {
+  const multiline = "## Acceptance Criteria\n- [ ] A multiline requirement.\n\n  Includes this constraint.\n- [ ] `[code:contract]` Documentation.";
+  const { job } = fixture(t, { verification: "local" });
+  Object.assign(job, acceptance(multiline)); job.mergeSha = mergeSha;
+  const valid = report(job);
+  validateReport(job, valid, multiline, now);
+  assert.throws(() => validateReport(job, valid, multiline.replace("this constraint", "a new constraint"), now), /stale/);
+  const after = provenChecklist(multiline, job.acLabels);
+  assert.equal(after, multiline.replaceAll("[ ]", "[x]"));
+  assert.deepEqual(acceptance(after), acceptance(multiline));
+});
+
+test("human acceptance requires explicit attributed confirmation, including unlabeled human ACs", t => {
+  for (const tag of ["[human:behavior]", "[human]"]) {
+    const humanBody = body.replace("[test:behavior]", tag);
+    const { job } = fixture(t, { verification: "local" });
+    Object.assign(job, acceptance(humanBody)); job.mergeSha = mergeSha;
+    const valid = report(job);
+    assert.throws(() => validateReport(job, valid, humanBody, now), /human confirmation/);
+    valid.criteria[0].evidence = [{ kind: "human", reference: "artifact://owner-confirmation",
+      observed: "Owner explicitly accepted this criterion", confirmedBy: "Fixture Owner" }];
+    validateReport(job, valid, humanBody, now);
+    delete valid.criteria[0].evidence[0].confirmedBy;
+    assert.throws(() => validateReport(job, valid, humanBody.replaceAll("[ ]", "[x]"), now), /human confirmation/);
+  }
 });
 
 test("launchd uses pinned argv and XML escaping, and does not serialize credentials", () => {

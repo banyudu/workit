@@ -9,15 +9,18 @@ import { coordinateVerification, refreshHeldFacts } from "./closeout.js";
 export const stages = ["implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
 export type Stage = typeof stages[number];
+export type VerificationMode = "deployed" | "local";
 export interface Deployment {
   environment: string; target: string; sourceSha: string; version: string;
 }
 export interface LifecycleConfig {
+  /** Preserve an issue's explicit human-only closeout authorization. */
+  trackerCompletion?: "human" | "automatic";
   enabled?: boolean;
   intervalSeconds?: number;
   maxWakeups?: number;
   maxErrors?: number;
-  verification?: "deployed" | "local";
+  verification?: VerificationMode;
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
   /** Trusted grouping key. Attention views expose only its digest. */
@@ -36,6 +39,7 @@ export interface VerifierRun {
   delivery?: "delivered" | "not-delivered"; recovery?: { reason: string; at: string };
 }
 export interface VerifierPlan { enabled: boolean; agent?: string; command?: string; concurrency: number; maxAttempts: number; timeoutSeconds: number }
+export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
@@ -44,11 +48,19 @@ export interface Job {
   controlCommand?: string[]; stateDirectory?: string;
   createdAt: string; updatedAt: string; nextWakeAt?: string;
   pr?: string; mergeSha?: string; deployment?: Deployment;
+  /** Tracker handoff recorded once the merged PR was handed to human review. */
+  inReview?: boolean;
+  /** Readback confirmed the verified Linear issue reached Done. */
+  trackerDone?: boolean;
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
   // Older pending wakes already charged wakeups when they were reserved.
   wake?: { id: string; reason: string; revision: number; counted?: boolean; delivery?: "not-delivered" };
   verification?: VerificationReport;
+  closeout?: {
+    checklist?: { before: string; after: string; issueID: string; teamID: string; changes?: ChecklistChange[] };
+    checklistConfirmed?: boolean; stateID?: string; stateConfirmed?: boolean;
+  };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
   acceptanceChangedAt?: string;
   acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string }>;
@@ -62,7 +74,7 @@ export interface VerificationReport {
   reviewer: { runID: string; independent: boolean };
   deployment?: Deployment;
   criteria: Array<{ label: string; status: "pass" | "fail" | "blocked";
-    evidence: Array<{ kind: string; reference: string; observed: string; deployment?: Deployment }> }>;
+    evidence: Array<{ kind: string; reference: string; observed: string; deployment?: Deployment; confirmedBy?: string }> }>;
 }
 
 export const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -80,36 +92,97 @@ export function sanitizedDetail(value: string): string {
     .replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 600);
 }
 
-export function acceptanceCriteria(body: string): string[] {
-  const section = body.split(/^##\s+Acceptance Criteria\s*$/im)[1]?.split(/^##\s+/m)[0] ?? "";
-  const criteria: string[] = [];
-  let current: string[] | undefined;
-  let indentation = 0;
+function checklistCriteria(body: string) {
+  const heading = /^##[ \t]+Acceptance Criteria[ \t]*\r?$/im.exec(body);
+  const start = heading ? heading.index + heading[0].length : body.length;
+  const tail = body.slice(start);
+  const end = tail.search(/^##[ \t]+/m);
+  const section = end < 0 ? tail : tail.slice(0, end);
+  const criteria: Array<{ text: string; checked: boolean; offset: number }> = [];
+  let current: { lines: string[]; checked: boolean; offset: number; indentation: number } | undefined;
   const finish = () => {
-    if (current) criteria.push(current.join("\n").trim());
+    if (current) criteria.push({ text: current.lines.join("\n").trim(), checked: current.checked, offset: current.offset });
     current = undefined;
   };
-  for (const line of section.split(/\r?\n/)) {
-    const checkbox = line.match(/^([ \t]*)-\s+\[[ xX]\]\s+(.+)$/);
+  let offset = start;
+  for (const raw of section.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const checkbox = line.match(/^([ \t]*)-[ \t]+\[([ xX])\][ \t]+(.+)$/);
     if (checkbox) {
-      finish(); current = [checkbox[2]]; indentation = checkbox[1].length;
+      finish();
+      current = { lines: [checkbox[3]], checked: checkbox[2] !== " ", offset: offset + line.indexOf("[") + 1,
+        indentation: checkbox[1].length };
     } else if (current) {
-      // Markdown list items may contain multiple paragraphs. Keep all indented
-      // requirements in both the scope check and AC binding across blank lines.
-      if (!line.trim()) current.push("");
-      else if (line.match(/^[ \t]*/)![0].length > indentation) current.push(line);
+      if (!line.trim()) current.lines.push("");
+      else if (line.match(/^[ \t]*/)![0].length > current.indentation) current.lines.push(line);
       else finish();
     }
+    offset += raw.length + 1;
   }
   finish();
-  return criteria;
+  return criteria.map(item => ({ ...item,
+    label: item.text.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(item.text).slice(0, 12),
+    human: /\[human(?::[a-z0-9-]+)?\]/.test(item.text) }));
 }
+
+// Keep the text-only parser contract shared with acceptance planning (#10).
+export function acceptanceCriteria(body: string): string[] {
+  return checklistCriteria(body).map(item => item.text);
+}
+
 export function acceptance(body: string): { acHash: string; acLabels: string[] } {
-  const lines = acceptanceCriteria(body);
-  if (lines.length < 2) throw new Error("Managed issues need at least two Acceptance Criteria checkboxes");
-  const acLabels = lines.map(line => line.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(line).slice(0, 12));
+  const criteria = checklistCriteria(body);
+  if (criteria.length < 2) throw new Error("Managed issues need at least two Acceptance Criteria checkboxes");
+  const acLabels = criteria.map(item => item.label);
   if (new Set(acLabels).size !== acLabels.length) throw new Error("Acceptance Criteria labels must be unique");
-  return { acHash: digest(lines.join("\n")), acLabels };
+  return { acHash: digest(criteria.map(item => item.text).join("\n")), acLabels };
+}
+
+/** Replace only the checkbox byte of proven, stable-labelled ACs. */
+export function provenChecklist(body: string, labels: string[]): string {
+  return synchronizeChecklist(body, labels.map(label => ({ label, checked: true })));
+}
+
+export function synchronizeChecklist(body: string, changes: ChecklistChange[]): string {
+  acceptance(body); // Reject ambiguous labels before editing.
+  const proven = new Map(changes.map(item => [item.label, item.checked]));
+  for (const item of checklistCriteria(body).reverse()) {
+    if (proven.has(item.label) && proven.get(item.label) !== item.checked) {
+      body = body.slice(0, item.offset) + (proven.get(item.label) ? "x" : " ") + body.slice(item.offset + 1);
+    }
+  }
+  return body;
+}
+
+/** Call only after validating the independent report. Omitted/blocked/unproven results leave boxes alone. */
+export function checklistChanges(report: VerificationReport): ChecklistChange[] {
+  return report.criteria.filter(item => item.status !== "blocked" && item.evidence.length > 0)
+    .map(item => ({ label: item.label, checked: item.status === "pass" }));
+}
+
+export function parseVerificationMode(value: unknown): VerificationMode {
+  if (value !== "local" && value !== "deployed") throw new Error("Verification mode must be local or deployed");
+  return value;
+}
+
+function validateVerificationMode(config: LifecycleConfig, body: string): void {
+  const mode = parseVerificationMode(config.verification);
+  if (mode === "deployed" && !config.deploymentProbe?.length) {
+    throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
+  }
+  if (mode === "local" && acceptanceCriteria(body).some(line => /\[deploy(?::[a-z0-9-]+)?\]/.test(line))) {
+    throw new Error("Local verification cannot satisfy a deployment Acceptance Criterion");
+  }
+}
+
+/** Issue-scoped correction; repository defaults and human holds stay intact. */
+export function setVerificationMode(job: Job, value: unknown): void {
+  const config = { ...job.config, verification: parseVerificationMode(value) };
+  validateVerificationMode(config, job.issue.body);
+  if (config.verification === job.config.verification) return;
+  if (job.wake) throw new Error("Pending wake requires inspected job reconcile before changing verification mode");
+  job.config = config;
+  delete job.deployment; delete job.verification; delete job.closeout; delete job.trackerDone;
 }
 
 function localContractDescription(criterion: string): boolean {
@@ -155,15 +228,11 @@ export function createJob(input: {
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
-  if (!["deployed", "local"].includes(config.verification)) throw new Error("Invalid lifecycle.verification");
-  if (config.verification === "local") assertLocalAcceptance(input.issue.body);
   if (config.deploymentProbe && (!Array.isArray(config.deploymentProbe) || !config.deploymentProbe.length ||
       config.deploymentProbe.some(arg => typeof arg !== "string" || !arg || arg.includes("\0")))) {
     throw new Error("lifecycle.deploymentProbe must be non-empty argv");
   }
-  if (config.verification === "deployed" && !config.deploymentProbe) {
-    throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
-  }
+  validateVerificationMode(config, input.issue.body);
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
     sessionID: "workit-" + id, agent: input.agent, stage: "implementing", detail: "",
@@ -224,7 +293,7 @@ export class JobStore {
       JobStore.python ??= execFileSync("python3", ["-c", "import sys; print(sys.executable)"],
         { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] }).trim();
       output = execFileSync(JobStore.python, ["-c", SQLITE, this.path, operation],
-      { input: JSON.stringify(input), encoding: "utf8", timeout: 15_000, stdio: ["pipe", "pipe", "pipe"] }); }
+      { input: JSON.stringify(input), encoding: "utf8", timeout: 15_000, maxBuffer: 64 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] }); }
     catch { throw new Error("Workit lifecycle storage failed; python3 with sqlite3 and a writable state directory are required"); }
     chmodSync(this.path, 0o600);
     return JSON.parse(output) as T;
@@ -272,9 +341,13 @@ export function processIsAlive(identity: string): boolean {
 
 export function checkpoint(store: JobStore, id: string, patch: {
   stage: Stage; detail: string; after?: number; pr?: string; mergeSha?: string;
+  verification?: VerificationMode;
+  trackerCompletion?: "human" | "automatic";
   expectedRevision?: number; expectedSessionID?: string;
 }, now = new Date()): Job {
   if (!stages.includes(patch.stage)) throw new Error("Unknown lifecycle stage");
+  if (patch.trackerCompletion !== undefined && !["human", "automatic"].includes(patch.trackerCompletion))
+    throw new Error("Tracker completion must be human or automatic");
   if (patch.stage === "verified") throw new Error("Use job verify with a verification report");
   if (patch.after !== undefined && (!Number.isSafeInteger(patch.after) || patch.after < 1)) throw new Error("--after must be positive seconds");
   if (patch.mergeSha !== undefined && !sha(patch.mergeSha)) throw new Error("--merge-sha must be a full commit SHA");
@@ -287,20 +360,23 @@ export function checkpoint(store: JobStore, id: string, patch: {
     if (["paused", "needs-you"].includes(job.stage) && !["paused", "needs-you", "cancelled"].includes(patch.stage)) {
       throw new Error("Use job resume to release a pause or human gate");
     }
+    if (patch.verification !== undefined) setVerificationMode(job, patch.verification);
+    if (patch.trackerCompletion !== undefined) job.config = { ...job.config, trackerCompletion: patch.trackerCompletion };
     if (patch.pr !== undefined) {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
       if (job.pr && patch.pr !== job.pr) {
-        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.facts;
+        delete job.mergeSha; delete job.deployment; delete job.verification; delete job.facts; delete job.closeout; delete job.inReview; delete job.trackerDone;
       }
       job.pr = patch.pr;
     }
     if (patch.mergeSha !== undefined) {
-      if (patch.mergeSha !== job.mergeSha) { delete job.deployment; delete job.verification; }
+      if (patch.mergeSha !== job.mergeSha) { delete job.deployment; delete job.verification; delete job.closeout; }
       job.mergeSha = patch.mergeSha;
     }
     if (patch.stage === "waiting-ci" && !job.pr) throw new Error("waiting-ci requires a PR");
     if (["waiting-deploy", "verifying"].includes(patch.stage) && (!job.pr || !job.mergeSha)) throw new Error("Post-merge stages require PR and merge SHA");
+    if (patch.stage === "waiting-deploy" && job.config.verification === "local") throw new Error("Local verification proceeds directly to verifying after merge");
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
     job.stage = patch.stage; job.detail = patch.detail; job.errors = 0;
@@ -314,47 +390,75 @@ export function checkpoint(store: JobStore, id: string, patch: {
   }, now);
 }
 
-export function validateReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
+export function validateProgressReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
   const report = value as VerificationReport;
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
+  validateVerificationMode(job.config, currentBody);
   if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
       [job.id, job.sessionID].includes(report.reviewer.runID)) {
     throw new Error("Verification needs the merged source and an independent reviewer run");
   }
   const checked = Date.parse(report.checkedAt);
   if (!Number.isFinite(checked) || checked < Date.parse(job.acceptanceChangedAt ?? job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
-  if (!Array.isArray(report.criteria) || report.criteria.length !== job.acLabels.length ||
-      new Set(report.criteria.map(item => item.label)).size !== job.acLabels.length) throw new Error("Verification must cover every AC exactly once");
-  for (const label of job.acLabels) {
-    const item = report.criteria.find(item => item.label === label);
-    if (!item || item.status !== "pass" || !Array.isArray(item.evidence) || !item.evidence.length ||
+  if (!Array.isArray(report.criteria) || !report.criteria.length || report.criteria.length > job.acLabels.length ||
+      new Set(report.criteria.map(item => item?.label)).size !== report.criteria.length ||
+      report.criteria.some(item => !item || !job.acLabels.includes(item.label) || !["pass", "fail", "blocked"].includes(item.status) || !Array.isArray(item.evidence))) {
+    throw new Error("Verification entries must have unique current AC labels, a valid status and an evidence array");
+  }
+  for (const item of report.criteria) {
+    const label = item.label;
+    if (item.status === "blocked" || (item.status === "fail" && !item.evidence.length)) continue;
+    if (!item.evidence.length ||
         item.evidence.some(entry => !entry.kind?.trim() || !entry.reference?.trim() || !entry.observed?.trim())) {
-      throw new Error(`AC '${label}' lacks passing evidence`);
+      throw new Error(`AC '${label}' lacks evidence for its reported result`);
+    }
+    if (checklistCriteria(currentBody).find(criterion => criterion.label === label)?.human &&
+        !item.evidence.some(entry => entry.kind === "human" && typeof entry.confirmedBy === "string" && entry.confirmedBy.trim())) {
+      throw new Error(`AC '${label}' needs real human confirmation (human evidence with confirmedBy and a confirmation reference)`);
     }
   }
-  if (job.config.verification === "local") assertLocalAcceptance(currentBody);
   if (job.config.verification !== "local") {
-    const matches = (value?: Deployment) => value && job.deployment &&
-      ["environment", "target", "sourceSha", "version"].every(key => value[key as keyof Deployment] === job.deployment![key as keyof Deployment]);
-    if (!matches(report.deployment) || !report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matches(entry.deployment)))) {
-      throw new Error("Verification needs journey evidence for the observed deployment");
+    if (report.deployment && !matchesDeployment(job, report.deployment)) throw new Error("Verification deployment binding is stale");
+    for (const item of report.criteria.filter(item => item.status !== "blocked")) {
+      for (const entry of item.evidence) {
+        if ((entry.deployment && !matchesDeployment(job, entry.deployment)) ||
+            (entry.kind === "journey" && (!matchesDeployment(job, report.deployment) || !matchesDeployment(job, entry.deployment)))) {
+          throw new Error("Verification needs journey evidence for the observed deployment");
+        }
+      }
     }
     acceptanceCriteria(currentBody).forEach((criterion, index) => {
-      if (requiresDeployed(criterion) && !report.criteria.find(item => item.label === job.acLabels[index])?.evidence.some(entry => entry.kind === "journey" && matches(entry.deployment))) {
+      const item = report.criteria.find(item => item.label === job.acLabels[index]);
+      if (requiresDeployed(criterion) && item?.status === "pass" && !item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment))) {
         throw new Error("Every deployed AC needs its own serving-bound journey evidence");
       }
     });
   }
-  acceptanceCriteria(currentBody).forEach((criterion, index) => {
-    if (requiresHuman(criterion) && !report.criteria.find(item => item.label === job.acLabels[index])?.evidence.some(entry => entry.kind === "human")) throw new Error("Human AC requires explicit human acceptance evidence");
-  });
+  return report;
+}
+
+function matchesDeployment(job: Job, value?: Deployment): boolean {
+  return !!value && !!job.deployment &&
+    (["environment", "target", "sourceSha", "version"] as const).every(key => value[key] === job.deployment![key]);
+}
+
+/** Completeness is a report property; existing checked boxes cannot supply missing evidence. */
+export function reportComplete(job: Job, report: VerificationReport): boolean {
+  return report.criteria.length === job.acLabels.length && report.criteria.every(item => item.status === "pass") &&
+    (job.config.verification === "local" || (matchesDeployment(job, report.deployment) &&
+      report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment)))));
+}
+
+export function validateReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
+  const report = validateProgressReport(job, value, currentBody, now);
+  if (!reportComplete(job, report)) throw new Error("Completion needs passing evidence for every AC and applicable deployed journey evidence");
   return report;
 }
 
 export function issueFinished(issue: IssueDetails): boolean {
   return issue.backend === "github" ? issue.state === "CLOSED"
-    : issue.stateType === "completed" || ["done", "completed"].includes(issue.state?.toLowerCase() ?? "");
+    : issue.stateType === "completed";
 }
 
 export interface Session {
@@ -379,6 +483,26 @@ export interface LifecycleAdapter {
   currentIssue?(job: Job): Promise<IssueDetails>;
   verifierPlan?(job: Job): Promise<VerifierPlan>;
   launchVerifier?(job: Job, run: VerifierRun, plan: VerifierPlan): Promise<void>;
+  /** Hand the merged tracker issue to human review; a no-op for other backends. */
+  markInReview(job: Job): Promise<void>;
+  /** Close a verified Linear issue; false preserves a later human state change. */
+  markDone(job: Job): Promise<boolean>;
+}
+
+/** Persisted acceptance survives tracker outages; the heartbeat retries sync. */
+export async function syncVerifiedIssue(store: JobStore, adapter: LifecycleAdapter, job: Job): Promise<Job> {
+  if (job.config.trackerCompletion === "human") return job;
+  if (!["verified", "verifying"].includes(job.stage) || job.issue.backend !== "linear" ||
+      !job.verification || !reportComplete(job, job.verification) || job.closeout?.stateConfirmed || job.trackerDone) return job;
+  const target = adapter as LifecycleAdapter & Partial<import("./lifecycle-closeout.js").CloseoutAdapter>;
+  if (!target.currentIssue || !target.updateIssue) return job;
+  try {
+    const { closeoutJob } = await import("./lifecycle-closeout.js");
+    return await closeoutJob(store, target as import("./lifecycle-closeout.js").CloseoutAdapter, job.id, { reconcile: true });
+  } catch (error) {
+    console.warn(`workit: tracker closeout for ${job.id} is pending and will be retried: ${error instanceof Error ? error.message : String(error)}`);
+    return store.get(job.id);
+  }
 }
 
 function available(session: Session): boolean {
@@ -393,6 +517,18 @@ export function controlCommand(job: Job): string {
   const prefix = job.stateDirectory ? "env WORKIT_STATE_DIR=" + quote(job.stateDirectory) + " " : "";
   return prefix + (job.controlCommand ?? ["workit"]).map(quote).join(" ");
 }
+
+export function verificationInstructions(job: Job): string[] {
+  return [
+    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. Choose acceptance scope from the current ACs; the repository setting is a default.`,
+    `When every AC can be reliably proven locally (for example a local CLI, tooling or documentation change), select local with this CLI's job checkpoint ${job.id} --stage STAGE --verification local --detail TEXT and explain the local acceptance coverage. Keep deployed for ACs that require a serving environment; never downgrade a deployment AC to local. A local-only issue does not need deployment authorization or a deployment wait to complete.`,
+    job.config.verification === "local"
+      ? "After an authorized merge, proceed directly to verifying and obtain independent evidence for every AC against the merged source locally. Local verification requires no deployment probe, serving version or deployed journey evidence."
+      : "In deployed mode, await the scheduled deployment after an authorized merge, then independently verify applicable journeys against the actual serving source/version. If the serving version changes, checkpoint waiting-deploy and rerun the affected acceptance probes.",
+    "Use workit job --help for the report contract. Both verification modes require a merged PR and complete independent AC evidence accepted by job verify --report.",
+  ];
+}
+
 function prompt(job: Job, reason: string): string {
   return [
     `Continue managed workit job ${job.id} for ${job.issue.url}. Reason: ${reason}.`,
@@ -400,13 +536,12 @@ function prompt(job: Job, reason: string): string {
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
     "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
-    `Acceptance profile: ${job.config.verification}. Apply its current AC scope; local acceptance does not require deployed journeys.`,
-    "Own implementation, preverification, review repair, merge when authorized, deployed acceptance and any follow-up fix. Do not stop at merge.",
+    "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
+    ...verificationInstructions(job),
     "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
     `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
-    job.config.verification === "local"
-      ? "Verification requires independent complete local AC evidence and merged source. Use workit job verify --report; process exit is not completion."
-      : "Verification requires independent AC evidence, the actual serving version, and applicable journeys. Use workit job verify --report; process exit is not completion.",
+    "Submit independent partial AC results with workit job verify --report to synchronize proven Linear checkbox states while leaving the issue state unchanged.",
+    "Completion still requires complete passing independent AC evidence, the actual serving version where applicable, and applicable journeys; process exit is not completion.",
   ].filter(Boolean).join("\n");
 }
 
@@ -418,13 +553,17 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
   const owner = options.process ?? processIdentity();
   const alive = options.alive ?? processIsAlive;
   const results: Array<{ id: string; result: string; detail?: string }> = [];
-  for (const candidate of store.list()) {
+  for (let candidate of store.list()) {
     if (options.jobID && candidate.id !== options.jobID) continue;
     // Project pause/cancel/completion too; it must survive an app outage.
-    if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you") {
-      const held = terminalStage(candidate.stage) ? candidate : await refreshHeldFacts(store, adapter, candidate, now);
-      if (held.projectedRevision !== held.revision) {
-        try { await adapter.project(held); store.acknowledgeProjection(held); } catch { /* durable job remains authoritative */ }
+    const pendingCloseout = candidate.stage === "verifying" && candidate.closeout && candidate.verification &&
+      reportComplete(candidate, candidate.verification) &&
+      (!candidate.nextWakeAt || Date.parse(candidate.nextWakeAt) <= now.getTime());
+    if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you" || pendingCloseout) {
+      if (["paused", "needs-you"].includes(candidate.stage)) candidate = await refreshHeldFacts(store, adapter, candidate, now);
+      candidate = await syncVerifiedIssue(store, adapter, candidate);
+      if (candidate.projectedRevision !== candidate.revision) {
+        try { await adapter.project(candidate); store.acknowledgeProjection(candidate); } catch { /* durable job remains authoritative */ }
       }
       continue;
     }
@@ -497,8 +636,19 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           reason = "deployment containing the merged change is ready; run applicable journeys";
         }
       }
+      // The tracker handoff belongs to workit rather than to an agent turn: hand a
+      // merged issue to human review as soon as the merge is known, and retry a
+      // failed handoff on a later tick instead of blocking delivery on the tracker.
+      if (job.mergeSha && !job.inReview) {
+        let settled = false;
+        try { await adapter.markInReview(job); settled = true; }
+        catch (error) {
+          console.warn(`workit: review handoff for ${job.id} will be retried: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (settled) save(current => { current.inReview = true; });
+      }
       if (job.stage === "verifying" && !job.wake && adapter.verifierPlan) {
-        const coordinated = await coordinateVerification(store, adapter, job, now, candidate.stage !== "verifying");
+        const coordinated = await coordinateVerification(store, adapter, job, now);
         job = store.get(job.id);
         if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
       }

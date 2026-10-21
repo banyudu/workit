@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, requiresHuman, runnableStage, sha, terminalStage, validateReport,
+import { acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
   type Blocker, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
@@ -22,7 +22,7 @@ export function correctAcceptance(store: JobStore, id: string, input: {
       oldAcHash: current.acHash, acHash: binding.acHash });
     current.config.verification = input.profile;
     current.issue = issue; Object.assign(current, binding); current.acceptanceChangedAt = now.toISOString();
-    delete current.deployment; delete current.verification; delete current.fingerprint; delete current.blocker;
+    delete current.deployment; delete current.verification; delete current.closeout; delete current.trackerDone; delete current.fingerprint; delete current.blocker;
     // Retain active/uncertain delivery audit and capacity until explicitly inspected.
     if (current.verifier) {
       if (["reserved", "running", "uncertain", "invalidated"].includes(current.verifier.state)) current.verifier.state = "invalidated";
@@ -58,7 +58,7 @@ export async function refreshHeldFacts(store: JobStore, adapter: LifecycleAdapte
       if (current.revision !== expected.revision) throw new Error("Job changed during fact refresh");
       current.facts = facts;
       if (facts.pr?.merged) {
-        if (current.mergeSha !== facts.pr.mergeSha) { delete current.deployment; delete current.verification; }
+        if (current.mergeSha !== facts.pr.mergeSha) { delete current.deployment; delete current.verification; delete current.closeout; delete current.trackerDone; }
         current.mergeSha = facts.pr.mergeSha;
         current.holdDetail ??= current.detail;
         current.detail = "Hold retained; GitHub confirms the PR is merged. Explicit resume is required";
@@ -120,21 +120,26 @@ export function readableAttention(view: ReturnType<typeof attention>): string {
   return [...facts, ...items].join("\n") || "No unfinished closeout dependencies.";
 }
 
+class VerificationReadError extends Error {}
+async function observe<T>(read: () => Promise<T>): Promise<T> {
+  try { return await read(); } catch { throw new VerificationReadError("Current verification facts unavailable"); }
+}
+
 export async function checkVerification(adapter: LifecycleAdapter, expected: Job, value: unknown, now = new Date()): Promise<{ report: VerificationReport; finished: boolean }> {
   if (expected.stage !== "verifying") throw new Error("Job must be in verifying before completion");
   if (expected.verifier && ["reserved", "running", "uncertain", "invalidated", "report-ready"].includes(expected.verifier.state) &&
       (expected.verifier.state === "invalidated" || (value as VerificationReport)?.reviewer?.runID !== expected.verifier.id)) throw new Error("Reconcile the existing verifier before replacing its report or identity");
   if (!adapter.currentIssue) throw new Error("Current issue reader unavailable");
-  const pr = await adapter.pr(expected);
+  const pr = await observe(() => adapter.pr(expected));
   if (!pr.merged || pr.mergeSha !== expected.mergeSha) throw new Error("GitHub does not establish the expected merged source");
   if (expected.config.verification !== "local") {
-    const deployment = await adapter.deployment(expected);
+    const deployment = await observe(() => adapter.deployment(expected));
     if (!deployment || JSON.stringify(deployment) !== JSON.stringify(expected.deployment) ||
-        !await adapter.containsMerge(expected, deployment.sourceSha)) throw new Error("Serving deployment changed; rerun applicable verification");
+        !await observe(() => adapter.containsMerge(expected, deployment.sourceSha))) throw new Error("Serving deployment changed; rerun applicable verification");
   }
-  const issue = await adapter.currentIssue(expected);
+  const issue = await observe(() => adapter.currentIssue!(expected));
   if (issue.url !== expected.issue.url) throw new Error("Current issue identity changed");
-  return { report: validateReport(expected, value, issue.body, now), finished: issueFinished(issue) };
+  return { report: validateReport(expected, value, issue.body, now), finished: issueFinished(issue) && (issue.backend !== "linear" || provenChecklist(issue.body, expected.acLabels) === issue.body) };
 }
 export function completeVerification(store: JobStore, expected: Job, report: VerificationReport, now = new Date()): Job {
   return store.update(expected.id, current => {
@@ -154,7 +159,7 @@ function readArtifact(path: string): unknown {
 }
 
 /** Called only under the ordinary per-job heartbeat claim. No implementer replay. */
-export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date, transitionContinuation = false): Promise<string | undefined> {
+export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date): Promise<string | undefined> {
   let job = expected;
   const save = (change: (current: Job) => void) => {
     job = store.update(job.id, current => {
@@ -201,9 +206,12 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
         if (value?.reviewer?.runID !== run.id) throw new Error("Verifier identity mismatch");
         const checked = await checkVerification(adapter, job, value, now);
         if (checked.finished) { job = completeVerification(store, job, checked.report, now); return "verified"; }
-        save(current => { current.verifier!.state = "report-ready"; current.verification = checked.report; });
+        save(current => { current.verifier!.state = "report-ready"; current.verification = checked.report; if (current.issue.backend === "linear") current.closeout ??= {}; });
         return wait("tracker-closeout", "owner", "Independent evidence passed; reconcile the issue checklist and completed state under repository policy", "tracker-state-change", "awaiting-tracker-closeout");
-      } catch {
+      } catch (error) {
+        if (error instanceof VerificationReadError) {
+          return wait("runner-error", "system", "Current issue, PR or deployment facts are unavailable; retain this verifier report and retry the read", "fact-reader-recovered", "verifier-facts-unavailable");
+        }
         // Never treat stale AC/source/serving evidence as success or disclose tool output.
         save(current => { current.verifier!.state = "failed"; delete current.verification; });
         return wait("runner-error", "verifier", "Report rejected by current AC, source, version or identity checks; inspect and rerun applicable verification", "fresh-valid-report", "verifier-report-rejected");
@@ -214,9 +222,9 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   }
   const plan = await adapter.verifierPlan!(job);
   if (!plan.enabled) {
-    const result = wait("missing-verifier", "verifier", "Dispatch is disabled; submit an independent report with job verify or explicitly opt in in trusted configuration", "independent-report-or-config-change", "verifier-disabled");
+    wait("missing-verifier", "verifier", "Dispatch is disabled; submit an independent report with job verify or explicitly opt in in trusted configuration", "independent-report-or-config-change", "verifier-disabled");
     // Preserve the existing post-merge/deployment handoff when dispatch is off.
-    return transitionContinuation ? undefined : result;
+    return undefined;
   }
   if (!plan.command || !plan.agent || !adapter.launchVerifier) return wait("missing-verifier", "system", "Configure an available review-tagged agent in the trusted registry, or submit an independent report manually", "registry-repaired", "verifier-unavailable");
   if ((job.verifierAttempts ?? 0) >= plan.maxAttempts) return wait("runner-error", "owner", "Verifier retry budget exhausted; inspect prior attempts and supply independent evidence manually", "owner-recovery", "verifier-budget-exhausted");

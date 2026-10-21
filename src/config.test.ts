@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_LAUNCH_INSTRUCTIONS, deepMerge, resolveConfig } from "./config.js";
@@ -112,6 +112,25 @@ test("a loaded registry supersedes workit's built-in default agents", () => {
   const resolved = resolveConfig(root, { homeDirectory: home });
   assert.deepEqual(Object.keys(resolved.config.agents ?? {}), ["codex"]);
   assert.equal(resolved.config.agents?.codex?.weight, 7);
+});
+
+test("parent fallback defaults on and can be disabled by project configuration", t => {
+  const root = mkdtempSync(join(tmpdir(), "workit-parent-config-"));
+  const home = join(root, "home");
+  mkdirSync(home);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  assert.equal(resolveConfig(root, { homeDirectory: home }).config.launch?.parentFallback, true);
+  writeFileSync(join(root, ".workit.yml"), "launch:\n  parentFallback: false\n");
+  assert.equal(resolveConfig(root, { homeDirectory: home }).config.launch?.parentFallback, false);
+});
+
+test("parent fallback configuration rejects non-boolean values", t => {
+  const root = mkdtempSync(join(tmpdir(), "workit-parent-config-"));
+  const home = join(root, "home");
+  mkdirSync(home);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, ".workit.yml"), "launch:\n  parentFallback: 'false'\n");
+  assert.throws(() => resolveConfig(root, { homeDirectory: home }), /launch.parentFallback must be a boolean/);
 });
 
 test("launch instructions default to the delivery + review block", () => {

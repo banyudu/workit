@@ -105,6 +105,7 @@ export interface CodingAgentsConfig {
 
 export interface WorkitConfig {
   lifecycle?: import("./lifecycle.js").LifecycleConfig;
+  gc?: import("./gc/engine.js").GCConfig;
   provider?: ProviderMode;
   repo?: string;
   default?: string;
@@ -139,6 +140,8 @@ export interface WorkitConfig {
   };
   launch?: {
     target?: LaunchTarget;
+    /** Retry a confirmed missing-parent rejection as a top-level Banyan session. */
+    parentFallback?: boolean;
     review?: boolean;
     /**
      * Guidance appended to every issue prompt. Replaces the built-in
@@ -166,6 +169,7 @@ export interface ResolvedConfig {
 export interface CliOptions {
   managed?: boolean;
   acceptance?: "local" | "deployed";
+  verification?: import("./lifecycle.js").VerificationMode;
   sessionID?: string;
   provider?: ProviderMode;
   repo?: string;
@@ -183,6 +187,8 @@ export interface CliOptions {
   /** Registry tag used to scope the weighted selection pool (e.g. "coding", "daily"). */
   tag?: string;
   target?: LaunchTarget;
+  /** Override launch.parentFallback for this invocation. */
+  parentFallback?: boolean;
   prompt: boolean;
   agentLaunch: boolean;
   review: boolean;

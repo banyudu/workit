@@ -118,6 +118,19 @@ function buildAliasIndex(config: WorkitConfig): Record<string, string> {
 }
 
 /**
+ * Tracker handoff for a Linear issue. Managed launches drop it: the heartbeat
+ * performs the handoff itself once it observes the merge.
+ */
+export const LINEAR_HANDOFF_INSTRUCTION =
+  "Tracker handoff (Linear): after the pull request is merged, attach the PR to the issue and set the issue state to In Review. After every acceptance criterion is independently verified and the evidence/checklist is reconciled, move it to Done. Preserve explicit human holds.";
+
+/** Default guidance the managed lifecycle owns instead of the launched agent. */
+export const MANAGED_OWNED_INSTRUCTION_PREFIXES: string[] = [
+  "Persistent goal (Codex only):",
+  "Tracker handoff (Linear):",
+];
+
+/**
  * Guidance appended to every issue prompt unless the repository overrides
  * `launch.instructions`. Delivery includes repeated review repairs until the
  * current PR head receives Superdog 5/5. Codex is explicitly asked to create a
@@ -131,6 +144,7 @@ export const DEFAULT_LAUNCH_INSTRUCTIONS: string[] = [
   "Review loop: for both new and existing PRs, wait for Superdog to review the current head commit. Fetch unresolved review comments, including automated/bot and CI feedback, address actionable feedback, run relevant checks, commit and push fixes, and request another review when needed. Repeat this wait/fix/test/push cycle until Superdog scores the current head 5/5, actionable review feedback is addressed, and required checks pass.",
   "Verify the Superdog score against the reviewed commit SHA using review/check metadata. An older commit's score, missing review, or pending review is not success. Mark the work and any native goal complete only after verifying the current head meets all completion criteria.",
   "Wait for pending reviews. If Superdog is not configured, the review service is unavailable, or another external blocker prevents verification or repair, report the blocker and evidence instead of claiming 5/5 or completion.",
+  LINEAR_HANDOFF_INSTRUCTION,
   "Stay within the scope of the issue and the review feedback; do not expand into unrelated refactors.",
 ];
 
@@ -225,12 +239,35 @@ function userConfigCandidates(explicit?: string, home = homedir()): string[] {
 }
 
 function validateConfig(config: WorkitConfig): void {
+  if (config.gc) {
+    const gc = config.gc;
+    for (const key of ["enabled", "archiveUnclassified", "archiveExternalWorktrees", "archiveDirtyReviews", "recycleUnclassified", "recycleExternalWorktrees", "cleanupRemnants", "preserveLocalState"] as const) if (gc[key] !== undefined && typeof gc[key] !== "boolean") throw new Error(`gc.${key} must be a boolean`);
+    for (const key of ["repositories", "excludedRepositories"] as const) if (gc[key] !== undefined && (!Array.isArray(gc[key]) || !gc[key]!.every(p => typeof p === "string" && p.length > 0))) throw new Error(`gc.${key} must be a path list`);
+    if (gc.disposablePaths !== undefined && (!Array.isArray(gc.disposablePaths) || !gc.disposablePaths.every(p => typeof p === "string" && p.length > 0 && !p.startsWith("/") && !p.split("/").some(s => !s || s === "." || s === ".." || s === ".git" || s === ".worktrees")))) throw new Error("gc.disposablePaths must contain exact repository-relative paths without Git metadata or traversal");
+    for (const key of ["reviewGraceHours", "mergedIdleHours", "cacheIdleDays", "archiveIdleDays", "retireIdleDays", "poolIdleDays", "warmPoolSize", "minFreeGB", "maxActions", "maxRunMinutes", "targetWorktrees", "idleWorktrees", "maxLocalStateMB", "excessIdleHours", "remnantIdleHours"] as const) {
+      const value = gc[key];
+      if (value !== undefined && (!Number.isFinite(value) || value < 0 || (key === "maxActions" && (!Number.isInteger(value) || value < 1)))) throw new Error(`gc.${key} must be a valid nonnegative number (maxActions is a positive integer)`);
+      if (value !== undefined && (key === "targetWorktrees" || key === "warmPoolSize" || key === "idleWorktrees") && !Number.isInteger(value)) throw new Error(`gc.${key} must be an integer`);
+      if (value === 0 && key === "maxRunMinutes") throw new Error("gc.maxRunMinutes must be positive");
+    }
+    for (const key of ["archiveDirectory", "archiveVolumeUUID", "banyanctl"] as const) if (gc[key] !== undefined && (typeof gc[key] !== "string" || !gc[key]!.length)) throw new Error(`gc.${key} must be a nonempty string`);
+    if (gc.repositoryPolicies !== undefined) {
+      if (!isRecord(gc.repositoryPolicies)) throw new Error("gc.repositoryPolicies must map repository paths to policies");
+      for (const [path, policy] of Object.entries(gc.repositoryPolicies)) {
+        if (!path || !isRecord(policy) || "repositoryPolicies" in policy) throw new Error("Invalid repository GC policy");
+        validateConfig({ gc: policy });
+      }
+    }
+  }
   if (config.provider && !["auto", "linear", "github"].includes(config.provider)) {
     throw new Error(`Unsupported provider '${config.provider}' in workit config`);
   }
   const target = config.launch?.target;
   if (target && !["banyan", "here", "iterm"].includes(target)) {
     throw new Error(`Unsupported launch target '${target}' in workit config`);
+  }
+  if (config.launch?.parentFallback !== undefined && typeof config.launch.parentFallback !== "boolean") {
+    throw new Error("launch.parentFallback must be a boolean");
   }
   const dependencies = config.launch?.dependencies;
   if (dependencies && !["symlink", "clone", "install", "none"].includes(dependencies)) {
@@ -361,6 +398,7 @@ function defaultConfig(): WorkitConfig {
     },
     launch: {
       target: "banyan",
+      parentFallback: true,
       review: true,
       instructions: [...DEFAULT_LAUNCH_INSTRUCTIONS],
       dependencies: "symlink",

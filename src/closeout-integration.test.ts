@@ -71,7 +71,7 @@ test("acceptance-profile-selection: full managed CLI launch uses explicit local 
   t.after(() => rmSync(promptFile, { force: true }));
   const prompt = readFileSync(promptFile, "utf8");
   assert.doesNotMatch(prompt, /create_goal|Superdog/);
-  assert.match(prompt, /Acceptance profile: local/);
+  assert.match(prompt, /Verification mode for this issue: local/);
   assert.equal(read().calls.filter((call: string[]) => call[0] === "gh" && call[1] !== "issue").length, 0);
   store.update(job.id, current => { current.stage = "verifying"; current.pr = "https://github.com/example/project/pull/42"; current.mergeSha = source; });
   const report = { jobID: job.id, issueURL: issue.url, acHash: job.acHash, mergeSha: source, checkedAt: new Date().toISOString(),

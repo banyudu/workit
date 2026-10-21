@@ -45,6 +45,31 @@ npm install --global @banyudu/workit
 workit --help
 ```
 
+## Worktree dependencies
+
+For a disposable verification worktree, prepare dependencies after checking out
+the revision being verified:
+
+```sh
+workit prepare --worktree /path/to/repo/.worktrees/review-job --dependencies clone
+```
+
+`clone` gives the worktree its own root and workspace `node_modules` directories
+using copy-on-write filesystem clones. It reuses the source installation only
+when manifests, lockfiles and package-manager configuration match. Absolute
+workspace links are rebased into the worktree. If cloning is unavailable or any
+dependency link escapes the worktree, preparation falls back to a frozen install
+using the package manager's cache. Package installation scripts are disabled.
+Use `--dependencies install` to always reconcile against the target lockfile,
+or `none` for checks that do not need dependencies. The command copies configured
+environment files and allows direnv, without fetching or changing an issue.
+
+For normal issue launches, `--build` selects clone mode and `--install` selects
+install mode. Both upgrade existing `node_modules` directory symlinks without
+modifying the original checkout's dependencies. The default issue-launch mode
+remains `symlink`; verification launchers should explicitly choose `clone` or
+`install` when their tooling requires dependencies to stay inside the worktree.
+
 ## Configuration
 
 Configuration is merged in this order:
@@ -239,6 +264,10 @@ in `src/config.ts`) asks the agent to:
 - Verify the reviewed commit SHA using review/check metadata. Older scores and
   missing or pending reviews do not satisfy completion. Report unavailable
   reviewers or other external blockers with evidence.
+- Hand a merged Linear issue over: attach the PR and set the issue state to
+  **In Review**. After independent acceptance verification and evidence/checklist
+  reconciliation, move it to **Done**. Managed jobs do this automatically when
+  `workit job verify` accepts the report, with heartbeat retries for tracker failures.
 - Stay within the issue and review scope.
 
 For Codex, the prompt explicitly requests `get_goal` and `create_goal` before
@@ -252,15 +281,27 @@ request to use Codex's goal tools.
 For unmanaged launches this is prompt guidance; continuation depends on the
 selected agent. [Managed issue delivery](docs/managed-delivery.md) uses workit's
 durable heartbeat and guarded Banyan continuation instead of the built-in native
-goal instruction. Repositories without Superdog can replace
-the guidance below with their own review policy.
+goal instruction, and it performs the Linear review handoff itself once it
+observes the merge, so that guidance is dropped from managed prompts.
+Managed verification follows the issue's ACs. Use
+`workit --managed --verification local ENG-123` for locally verifiable tooling;
+`job checkpoint` and `job resume` also accept `--verification local|deployed` to
+correct an inherited default for one job. Local mode still requires merged
+source and independent evidence for every AC.
+Repositories without Superdog can replace the guidance below with their own
+review policy.
 
-Managed jobs support `--acceptance local|deployed`, audited acceptance correction,
-`workit job attention --format text`, and opt-in bounded independent verifiers.
-The [workflow contract](docs/managed-delivery.md) also documents Banyan's atomic
-revision/session-checked owner pause and recovery after partial failures.
+Banyan launches inherit the calling session from `BANYAN_SESSION_ID`. Set
+`BANYAN_PARENT_SESSION_ID` to nest under a different session. Workit resolves
+the parent before clearing the child CLI's identity variables, and uses
+`--no-parent` when neither variable contains an ID. If the parent is missing or closed,
+workit retries once as a top-level session after a confirmed HTTP 400
+missing-parent rejection. Other errors are reported without retrying.
+Set `launch.parentFallback: false` or pass `--no-parent-fallback` to require the
+parent; `--parent-fallback` enables fallback for a single run.
 
-Override it per repository — the list replaces the default, so `[]` disables it:
+Override the prompt guidance per repository — the list replaces the default,
+so `[]` disables it:
 
 ```yaml
 launch:
@@ -286,7 +327,147 @@ The default provider is `auto`: numeric identifiers route to GitHub and
 `PROJECT-123`-style identifiers route to Linear. Use `--linear` or `--github`
 to override inference.
 
-## Development
+## Worktree recycling
+
+`workit gc` reports lifecycle decisions without changing checkouts. Pass `--apply`
+to execute them. Clean inactive checkouts are deleted directly; branches stay in
+the repository, and `refs/workit-gc/retired/<record-id>-<head>` pins their commits,
+including detached revisions. Routine GC makes no full-checkout archives or Git
+bundles and needs no external SSD. With `preserveLocalState`, only unique local
+files are copied and hash/mode/link verified under the internal runtime state
+directory before retirement. Existing
+archives remain untouched and keep their original `RESTORE.txt` instructions.
+
+Use `--json` or `--output /path/to/report.json` for automation. Reports include
+operation, elapsed milliseconds and archive/restored bytes (zero for routine
+GC). Runtime records live in `~/.local/state/workit/state.sqlite`, outside the
+checkout; `WORKIT_GC_STATE` overrides that path. Python 3, Git and `lsof` are
+required; GitHub CLI supplies exact merged PR head evidence when available.
+
+```sh
+workit gc --dry-run
+workit gc --apply --max-actions 4
+workit gc --dry-run --only-repo ~/dev/my-project
+workit gc --dry-run --remnants-only
+workit gc register --worktree /path/to/checkout --role implementation
+workit gc register --worktree /path/to/slot --role pool
+workit gc keep --worktree /path/to/checkout
+workit gc keep --worktree /path/to/checkout --off
+# Recover a deleted checkout at its saved revision:
+git worktree add --detach /path/to/restored refs/workit-gc/retired/RECORD-ID-HEAD
+# Recreate committed source and restore preserved local files together:
+workit gc restore --state ~/.local/state/workit/retained-state/SNAPSHOT --worktree /path/to/restored
+```
+
+Issue launchers register implementation checkouts and lease them during
+preparation. Review launchers register immutable `job.json` ownership before
+setup, hand off the lease to the supervisor, and call `gc finish --apply` after
+the agent exits. Result JSON and agent logs stay in the external job directory.
+PID and process start time identify leases, so PID reuse cannot keep a dead job
+alive. Pool owners call `gc lease --worktree PATH --pid PID` before use and
+`gc release` afterward. Keep flags and repository exclusions always win.
+
+Configure defaults in `~/.config/workit/config.yml`; `.workit.yml` supplies
+repository overrides:
+
+```yaml
+gc:
+  enabled: true
+  repositories: [~/dev/my-project]
+  excludedRepositories: [~/dev/never-clean]
+  # banyanctl: /path/to/banyanctl
+  reviewGraceHours: 1
+  mergedIdleHours: 24
+  cacheIdleDays: 14
+  retireIdleDays: 30
+  warmPoolSize: 2
+  poolIdleDays: 7
+  minFreeGB: 100
+  maxActions: 4
+  maxRunMinutes: 2
+  # Keep live checkouts plus this many warm idle checkouts per repository:
+  idleWorktrees: 2
+  preserveLocalState: true
+  maxLocalStateMB: 256
+  # Optional soft targets; protected or locally changed work can exceed them.
+  # targetWorktrees: 5
+  # excessIdleHours: 1
+  # recycleUnclassified: true
+  # cleanupRemnants: true
+  # remnantIdleHours: 24
+  # Exact relative paths, only when all their local contents are disposable:
+  # disposablePaths: [.greptile/config.json]
+  # repositoryPolicies:
+  #   ~/dev/busy-project:
+  #     idleWorktrees: 1
+```
+
+Open Banyan sessions (including waiting/suspended sessions), live process working
+directories or open files, keep flags, Git locks, nested checkouts and live leases
+protect a checkout. An unavailable configured activity source prevents cleanup.
+Agent history, Git operations and index activity determine idle age. Local edits,
+staged changes, untracked files, and ignored local data such as databases or
+environment files are retained regardless of age. Index flags that can conceal
+changes (`skip-worktree` or `assume-unchanged`) also retain the checkout.
+Local files do not prevent independent trimming of generated caches. With
+`preserveLocalState: true`, a clean checkout can retire after its unique local
+roots are copied and verified. Only these roots are hashed; committed source and
+dependencies are not backed up. Files exceeding `maxLocalStateMB`, special files,
+or changing data prevent retirement. Snapshots retain permissions and symlinks,
+contain `record.json` and restoration instructions, and are never auto-deleted.
+
+Known rebuildable caches (`node_modules`, `.build`, `.next`, `target`, and
+`.direnv/nix-sources`) may be removed from valid Git checkouts. Tracked files
+inside them remain protected. `disposablePaths` explicitly permits additional
+exact files/directories; unknown siblings stay protected. GC does not follow
+symlinks when deleting caches and only makes owned cache directories writable.
+Native agent session histories are never part of worktree cleanup.
+
+Clean implementations recycle after their exact PR head is merged and idle,
+or after `retireIdleDays`. Idle implementations below that age can trim caches.
+Clean completed reviews recycle promptly; interrupted reviews wait for their
+owner to exit and the recovery grace. Pools retain the newest two idle slots
+plus active leases. Dirty reviews remain available for inspection.
+
+`targetWorktrees` reserves capacity for protected sessions/jobs and recently
+used idle checkouts, then removes excess inactive clean checkouts after
+`excessIdleHours`. `recycleUnclassified` opts unknown Git checkouts under
+`.worktrees` into this policy. `recycleExternalWorktrees` additionally opts in
+Git-registered checkouts outside that directory. Neither flag overrides local
+state protection. `repositoryPolicies` supplies per-repository personal policy.
+`idleWorktrees` replaces the fixed total target with an idle allowance in addition
+to protected live work. Its newest idle checkouts stay warm; excess checkouts
+retire after `excessIdleHours`. Local modifications always remain protected.
+`--only-repo` restricts discovery and actions; `--repo` adds repositories to the
+normal inventory. Legacy `archiveIdleDays`, `archiveUnclassified`, and
+`archiveExternalWorktrees` remain aliases when the new fields are absent.
+Legacy archive destination and dirty-review archive settings do not enable
+backups or force deletion of dirty work.
+
+`cleanupRemnants` opts in unregistered, non-hidden direct folders under
+`.worktrees`. Without Git metadata, remaining files cannot be assumed to exist
+in a commit: only empty folders or explicitly disposable contents can be
+removed after `remnantIdleHours`. Unknown source files and agent metadata stay.
+Git-owned roots, nested Git directories, symlinks and control directories stay.
+`--remnants-only` limits a run to these folders and partial review deletions.
+
+All apply paths share one nonblocking cleanup worker: scheduled sweeps,
+`gc finish`, and cache pressure relief cannot delete different worktrees in
+parallel. Busy finish calls record completion first and leave cleanup pending
+for the next sweep. Per-checkout locks still coordinate creators and leases.
+`maxActions` and `maxRunMinutes` bound inspections/actions after discovery and
+activity collection; an in-progress deletion finishes safely. Persistent
+inspection checkpoints rotate successive sweeps past retained/dirty entries
+without changing lifecycle age. Apply commands run at reduced process priority
+when supported.
+
+The four-hour scheduler runs `scripts/gc-launchd.sh`; its report is
+`~/.local/state/workit/last-gc.json` (`WORKIT_GC_REPORT` overrides it). Launchers
+also provide bounded cache-only pressure relief below `minFreeGB`, at most once
+per repository per five minutes. Discovery imports known review metadata and
+matching workit launches. Failures are reported with a nonzero exit.
+
+## Development commands
 
 ```sh
 bun install

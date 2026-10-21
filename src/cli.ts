@@ -2,11 +2,11 @@ import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
-import { JobStore, createJob } from "./lifecycle.js";
+import { JobStore, createJob, parseVerificationMode } from "./lifecycle.js";
 import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
-import { allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
-import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, repositoryRoot } from "./git.js";
+import { MANAGED_OWNED_INSTRUCTION_PREFIXES, allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
+import { branchForIssue, createOrResumeWorktree, originRemote, prepareDependencies, prepareExistingWorktree, repositoryRoot } from "./git.js";
 import { fetchIssue, inferBackend, normalizeIdentifier, transitionLinearIssue } from "./issue.js";
 import { headlessPromptCommand, launch, runHere } from "./launch.js";
 import {
@@ -19,6 +19,8 @@ import {
 } from "./project.js";
 import { listAgents, syncDerivedConfigs, type SyncResult } from "./sync.js";
 import type { CliOptions, DependencyMode, LaunchTarget, ProviderMode } from "./types.js";
+import { gcCLI } from "./gc/cli.js";
+import { pressureGC, registerWorktree, setLifecycle } from "./gc/engine.js";
 
 const VERSION: string = (() => {
   try {
@@ -42,6 +44,8 @@ Usage:
   workit heartbeat install|uninstall|status
   workit sync-map [--map <path>] [--roots <dirs>]
   workit agents [--tag <tag>] [--format json|table] [--at <iso>]
+  workit prepare --worktree <path> [--dependencies clone|install|symlink|none]
+  workit gc [--dry-run | --apply] [--json] (see workit gc --help)
 
 Issue routing:
   workit 23             GitHub issue #23
@@ -105,11 +109,14 @@ Options:
   --tag <tag>                           Scope weighted selection to agents carrying this tag
   --here                               Launch in the current terminal
   --banyan                             Launch a Banyan session (default)
+  --parent-fallback                    Fall back to top-level if the Banyan parent is missing (default)
+  --no-parent-fallback                 Fail if the Banyan parent is missing
   --iterm                              Launch an iTerm2 tab
   --no-prompt                          Launch agent without an issue prompt
   --no-agent                           Create/prepare worktree only
   --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
   --acceptance local|deployed           Explicit per-job acceptance profile (managed only)
+  --verification local|deployed         Override managed verification for these issues
   --review / --no-review               Include/skip design guidance
   --instructions <text>                Append guidance to the issue prompt (repeatable)
   --no-instructions                    Drop the prompt guidance (auto-PR + review block)
@@ -173,6 +180,9 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--unmanaged":
         options.managed = false;
+        break;
+      case "--verification":
+        options.verification = parseVerificationMode(next());
         break;
       case "--github":
       case "--gh":
@@ -257,6 +267,12 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--banyan":
         options.target = "banyan";
+        break;
+      case "--parent-fallback":
+        options.parentFallback = true;
+        break;
+      case "--no-parent-fallback":
+        options.parentFallback = false;
         break;
       case "--iterm":
         options.target = "iterm";
@@ -494,7 +510,34 @@ async function main(): Promise<void> {
     await lifecycleCLI(process.argv.slice(2));
     return;
   }
-  const invocation = parseInvocation(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv[0] === "gc") { gcCLI(argv.slice(1)); return; }
+  if (argv[0] === "prepare") {
+    let target: string | undefined;
+    let mode: DependencyMode = "clone";
+    for (let index = 1; index < argv.length; index++) {
+      const flag = argv[index];
+      if (flag === "--help" || flag === "-h") {
+        console.log(help());
+        return;
+      }
+      if (flag !== "--worktree" && flag !== "--dependencies") throw new Error(`Unknown prepare option '${flag}'`);
+      const value = argv[++index];
+      if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+      if (flag === "--worktree") target = resolveHomePath(value);
+      else {
+        if (!["clone", "install", "symlink", "none"].includes(value)) throw new Error(`Unsupported dependency mode '${value}'`);
+        mode = value as DependencyMode;
+      }
+    }
+    if (!target) throw new Error("workit prepare requires --worktree <path>");
+    const root = repositoryRoot(target);
+    const resolved = resolveConfig(root, { remote: originRemote(root) });
+    prepareExistingWorktree(target, resolved.config, mode);
+    console.log(`Prepared ${target} (dependencies=${mode})`);
+    return;
+  }
+  const invocation = parseInvocation(argv);
   const options = invocation.options;
   if (invocation.mode === "run") {
     const resolved = resolveConfig(resolveHomePath("~"));
@@ -720,6 +763,14 @@ async function main(): Promise<void> {
     const instructions = options.noInstructions
       ? []
       : [...(config.launch?.instructions ?? []), ...(options.instructions ?? [])];
+    const managed = options.managed ?? (config.lifecycle?.enabled === true && options.agentLaunch && options.prompt &&
+      (options.target ?? config.launch?.target ?? "banyan") === "banyan");
+    if (managed && (!options.agentLaunch || !options.prompt ||
+        (options.target ?? config.launch?.target ?? "banyan") !== "banyan")) {
+      throw new Error("Managed jobs require a prompted agent in Banyan");
+    }
+    if (options.acceptance && options.verification && options.acceptance !== options.verification) throw new Error("--acceptance and --verification must agree");
+    if ((options.acceptance || options.verification) && !managed) throw new Error("--verification requires a managed launch");
 
     if (options.verbose && resolved.configFiles.length) {
       console.log(`Config: ${resolved.configFiles.join(", ")}`);
@@ -746,9 +797,10 @@ async function main(): Promise<void> {
       : (prefetched && backend === "linear"
           ? prefetched
           : await fetchIssue(backend, identifier, config, root));
-    if (!options.dryRun) await transitionLinearIssue(issue, config);
+    if (!options.dryRun) await transitionLinearIssue(issue, config, root);
 
     const branch = branchForIssue(issue.backend, issue.identifier, issue.title, config);
+    if (!options.dryRun) pressureGC(root);
     const worktree = options.dryRun
       ? {
           path: resolve(root, config.worktree?.directory ?? ".worktrees", branch.replace(/\//g, "-")),
@@ -757,7 +809,10 @@ async function main(): Promise<void> {
           resumed: false,
         }
       : createOrResumeWorktree({ ...resolved, config }, branch);
-    if (!options.dryRun) prepareDependencies(root, worktree.path, dependencyMode);
+    if (!options.dryRun) {
+      registerWorktree(worktree.path, { role: "implementation", issue: issue.identifier, pid: process.pid, phase: "preparing" });
+      prepareDependencies(root, worktree.path, dependencyMode);
+    }
     const pickPool = options.tag
       ? agentDefinitionsByTag(config, options.tag)
       : config.agents ?? {};
@@ -779,21 +834,14 @@ async function main(): Promise<void> {
           options.allowFallback,
         )
       : { name: "none", definition: { command: "" } };
-    const managed = options.managed ?? (config.lifecycle?.enabled === true && options.agentLaunch && options.prompt &&
-      (options.target ?? config.launch?.target ?? "banyan") === "banyan");
-    if (managed && (!options.agentLaunch || !options.prompt ||
-        (options.target ?? config.launch?.target ?? "banyan") !== "banyan")) {
-      throw new Error("Managed jobs require a prompted agent in Banyan");
-    }
-    if (options.acceptance && !managed) throw new Error("--acceptance requires a managed launch");
     let job: ReturnType<typeof createJob> | undefined;
     let jobStore: JobStore | undefined;
     if (managed && !options.dryRun) {
       await new BanyanLifecycleAdapter().requireWorkflowSupport(root);
       jobStore = new JobStore();
       job = createJob({ issue, repoRoot: root, worktree: worktree.path,
-        githubRepo: githubRepository(remote), agent: selected.name,
-        config: config.lifecycle, acceptance: options.acceptance });
+        githubRepo: githubRepository(remote), agent: selected.name, acceptance: options.acceptance,
+        config: { ...config.lifecycle, ...(options.verification ? { verification: options.verification } : {}) } });
       job.controlCommand = [process.execPath, resolve(process.argv[1])];
       job.stateDirectory = dirname(jobStore.path);
       if (jobStore.list().some(existing => existing.id === job!.id)) {
@@ -805,7 +853,12 @@ async function main(): Promise<void> {
     try {
       launch({ ...resolved, config }, issue, worktree, selected.name, selected.definition, {
         ...options,
-        instructions: job ? [...instructions.filter(line => !line.startsWith("Persistent goal (Codex only):")), ...managedInstructions(job)] : instructions,
+        instructions: job
+          ? [
+              ...instructions.filter(line => !MANAGED_OWNED_INSTRUCTION_PREFIXES.some(prefix => line.startsWith(prefix))),
+              ...managedInstructions(job),
+            ]
+          : instructions,
         sessionID: job?.sessionID,
       });
     } catch (error) {
@@ -823,6 +876,7 @@ async function main(): Promise<void> {
         console.warn("workit: managed job saved; heartbeat will retry its Banyan projection");
       }
     }
+    if (!options.dryRun) setLifecycle(worktree.path, { pid: process.pid, release: true, phase: "idle" });
   }
 }
 

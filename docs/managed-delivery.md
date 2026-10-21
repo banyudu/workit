@@ -1,8 +1,8 @@
 # Managed issue delivery
 
 Managed launches own one issue through implementation, local preverification,
-review/CI repair, authorized merge, deployment waiting, independent acceptance
-and tracker closeout. They are opt-in:
+review/CI repair, authorized merge, deployment waiting, independent acceptance,
+tracker handoff and verified issue closeout. They are opt-in:
 
 ```bash
 workit --managed 23
@@ -46,9 +46,22 @@ Return `{"ready":false}` until the relevant deployment is available, then:
 Report the actual serving source/version, not newest main or mere deploy-job
 success. Workit checks GitHub ancestry against the merged PR. Trusted probe argv
 is snapshotted from launch configuration; issue text and checkpoints cannot
-supply new probe commands. Use `verification: local` only when every AC has
-reliable local acceptance. It still requires a merged PR, independent evidence
-and tracker closeout.
+supply new probe commands. Verification scope is per issue: the repository
+setting is a default, and a local CLI, tooling or documentation issue should use
+`local` when every AC has reliable local acceptance. Override the default at
+launch without changing other jobs:
+
+```bash
+workit --managed --verification local TASK-123
+```
+
+Local verification proceeds directly from merge to `verifying`; it requires no
+deployment probe, serving version or deployed journey. It still requires a merged
+PR, independent evidence for every AC and tracker handoff. Keep `deployed` when
+acceptance requires a serving environment. An explicit `[deploy]` or
+`[deploy:label]` AC prevents selecting local verification. Both the initial
+prompt and heartbeat continuations explain the selected mode and how to correct
+an inherited default after reading the actual ACs.
 
 `--unmanaged` overrides the project setting. Shell-only, unprompted, iTerm and
 current-terminal launches remain unmanaged. Explicit `--managed` rejects
@@ -122,137 +135,40 @@ goal instruction and asks agents not to add native goals or schedules. Handle an
 already-active unrelated goal explicitly before onboarding that conversation.
 Workit does not pick additional backlog issues.
 
-## Attention and blocker ownership
+## Tracker handoff
 
-```bash
-workit job attention --format json
-workit job attention --format text
-workit tick --job JOB_ID
-```
+Workit owns the Linear state handoffs rather than delegating them to the agent.
+Launch claims queued work (`Backlog`, `Todo`, `On Hold` → `In Progress`). The
+heartbeat then hands a merged issue to review as soon as it observes the
+merge, moving `In Progress`, `Rework` or `Merging` → `In Review`. After
+`workit job verify` accepts independent passing evidence for every current AC,
+workit automatically moves the Linear issue from `In Review` to `Done` and
+confirms the state by reading it back. Merge alone never marks it Done.
+Recording a follow-up PR re-arms the handoff, so the issue
+is handed over again after that PR merges.
 
-Attention is a read-only closeout view of durable observations. The JSON view
-contains grouped `items` and per-job facts. Each item gives a reason, responsible
-party (`owner`, `external`, `system` or `verifier`), opaque dependency identity
-when configured, observation time, recheck trigger and concrete next action.
-It distinguishes missing verification, recoverable tools, unchanged external
-waits, source provenance repair and owner acceptance/hold decisions.
+The handoff is best-effort and idempotent. A tracker failure is reported on
+stderr and retried on later ticks instead of failing or delaying the job, and a
+settled handoff is recorded as durable job state. Authentication follows the
+rest of the CLI: `LINEAR_API_KEY` when it is set, otherwise the authenticated
+`linear` CLI, so a CLI on the heartbeat's `PATH` is enough. Managed prompts drop
+the tracker-handoff guidance that unmanaged launches receive, because the
+heartbeat performs it. `workit job verify` accepts the Linear handoff state
+(`In Review` or already `Done`) as its tracker precondition.
 
-The existing heartbeat refreshes held jobs' GitHub merge/head/check facts at the
-job interval without reading or waking their agent conversations. A merged PR
-is shown as merged, and a conflicting or failed head loses its previous ready
-status. Original hold detail and wake receipts remain available in job status.
-Readiness is an observation for policy assessment, never merge authority.
-Failed refreshes report an actionable tool error instead of presenting cached
-readiness as current. Paused jobs receive only observation/projection work.
+Acceptance is saved before attempting the Done transition, so a tracker outage
+does not discard the independent report. The heartbeat retries completion for
+verified jobs until `trackerDone: true` records a confirmed readback. This also
+covers previously verified jobs. Before writing, it rechecks the current AC
+binding and preserves human holds, cancellations and reopened issues; only an
+issue still in `In Review` is moved. Already-Done issues are acknowledged without
+another write. Completion sync needs no agent wake or idle session.
 
-Set the same trusted `lifecycle.deploymentDependency` key on jobs that genuinely
-share a deployment/provenance dependency. Workit groups matching blocker types
-using a digest of that key; attention does not expose the configured key, probe
-argv, deployment targets or credentials. Unconfigured dependencies remain
-separate per job until explicitly configured as shared. Unrelated configured
-keys remain separate. A healthy runtime without its built source/version is an
-external repair dependency, never an accepted journey. This workflow does not
-modify downstream deployment code.
-
-## Optional independent verifier dispatch
-
-Dispatch is disabled by default. It is read from current trusted user/project
-configuration, separate from the launch acceptance snapshot. To explicitly opt
-in for a project, configure a review-tagged agent in the shared registry and add:
-
-```yaml
-lifecycle:
-  verifier:
-    enabled: true
-    agent: independent-reviewer
-    concurrency: 1
-    maxAttempts: 2
-    timeoutSeconds: 300
-```
-
-Example registry entry (the command must already be installed and authorized):
-
-```yaml
-agents:
-  independent-reviewer:
-    command: codex
-    tags: [review]
-    weight: 1
-```
-
-This does not install a scheduler or enable dispatch for other projects. Bounds
-are positive integers: concurrency at most 16, attempts at most 10 and timeout
-at most 3600 seconds. The default bounds are 1, 2 and 300 respectively. The
-store counts reserved, running, uncertain and invalidated runs against capacity;
-each reservation consumes one attempt. Failed known outcomes can retry on a
-later job interval, within that budget. Budget exhaustion leaves a concrete
-manual verification/recovery action. Dispatch disabled or an unavailable review
-agent also produces a concrete next action; it never installs an agent.
-
-The heartbeat checks the current AC and merged/serving bindings before reserving
-capacity atomically in SQLite. It persists a new independent run/session ID,
-binding, attempt count, report path and outcome path **before** calling the
-existing Banyan launch integration. The separate headless verifier has a bounded
-process timeout and instructions to verify only, without creating native goals
-or another scheduler. Explicit human ACs remain owner decisions. Dispatch grants
-no permission for paid/provider journeys, external messages, merge, deployment,
-AC edits, tracker checklist changes or Done transitions.
-
-Repeated/concurrent ticks and restarts reuse the persisted run. Reports are read
-only after the bounded runner writes a complete outcome. Returned reviewer
-identity must match that run, and reports pass the ordinary current-AC,
-merged-source and serving-version gate. Rejected reports remain unfinished.
-Accepted evidence with an open tracker produces `tracker-closeout`; only an
-external authorized tracker completion lets a subsequent recheck mark the job
-verified. Workit never changes the tracker to Done itself.
-
-A lost launch acknowledgement or crashed reservation becomes uncertain and
-holds the job for inspection; no fresh verifier is blindly launched. Inspect
-the saved run/session, report, outcome and original conversation before using:
-
-```bash
-workit job verifier-reconcile JOB_ID --run-id VERIFIER_RUN_ID --outcome not-delivered --reason "Inspection established no delivered prompt" --expected-revision 18
-workit job resume JOB_ID --detail "Inspected hold released"
-```
-
-Use `delivered` to continue observing that same compatible run. Use `completed`
-only after inspection establishes the run has finished, including an invalidated
-run, to archive its identity and release capacity. `not-delivered` permits a
-later bounded retry after inspection establishes no delivery. Reconciliation
-checks revision and run identity, preserves attempt counts and never releases a
-pause/human hold. A cancelled job can reconcile an in-flight verifier receipt
-to release capacity while remaining cancelled. Pause/cancel stop new scheduling;
-they do not interrupt an already launched verifier. Use Banyan to control its
-process. Do not use another reviewer's report to silently replace an active run.
-
-## Owner pause bridge
-
-Banyan's [owner-pause UI integration](https://github.com/banyudu/banyan/issues/142)
-must use this exact contract, supplying the revision
-and session from the displayed job:
-
-```text
-workit job pause JOB_ID --detail TEXT --expected-revision N --expected-session-id SESSION_ID
-```
-
-Configure Banyan's trusted invocation and owning state directory for **Pause and
-Close** in `~/.banyan/workit.json`.
-
-Both expected fields remain optional for older CLI callers. Workit checks them
-in the atomic revision update. Either mismatch fails without changing the job
-or projecting anything. Success returns the resulting job as JSON, including
-`projection: {status, sessionID, revision}`. `status` is `confirmed` when the
-Banyan projection command succeeds and `pending` when the durable pause saved
-but projection failed. The heartbeat retries projection even for held jobs.
-The UI must keep the terminal open until it observes the matching job/session,
-revision and paused workflow in Banyan; a durable pause alone is insufficient.
-
-Pause removes future continuation scheduling and preserves the issue, acceptance
-history and pending wake audit. It does not verify or cancel the issue, interrupt
-an active turn or close a process. If a pending wake exists, inspect the original
-conversation and run `job reconcile` before explicitly resuming. Reconciliation
-also supports paused jobs and leaves the hold in place. Workit never treats an
-uncertain delivery as permission to dispatch a fresh conversation.
+An issue launched under explicit human-only closure instructions can retain that
+authorization with `job checkpoint ... --tracker-completion human`. The setting
+is scoped to that job and suppresses automatic Done synchronization after
+verification; other jobs keep their existing policy. Use `automatic` only when
+the issue's authorization allows it.
 
 ## Checkpoints and recovery
 
@@ -266,6 +182,36 @@ workit job pause JOB_ID --detail "Owner requested a hold"
 workit job resume JOB_ID --detail "Hold released"
 workit job cancel JOB_ID --detail "Scope cancelled"
 ```
+
+During an active verification turn, `workit job refresh-deployment JOB_ID`
+records the current serving version through the job's original read-only probe
+and checks merged-source ancestry. It requires an unheld post-merge job with no
+pending wake or active claim, and commits with a revision check. It neither
+wakes the session nor accepts evidence. Revalidate affected acceptance probes
+after a version change, then use `job verify --report` as usual. The targeted
+guards are covered by `src/deployment-refresh.test.ts`.
+
+To correct verification scope on an active job, include `--verification` in a
+checkpoint and explain how every AC will be proven. For local post-merge
+acceptance:
+
+```bash
+workit job checkpoint JOB_ID --stage verifying --verification local --detail "All ACs cover local CLI output and tests on the merged source"
+```
+
+A job already held in `needs-you` or `paused` can change mode while remaining
+held by checkpointing the same stage. To explicitly release the hold and correct
+the mode together:
+
+```bash
+workit job resume JOB_ID --verification local --detail "Every AC has local acceptance; deployment is outside this issue's scope"
+```
+
+Mode corrections affect only that job, clear stale deployment/report evidence,
+and preserve merge, tracker and independent-review requirements. Ordinary
+checkpoints cannot release a human hold. Pending wake delivery must be inspected
+and reconciled before changing mode or resuming. Switching to `deployed`
+requires the trusted deployment probe already saved in the job's configuration.
 
 Stages: `implementing`, `preverifying`, `reviewing`, `waiting-ci`,
 `waiting-deploy`, `verifying`, `fixing`, `needs-you`, `paused`, `cancelled`,
@@ -292,6 +238,12 @@ workit job resume JOB_ID
 
 Use `--delivery not-delivered` only when inspection establishes that no prompt
 was delivered. Reconciliation leaves the job held until explicit resume.
+Workit may have saved an intent that Banyan never admitted. For this inspected
+`not-delivered` outcome, reconciliation can clear only Workit's intent when
+protocol v1 confirms the original session's readable, current held workflow has
+no matching receipt and no other unresolved wake. Any older settled native
+receipt is preserved. Matching receipts still use Banyan's guarded resolution;
+an absent receipt never establishes a `delivered` outcome.
 Missing/ambiguous conversation identity, unreadable journals, removed worktrees
 and uncertain launches never fall back to replaying the initial task in a new
 conversation. Recover the named Banyan session first. Repeated auth/control
@@ -299,13 +251,96 @@ failures use bounded exponential backoff, then become `needs-you`.
 
 ## Verified completion
 
-An independent verifier produces a report covering every current AC. After
-acceptance is proven, reconcile the issue's evidence/checklist and completed
-state under repository policy, then submit:
+An independent verifier can submit AC progress as soon as individual results
+are proven, using the same command as final completion:
 
 ```bash
 workit job verify JOB_ID --report /absolute/path/verification.json
 ```
+
+For Linear, partial reports synchronize evidenced results even while other ACs
+are missing, failed or blocked. `pass` with valid evidence checks that AC; `fail`
+with valid evidence unchecks it. Omitted or `blocked` ACs, and failures with no
+evidence, retain their existing checkbox state. A claimed pass with missing or
+invalid evidence rejects the report. Each included label must be current and
+unique, and human results still require attributed human confirmation.
+Report pending human acceptance as `blocked` so other proven ACs can synchronize.
+
+For example, submit just the passing `documented-contract` entry from the report
+below while the journey is still pending. Only that checkbox is synchronized;
+the issue state is unchanged and the returned job remains `verifying`. This is
+accepted progress, not verified completion. Retry a failed/interrupted sync with
+`job closeout JOB_ID`, which revalidates the stored partial report first.
+
+Progress synchronization retains the current issue/AC binding, merged-source,
+independent-reviewer, owner-hold and applicable serving-version gates. A deployed
+job still rechecks its observed serving version, but a partial report containing
+only local/code evidence does not need a fabricated journey. Included journey
+or version-bound evidence must match the actual observed deployment.
+
+Final completion requires one complete passing report covering every current
+AC, including applicable deployed journey evidence. Reports are not accumulated
+to infer completion: existing checked boxes and passes from earlier submissions
+cannot fill gaps in the latest report. Only then does workit resolve the
+issue's actual team's active `completed` workflow state and confirm checklist
+and state by readback before marking the job `verified`. No extra per-issue
+approval is needed for this validated managed path. Existing completed states
+are retained; canceled/duplicate states never count as successful completion.
+If a team has several completed states, the first by workflow position (then ID)
+is selected. GitHub behavior is unchanged: close the issue under repository
+policy before submitting; workit does not mutate its body or state.
+
+Linear closeout requires `LINEAR_API_KEY` and uses the supported public
+[GraphQL issueUpdate API](https://linear.app/developers/graphql) with
+`IssueUpdateInput.description` or `stateId`. It does not depend on CLI-specific
+full-description helpers or an invented compare-and-swap parameter.
+
+The job stores the latest accepted progress/completion report and each mutation
+intent before sending it. A subsequent report can update more ACs without
+repeating already-applied results.
+After a failure or interruption, inspect status and retry only that job:
+
+```bash
+workit job status JOB_ID
+workit job closeout JOB_ID
+```
+
+`closeout` revalidates stored independent evidence against current ACs, GitHub
+merged source and, where applicable, the actual serving version. It reads the
+tracker before retrying an uncertain mutation, skips effects already confirmed,
+and never claims a newly verified job while either effect is unconfirmed.
+It also reconciles a job marked `verified` by older workit versions; that job
+returns to `verifying` until revalidation and readbacks succeed. No bulk job
+migration runs automatically. Missing/stale reports require fresh independent
+evidence and `job verify --report PATH`.
+
+Checkbox synchronization matches unique stable labels in a fresh Acceptance
+Criteria section and changes only the evidenced pass/fail checkbox character,
+retaining all other description bytes, other checklists and current human edits.
+A second read compares description, `updatedAt`, team, state and hold labels immediately before
+each mutation. Changed AC content invalidates the report. Changed snapshots
+abort before writing; post-write readback must match the intended description.
+On an ambiguous pending checklist conflict, inspect Linear's current description
+and activity history, merge/restore the checkbox-only change without removing
+human edits, then retry `job closeout`. Workit does not blindly restore an old
+full description. Lost responses are reconciled even when the API reported an
+error; retries do not repeat an effect already present.
+
+Linear does not expose a conditional description/state update. These reads
+detect observable conflicts but cannot eliminate edits or holds arriving between
+the last read and mutation, or an edit overwritten in that window. Local SQLite
+claims serialize workit processes in one state directory, not other clients or
+hosts. Human writers should avoid concurrent description edits during closeout;
+inspect activity history if a race is suspected. Workit preserves concurrent
+local pauses/checkpoints and never clears an explicit hold to finish closeout.
+Readback also cannot rule out a timed-out request committing later; a retry sends
+the same field value, but Linear may record another activity or notification.
+
+Paused, human-blocked and canceled jobs cannot close out. Linear archived or
+snoozed issues, states named `On Hold`, `Hold`, `Paused` or `Blocked`, and labels
+`owner-hold`, `owner hold`, `on-hold`, `on hold`, `hold`, `paused` or `blocked`
+also block mutations until explicitly released. Represent owner holds through
+these controls rather than relying on prose in the description.
 
 Example report (labels and hashes must match job status):
 
@@ -348,12 +383,18 @@ Example report (labels and hashes must match job status):
 
 AC labels use `[test:journey-contract]`-style tags. Unlabeled checkboxes receive
 stable content hashes shown in job status. Checked/unchecked changes preserve
-the AC hash; contract edits invalidate it, including indented requirements in
-separate paragraphs within a criterion. Every AC must occur exactly once with
-passing evidence. Deployed acceptance needs applicable journey evidence bound to
-the observed target/version. Completion rechecks the merged PR, current ACs,
-tracker completion and serving deployment. A changed serving version requires
+the AC hash; contract edits invalidate it. For final completion, every AC must
+occur exactly once with passing evidence. Deployed acceptance needs applicable
+journey evidence bound to the observed target/version. Local reports omit deployment fields and use appropriate local test/code evidence against the merged source. Completion rechecks the
+merged PR, current ACs, tracker completion and serving deployment. A changed serving version requires
 fresh applicable evidence.
+
+Every `[human:label]` (or `[human]`) AC additionally requires evidence with
+`kind: "human"`, a nonempty `confirmedBy` naming the actual human, and a
+`reference` to that person's explicit confirmation. An agent must not fabricate
+this attestation; ordinary test evidence and existing checked boxes do not waive
+human acceptance. The validator checks the attestation structure, while the
+independent verifier owns its truth.
 
 The validator checks completeness and provenance bindings, not the semantic
 truth of observations. The independent verifier/repository tools still own
@@ -368,6 +409,9 @@ verified. Verified/cancelled jobs stop scheduling after their final Banyan
 projection is delivered. Banyan shows an independent workflow badge and offers
 **Close verified sessions**. Repository merge/deployment authorization remains
 in force throughout.
+Automatic tracker completion grants no verifier-dispatch, merge, deployment,
+runtime-configuration or external-messaging authority. It changes the former
+human-only Linear Done policy only for this validated managed closeout path.
 
 ## Development verification
 
@@ -391,3 +435,28 @@ recovery, dispatch budgets, local/deployed closeout and the exact owner-pause
 argv. They do not migrate live jobs, enable dispatch on the developer host or
 replace a running CLI. Banyan owns the companion UI and terminal close; its owner
 pause integration must observe the matching projected pause before closing.
+
+### Optional closeout coordination
+
+`workit job attention --format text` groups unfinished dependencies and shows the
+next action. `--format json` is available for clients. Paused jobs may refresh
+read-only PR facts; a newer merge never releases the saved hold.
+
+Independent verifier dispatch is opt-in in trusted configuration:
+
+```yaml
+lifecycle:
+  verifier:
+    enabled: true
+    agent: local-review  # a review-tagged entry in the trusted agent registry
+    concurrency: 1
+    maxAttempts: 2
+    timeoutSeconds: 300
+```
+
+Workit persists the verifier identity before launch, bounds simultaneous runs and
+attempts, and consumes its report through the normal source/AC/deployment gates.
+An unavailable fact reader retains the report for retry. A lost launch response
+requires inspected `job verifier-reconcile`; it never triggers blind replay.
+When dispatch is disabled, ordinary managed continuation remains available.
+These limits count dispatches and elapsed verifier time, not tokens or dollars.

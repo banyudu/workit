@@ -34,7 +34,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsx src/cli.ts",
-    "test": "tsx --test src/**/*.test.ts",
+    "test": "tsx --test src/*.test.ts src/gc/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run build",

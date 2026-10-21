@@ -20,6 +20,8 @@ class Adapter implements LifecycleAdapter {
   issue = { ...issue, state: "CLOSED" }; deploy: Deployment | undefined = deployment;
   plan: VerifierPlan = { enabled: true, agent: "fixture-review", command: "fixture-review", concurrency: 1, maxAttempts: 2, timeoutSeconds: 60 };
   async session(job: Job): Promise<Session> { this.sessions++; return { id: job.sessionID, status: "idle" }; }
+  async markInReview() {}
+  async markDone() { return false; }
   async project() { this.projections++; }
   async wake(_job: Job, id: string) { this.wakes.push(id); }
   async pr() { this.reads++; return this.snapshot; }
@@ -199,7 +201,7 @@ test("verifier-dispatch-bounds: disabled/unavailable dispatch, retry budgets and
     if (mode === "budget") store.update(job.id, current => { current.verifierAttempts = 2; }, at);
     if (["paused", "cancelled", "needs-you"].includes(mode)) checkpoint(store, job.id, { stage: mode as "paused", detail: "Owner decision" }, at);
     await run();
-    assert.equal(adapter.launches.length, 0); assert.equal(adapter.wakes.length, 0);
+    assert.equal(adapter.launches.length, 0); assert.equal(adapter.wakes.length, mode === "disabled" ? 1 : 0);
     if (mode !== "cancelled") assert.ok(attention(store.list()).items.some(item => item.nextAction.length > 10));
   }
   const { store, job, adapter, run } = fixture(t);
@@ -321,7 +323,7 @@ test("acceptance-scope-preserved: every explicit deployed criterion needs curren
   const value = report(job); value.deployment = deployment;
   value.criteria.forEach(item => { item.evidence = [{ kind: "journey", reference: "artifact://journey", observed: "Actual deployed behavior", deployment }]; });
   value.criteria.at(-1)!.evidence[0].deployment = { ...deployment, version: "stale-serving-version" };
-  assert.throws(() => validateReport(job, value, required, new Date(at.getTime() + 60_000)), /Every deployed AC/);
+  assert.throws(() => validateReport(job, value, required, new Date(at.getTime() + 60_000)), /journey evidence/);
   assert.throws(() => validateReport(job, { ...value, reviewer: { runID: "fixture-independent", independent: "yes" } }, required, new Date(at.getTime() + 60_000)), /independent reviewer/);
 });
 
@@ -401,4 +403,25 @@ test("blocker-grouping: stale serving bindings use the configured shared provena
   assert.deepEqual(view.items[0].jobIDs.sort(), [job.id, second.id].sort());
   assert.equal(adapter.launches.length, 0);
   assert.equal(adapter.wakes.length, 0);
+});
+
+
+test("transient fact failures retain valid evidence and never spend another verifier attempt", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  adapter.issue.state = "OPEN";
+  await run();
+  const verifier = store.get(job.id).verifier!;
+  handoff(verifier, report(job, verifier.id));
+  await run(new Date(at.getTime() + 120_000));
+  const valid = store.get(job.id).verification;
+  const reader = adapter.currentIssue.bind(adapter);
+  adapter.currentIssue = async () => { throw new Error("temporary outage"); };
+  const failed = await run(new Date(at.getTime() + 180_000));
+  assert.equal(failed[0].result, "verifier-facts-unavailable");
+  assert.equal(store.get(job.id).verifier!.state, "report-ready");
+  assert.deepEqual(store.get(job.id).verification, valid);
+  adapter.currentIssue = reader; adapter.issue.state = "CLOSED";
+  await run(new Date(at.getTime() + 240_000));
+  assert.equal(store.get(job.id).stage, "verified");
+  assert.equal(adapter.launches.length, 1);
 });

@@ -70,7 +70,20 @@ test("owner-pause-contract: exact argv guards revision/session, returns projecti
   assert.equal(invoke(["pause", job.id, "--detail", "Keep held"]).stage, "paused");
   assert.throws(() => invoke(["resume", job.id]));
   assert.deepEqual(store.get(job.id).wake, job.wake);
-  writeFileSync(ctl, '#!/usr/bin/env node\nconsole.log(JSON.stringify({ok:true}));\n', { mode: 0o700 });
+  writeFileSync(ctl, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "workflow" && args[1] === "set") {
+  fs.writeFileSync(process.env.PAUSE_PROJECTION_FILE, JSON.stringify(args));
+}
+const projected = JSON.parse(fs.readFileSync(process.env.PAUSE_PROJECTION_FILE, "utf8"));
+const value = flag => projected[projected.indexOf(flag) + 1];
+console.log(JSON.stringify(args[0] === "session" ? {workflowProtocol:1,sessions:[{
+  id:${JSON.stringify(job.sessionID)},cwd:${JSON.stringify(directory)},workflow:{owner:"workit",
+  jobID:${JSON.stringify(job.id)},revision:Number(value("--revision")),state:value("--state"),
+  wake:{id:${JSON.stringify(job.wake.id)},status:"uncertain"}}
+}]} : {ok:true}));
+`, { mode: 0o700 });
   const reconciled = invoke(["reconcile", job.id, "--delivery", "not-delivered", "--detail", "Inspected original conversation; no delivery"]);
   assert.equal(reconciled.stage, "paused");
   assert.equal(reconciled.nextWakeAt, undefined);

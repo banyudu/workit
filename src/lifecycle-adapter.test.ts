@@ -12,18 +12,38 @@ function fixture(t: { after: (fn: () => void) => void }) {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const cli = join(directory, "banyanctl");
   writeFileSync(cli, `#!/usr/bin/env node
-process.stdout.write(process.env.WORKIT_TEST_OUTPUT || "");
+if (process.env.WORKIT_TEST_OUTPUT_BYTES) {
+  process.stdout.write(JSON.stringify({ workflowProtocol: 1,
+    sessions: [{ id: 'fixture-session', detail: 'x'.repeat(Number(process.env.WORKIT_TEST_OUTPUT_BYTES)) }] }));
+} else process.stdout.write(process.env.WORKIT_TEST_OUTPUT || "");
 process.stderr.write(process.env.WORKIT_TEST_STDERR || "");
 if (process.env.WORKIT_TEST_SIGNAL) process.kill(process.pid, "SIGTERM");
 else if (process.env.WORKIT_TEST_HANG) setInterval(() => {}, 1000);
-else process.exit(Number(process.env.WORKIT_TEST_EXIT || 0));
+else process.exitCode = Number(process.env.WORKIT_TEST_EXIT || 0);
 `, { mode: 0o700 });
   const run = (output: unknown, env = {}, args = ["workflow", "wake"]) => commandJSON([cli, ...args], directory, {
     WORKIT_TEST_OUTPUT: JSON.stringify(output), WORKIT_TEST_STDERR: "", WORKIT_TEST_EXIT: "0",
-    WORKIT_TEST_SIGNAL: "", WORKIT_TEST_HANG: "", ...env,
+    WORKIT_TEST_SIGNAL: "", WORKIT_TEST_HANG: "", WORKIT_TEST_OUTPUT_BYTES: "", ...env,
   });
   return { directory, run };
 }
+
+test("session inventories larger than 4 MiB remain readable", async t => {
+  const { run } = fixture(t);
+  const bytes = 5 * 1024 * 1024;
+  const result = await run(null, { WORKIT_TEST_OUTPUT_BYTES: String(bytes) }, ["session", "list"]) as {
+    workflowProtocol: number; sessions: Array<{ id: string; detail: string }>;
+  };
+  assert.equal(result.workflowProtocol, 1);
+  assert.equal(result.sessions[0].id, "fixture-session");
+  assert.equal(result.sessions[0].detail.length, bytes);
+});
+
+test("oversized JSON reports the buffer limit instead of an authentication error", async t => {
+  const { run } = fixture(t);
+  await assert.rejects(run(null, { WORKIT_TEST_OUTPUT_BYTES: String(33 * 1024 * 1024) }, ["session", "list"]),
+    /JSON output exceeded the 32 MiB buffer limit/);
+});
 
 test("commandJSON preserves structured workflow refusals on nonzero and zero exits", async t => {
   const { run } = fixture(t);

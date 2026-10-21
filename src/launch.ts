@@ -142,6 +142,7 @@ function runBanyan(
   issue: IssueDetails,
   worktree: WorktreeResult,
   sessionID?: string,
+  parentFallback = true,
   control?: { executable: string; quiet: boolean },
 ): void {
   const banyanctl = control?.executable ?? findBanyanctl();
@@ -152,11 +153,31 @@ function runBanyan(
     "--title-url", issue.url,
     "--cwd", worktree.path,
   ];
-  if (process.env.BANYAN_PARENT_SESSION_ID || process.env.BANYAN_SESSION_ID) {
-    args.push("--parent", process.env.BANYAN_PARENT_SESSION_ID ?? process.env.BANYAN_SESSION_ID!);
-  }
   if (command) args.push("--command", `cd ${shellQuote(worktree.path)} && ${command}`);
-  const result = spawnSync(banyanctl, args, { stdio: control?.quiet ? "pipe" : "inherit", timeout: 30_000 });
+  // A launch inside Banyan inherits its calling session unless an explicit
+  // override is set. Resolve it before clearing the child CLI's identity.
+  const parent = process.env.BANYAN_PARENT_SESSION_ID?.trim() || process.env.BANYAN_SESSION_ID?.trim();
+  const environment = { ...process.env };
+  delete environment.BANYAN_SESSION_ID;
+  delete environment.BANYAN_PARENT_SESSION_ID;
+  const invoke = (parentArgs: string[]) => spawnSync(banyanctl, [...args, ...parentArgs], {
+    env: environment, encoding: "utf8", stdio: [control?.quiet ? "ignore" : "inherit", "pipe", "pipe"], timeout: 30_000,
+  });
+  let result = invoke(parent ? ["--parent", parent] : ["--no-parent"]);
+  // A 400 missing-parent rejection happens before session creation. Retry only
+  // this confirmed failure, once, keeping the same session id and command.
+  if (parent && parentFallback && result.status === 64 &&
+      /^banyanctl: server returned HTTP 400\r?$/m.test(result.stderr ?? "")) {
+    let response;
+    try { response = JSON.parse(result.stdout); } catch { /* Preserve the original error. */ }
+    if (response?.ok === false && response.error?.code === "bad_request" &&
+        response.error.message === `No active parent session found for id '${parent}'`) {
+      console.warn(`workit: Banyan parent '${parent}' is inactive; launching a top-level session`);
+      result = invoke(["--no-parent"]);
+    }
+  }
+  if (!control?.quiet && result.stdout) process.stdout.write(result.stdout);
+  if (!control?.quiet && result.stderr) process.stderr.write(result.stderr);
   if (result.error) throw new Error(`Unable to launch Banyan: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`banyanctl exited with status ${result.status ?? "unknown"}`);
 }
@@ -189,7 +210,7 @@ child.on('exit',(code)=>finish(!timedOut&&code===0?'complete':'failed'));
 process.on('SIGTERM',stop);process.on('SIGINT',stop);`;
   const command = [process.execPath, "-e", runner, "--", headlessPromptCommand(plan.command, prompt), run.outcomePath, String(run.timeoutSeconds)].map(shellQuote).join(" ");
   runBanyan(command, { ...job.issue, identifier: run.id, title: "Independent managed verification" },
-    { path: job.worktree, branch: "", sourceBranch: "", resumed: false }, run.sessionID, { executable: banyanctl, quiet: true });
+    { path: job.worktree, branch: "", sourceBranch: "", resumed: false }, run.sessionID, true, { executable: banyanctl, quiet: true });
 }
 
 function runIterm(
@@ -243,6 +264,7 @@ export function launch(
   } else if (target === "iterm") {
     runIterm(command, worktree);
   } else {
-    runBanyan(command, issue, worktree, options.sessionID);
+    runBanyan(command, issue, worktree, options.sessionID,
+      options.parentFallback ?? resolved.config.launch?.parentFallback ?? true);
   }
 }
