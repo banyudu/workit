@@ -110,6 +110,7 @@ test("held-job-fact-refresh and authority-preserved: merge/conflict facts replac
     const before = store.get(job.id);
     await run();
     const refreshed = store.get(job.id);
+    assert.equal(refreshed.lastProgressAt, before.lastProgressAt, "fact refresh is not work progress");
     assert.equal(refreshed.stage, "needs-you"); assert.equal(refreshed.nextWakeAt, undefined);
     assert.equal(refreshed.sessionID, job.sessionID); assert.deepEqual(refreshed.wake, before.wake);
     assert.equal(refreshed.holdDetail, "Awaiting permission to merge");

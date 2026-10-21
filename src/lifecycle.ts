@@ -331,14 +331,14 @@ export class JobStore {
   acknowledgeProjection(job: Job): boolean {
     return this.call("cas", { expected: job.revision, job: { ...job, projectedRevision: job.revision } });
   }
-  update(id: string, change: (job: Job) => void, now = new Date()): Job {
+  update(id: string, change: (job: Job) => void, now = new Date(), options: { recordProgress?: boolean } = {}): Job {
     for (let attempt = 0; attempt < 10; attempt++) {
       const job = this.get(id);
       const expected = job.revision;
       const progress = (value: Job) => JSON.stringify([value.stage, value.detail, value.pr, value.mergeSha, value.observedSourceSha, value.deployment, value.verification, value.acHash]);
       const before = progress(job);
       change(job);
-      if (progress(job) !== before) job.lastProgressAt = now.toISOString();
+      if (options.recordProgress !== false && progress(job) !== before) job.lastProgressAt = now.toISOString();
       job.revision++;
       job.updatedAt = now.toISOString();
       if (this.call<boolean>("cas", { expected, job })) return job;

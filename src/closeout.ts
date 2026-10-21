@@ -89,7 +89,7 @@ export async function refreshHeldFacts(store: JobStore, adapter: LifecycleAdapte
         current.holdDetail ??= current.detail;
         current.detail = "Hold retained; the PR is not currently ready. Inspect its latest head and checks";
       }
-    }, now);
+    }, now, { recordProgress: false });
   } catch { return store.get(expected.id); }
 }
 

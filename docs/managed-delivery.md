@@ -472,6 +472,14 @@ until their next meaningful change. `generatedAt` means the local snapshot read
 time, not a fresh tracker or deployment observation. Clients must show truncation
 and keep previous results visibly stale if refresh fails.
 
+The optional `display` object adds a bounded `kind` and `label` for session-tree
+clients. `stopReason` preserves the sanitized original reason for a held job;
+`nextAction` distinguishes a tool failure or uncertain continuation from an
+actual owner decision. These fields are read-only presentation and never release
+holds or grant execution authority. Fact-only held-PR reconciliation does not
+advance `lastProgressAt`, including when its descriptive text or merge facts
+change. Previously recorded timestamps are retained, not retroactively rewritten.
+
 ## Investigation outcomes and named serving targets
 
 Implementation is the default delivery kind and still requires an authorized
