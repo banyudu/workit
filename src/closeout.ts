@@ -4,7 +4,7 @@ import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
+import { SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateReport,
   type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
@@ -221,6 +221,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
         save(current => { current.verifier!.state = "report-ready"; current.verification = checked.report; if (current.issue.backend === "linear") current.closeout ??= {}; });
         return wait("tracker-closeout", "owner", "Independent evidence passed; reconcile the issue checklist and completed state under repository policy", "tracker-state-change", "awaiting-tracker-closeout");
       } catch (error) {
+        if (error instanceof SourceProvenanceError) return wait("source-provenance", "external", "Repair the actual serving source/version binding before accepting evidence", "serving-provenance-repaired", "serving-binding-stale");
         if (error instanceof VerificationReadError) {
           return wait("runner-error", "system", "Current issue, PR or deployment facts are unavailable; retain this verifier report and retry the read", "fact-reader-recovered", "verifier-facts-unavailable");
         }

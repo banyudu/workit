@@ -1,10 +1,13 @@
-import { sha, type Job, type LifecycleAdapter } from "./lifecycle.js";
+import { SourceProvenanceError, sha, type Job, type LifecycleAdapter } from "./lifecycle.js";
 
 export const investigation = (job: Job): boolean => job.config.delivery === "investigation";
 export const verificationSource = (job: Job): string | undefined => investigation(job) ? job.observedSourceSha : job.mergeSha;
 export class VerificationReadError extends Error {}
 export async function observe<T>(read: () => Promise<T>): Promise<T> {
-  try { return await read(); } catch { throw new VerificationReadError("Current verification facts unavailable"); }
+  try { return await read(); } catch (error) {
+    if (error instanceof SourceProvenanceError) throw error;
+    throw new VerificationReadError("Current verification facts unavailable");
+  }
 }
 
 /** Both CLI and automatic verification establish the same source contract. */
