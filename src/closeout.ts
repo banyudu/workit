@@ -1,3 +1,4 @@
+import { QueueStore } from "./queue-store.js";
 import { assertVerificationSource, assertVerificationDeployment, investigation, verificationSource, VerificationReadError, observe } from "./verification-source.js";
 import { selectDeploymentTarget } from "./deployment-target.js";
 import { assertTracker } from "./tracker-policy.js";
@@ -171,7 +172,7 @@ function readArtifact(path: string): unknown {
 }
 
 /** Called only under the ordinary per-job heartbeat claim. No implementer replay. */
-export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date): Promise<string | undefined> {
+export async function coordinateVerification(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date, dispatchNow: () => Date = () => new Date()): Promise<string | undefined> {
   let job = expected;
   const save = (change: (current: Job) => void) => {
     job = store.update(job.id, current => {
@@ -264,6 +265,10 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   const claimed = store.reserveVerifier(job, reserved, plan.concurrency, plan.maxAttempts, now);
   if (!claimed) return wait("external-wait", "system", "Wait for a verifier capacity slot; concurrent claims cannot launch duplicates", "verifier-capacity", "verifier-capacity");
   job = claimed;
+  if (!new QueueStore(store).continuation(job, reserved.id, dispatchNow())) {
+    save(current => { delete current.verifier; current.verifierAttempts = Math.max(0, (current.verifierAttempts ?? 1) - 1); });
+    return wait("queue-bound", "owner", "Inspect queue status: pause, deadline, budget or concurrency prevents verifier dispatch", "queue-state-budget-or-capacity-change", "queue-bound");
+  }
   try { await adapter.launchVerifier(job, reserved, plan); }
   catch { return uncertain(); }
   save(current => { current.verifier!.state = "running"; current.verifier!.delivery = "delivered"; current.verifier!.startedAt = now.toISOString(); });

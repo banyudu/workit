@@ -1,3 +1,4 @@
+import { QueueStore } from "./queue-store.js";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
@@ -35,7 +36,7 @@ export interface LifecycleConfig {
   verifier?: { enabled?: boolean; agent?: string; concurrency?: number; maxAttempts?: number; timeoutSeconds?: number };
 }
 export interface Blocker {
-  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout";
+  reason: "owner-hold" | "acceptance-decision" | "external-wait" | "source-provenance" | "missing-verifier" | "runner-error" | "uncertain-delivery" | "tracker-closeout" | "queue-bound";
   owner: "owner" | "external" | "system" | "verifier";
   dependency?: string; observedAt: string; recheckTrigger: string; nextAction: string;
 }
@@ -48,6 +49,7 @@ export interface VerifierRun {
 export interface VerifierPlan { enabled: boolean; agent?: string; command?: string; concurrency: number; maxAttempts: number; timeoutSeconds: number }
 export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
+  queue?: { id: string; key: string; launchID: string; outcome?: string; deadline?: string };
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
   repoRoot: string; worktree: string; sessionID: string; githubRepo: string;
@@ -679,7 +681,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         if (settled) save(current => { current.inReview = true; });
       }
       if (job.stage === "verifying" && !job.wake && adapter.verifierPlan) {
-        const coordinated = await coordinateVerification(store, adapter, job, now);
+        const coordinated = await coordinateVerification(store, adapter, job, now, () => options.now ?? new Date());
         job = store.get(job.id);
         if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
       }
@@ -688,8 +690,29 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         results.push({ id: job.id, result: "unchanged" }); continue;
       }
       if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
-      if (!job.wake) save(current => { current.wake = { id: randomUUID(), reason, revision: current.revision + 1, counted: false }; });
+      const hadPendingWake = !!job.wake;
+      const wakeID = job.wake?.id ?? randomUUID();
+      if (!new QueueStore(store).continuation(job, wakeID, options.now ?? new Date())) {
+        save(current => {
+          current.blocker = { reason: "queue-bound", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "queue-state-budget-or-capacity-change",
+            nextAction: "Inspect queue status: its pause, deadline, continuation budget or concurrency prevents this dispatch" };
+          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
+        });
+        results.push({ id: job.id, result: "queue-bound" }); continue;
+      }
+      if (!job.wake) save(current => { current.wake = { id: wakeID, reason, revision: current.revision + 1, counted: false }; });
       await adapter.project(job);
+      // Projection can await another process. Recheck queue authority at the
+      // actual dispatch boundary, using the existing receipt without charging twice.
+      if (!new QueueStore(store).continuation(job, wakeID, options.now ?? new Date())) {
+        save(current => {
+          if (!hadPendingWake) delete current.wake;
+          current.blocker = { reason: "queue-bound", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "queue-state-budget-or-capacity-change",
+            nextAction: "Queue changed before delivery; inspect queue status before another dispatch" };
+          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
+        });
+        results.push({ id: job.id, result: "queue-bound" }); continue;
+      }
       await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;

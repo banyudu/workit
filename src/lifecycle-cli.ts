@@ -1,3 +1,5 @@
+import { advanceQueues, CommandQueueLauncher } from "./queue.js";
+import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
@@ -70,7 +72,9 @@ Local acceptance skips deployment checks and still requires complete independent
   const adapter = new BanyanLifecycleAdapter();
   if (args[0] === "tick") {
     const values = options(args.slice(1)); only(values, ["--job"]);
-    console.log(JSON.stringify(await tick(store, adapter, { jobID: values["--job"] })));
+    const launches = values["--job"] ? [] : await advanceQueues(store, adapter, new CommandQueueLauncher(dirname(store.path)));
+    const jobs = await tick(store, adapter, { jobID: values["--job"] });
+    console.log(JSON.stringify(launches.length ? { queues: launches, jobs } : jobs));
     return;
   }
   const [action, id, ...rest] = args.slice(1);
@@ -217,6 +221,7 @@ export function managedInstructions(job: Job): string[] {
   return [
     `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
     `You own managed workit job ${job.id} through verified issue completion, not just a PR. Banyan session: ${job.sessionID}.`,
+    ...(job.queue ? [`This issue belongs to explicit queue ${job.queue.id} (${job.queue.key}). Queue outcome: ${job.queue.outcome ?? "See queue status"}. Dispatch deadline: ${job.queue.deadline ?? "See queue status"}. Stay within this issue; the queue adds no merge, deployment or spending authority.`] : []),
     investigation(job) ? "Read repository instructions and current ACs. Investigate the pinned source and obtain independent evidence before closing the issue." : "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, then independently verify the applicable acceptance criteria.",
     ...verificationInstructions(job),
     "Do not create a native goal or scheduled task for this managed issue: workit owns continuation and its heartbeat. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",

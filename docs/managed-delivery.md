@@ -518,3 +518,96 @@ Correction reads the current trusted target configuration and clean worktree
 source, records an audit entry, and invalidates old reports/deployment bindings.
 Existing pauses, pending wake receipts and uncertain verifiers remain held.
 Changing delivery kind or target grants no new deployment or merge authority.
+
+## Explicit bounded issue queues
+
+A queue records an outcome and an ordered issue allowlist. It uses the existing
+heartbeat; it does not discover backlog issues or adopt existing jobs. Create a
+JSON plan with absolute repository paths (replace this portable example path):
+
+```json
+{
+  "title": "Finish the export workflow",
+  "outcome": "Export and retry issues independently verified",
+  "deadline": "2026-12-01T08:00:00+08:00",
+  "maxConcurrent": 2,
+  "maxStarts": 3,
+  "maxContinuations": 12,
+  "items": [
+    { "key": "export", "repo": "/path/to/project", "issue": "23", "provider": "github", "verification": "local" },
+    { "key": "retry", "repo": "/path/to/project", "issue": "24", "provider": "github", "dependsOn": ["export"], "verification": "local" }
+  ]
+}
+```
+
+Items may also select an `agent`, `delivery: "investigation"`, or a trusted
+`deploymentTarget`. Linear identifiers are supported with `provider: "linear"`;
+queue preflight requires the supported API's complete workflow/hold metadata.
+Profiles and current AC hashes are resolved at creation and checked again before
+launch. Changed ACs, completed issues and owner holds require inspection. The
+queue never releases a tracker hold automatically and skips the ordinary
+pre-launch Linear state transition; the launched agent follows current policy.
+
+```bash
+workit queue create /path/to/plan.json
+workit queue status QUEUE_ID
+workit queue start QUEUE_ID --expected-revision 0
+workit queue list
+workit queue pause QUEUE_ID --expected-revision CURRENT_REVISION
+workit queue cancel QUEUE_ID --expected-revision CURRENT_REVISION
+```
+
+Creation always saves a **paused** plan and prints its preview. Use the current
+revision from status for start/pause/cancel. A global `workit tick` advances active
+queues before ordinary jobs; `tick --job ID` does not start other issues. The host
+must remain awake with the existing heartbeat, Banyan, CLI runtime, repository
+paths and authentication available. This does not install another scheduler.
+
+`maxStarts` counts durable launch reservations, including uncertain/failed
+attempts. `maxContinuations` counts persisted automatic wake/verifier dispatch
+attempts across the queue, including conservative reservations whose delivery
+cannot be confirmed. Retrying the same wake receipt does not charge twice.
+`maxConcurrent` limits occupied queue issue slots, including uncertain launches
+and in-flight verifier work. Dependencies must be **verified**, not merely merged,
+closed, canceled or process-exited. Independent eligible items can proceed after
+an idle human-blocked job releases its slot; its owner hold remains intact.
+Explicit job resume must reacquire queue capacity before another dispatch.
+
+The deadline and pause/cancel prevent future model dispatches. They do not kill
+an already-running turn, revoke a dispatch already handed to another process,
+or prevent read-only fact/receipt checks and accepted-evidence reconciliation.
+These are dispatch/time bounds, **not token or dollar spending caps**. A runtime
+can perform multiple model calls or tools inside one turn. Manual agent work is
+outside the queue budget. Queue creation/start grants no new merge, deployment,
+external-message or provider-spending authority; repository policy still applies.
+
+A durable reservation exists before any launch. After a crash or lost response,
+status shows the item, launch ID and deterministic job/session identity. Workit
+never automatically replays an uncertain launch. Inspect the original session,
+job and local process before recording the observed outcome:
+
+```bash
+workit queue reconcile QUEUE_ID --item export --outcome delivered --reason "Observed the matching original session" --expected-revision CURRENT_REVISION
+workit queue reconcile QUEUE_ID --item export --outcome abandoned --reason "Confirmed no agent remains; do not retry this reservation" --expected-revision CURRENT_REVISION
+```
+
+`delivered` requires a matching durable job. `abandoned` stops further automatic
+continuation for that item and releases its slot; it does not kill an orphaned
+process or remove the job. Neither refunds budget nor silently retries. Existing
+jobs retain their identity; recover them explicitly rather than creating a second
+owner. A canceled/expired queue cannot be restarted with a fresh budget.
+
+A missing or closed conversation does not prove that its process stopped. Such
+items retain capacity conservatively. After inspecting process/session liveness,
+release a held or finished job's slot explicitly (pending wake or verifier
+receipts must first be reconciled through the existing job recovery commands):
+
+```bash
+workit queue release QUEUE_ID --item export --reason "Confirmed original agent and verifier stopped" --expected-revision CURRENT_REVISION
+```
+
+`queue status` shows verified, working, waiting, blocked, uncertain, dependency-
+blocked and remaining items, slot usage and remaining budgets. Launched jobs also
+appear in `job overview` and Banyan's Work sidebar. Queue runtime state stays in
+workit's native SQLite database alongside jobs; no session history or runtime
+state is written into shared agent instructions.
