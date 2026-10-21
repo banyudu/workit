@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acceptance, checkpoint, createJob, JobStore, validateReport, type LifecycleAdapter, type VerificationReport } from "./lifecycle.js";
+import { SourceProvenanceError, acceptance, checkpoint, createJob, JobStore, validateReport, type LifecycleAdapter, type VerificationReport } from "./lifecycle.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
-import { correctAcceptance } from "./closeout.js";
+import { coordinateVerification, correctAcceptance } from "./closeout.js";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
 
 const source = "a".repeat(40);
@@ -96,4 +96,17 @@ test("correcting an investigation target does not declare unfinished observation
     issue, new Date(), { deploymentTargets: targets });
   assert.equal(changed.stage, "investigating");
   assert.equal(changed.acceptanceHistory?.at(-1)?.priorSourceSha, source);
+});
+
+
+test("verifier coordination preserves named-target provenance errors for the attention view", async t => {
+  const { store, job, adapter } = fixture(t);
+  store.update(job.id, current => { current.stage = "verifying"; current.config.verification = "deployed"; current.config.deploymentProbe = ["probe"]; });
+  adapter.verifierPlan = async () => ({ enabled: true, command: "fixture", agent: "fixture", concurrency: 1, maxAttempts: 1, timeoutSeconds: 60 });
+  adapter.launchVerifier = async () => { throw new Error("Must not launch with invalid provenance"); };
+  adapter.deployment = async () => { throw new SourceProvenanceError("Wrong target"); };
+  const result = await coordinateVerification(store, adapter, store.get(job.id), new Date());
+  assert.equal(result, "serving-binding-stale");
+  assert.equal(store.get(job.id).blocker?.reason, "source-provenance");
+  assert.equal(store.get(job.id).blocker?.owner, "external");
 });
