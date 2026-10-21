@@ -4,6 +4,7 @@ import { QueueStore } from "./queue-store.js";
 import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { groupCLI } from "./group-cli.js";
 import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
 import { JobStore, createJob, parseVerificationMode, parseDeliveryKind } from "./lifecycle.js";
 import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
@@ -42,6 +43,7 @@ Usage:
   workit [options] <issue> [issue ...]
   workit run [--tag <tag>] [--agent <name>] [--workdir <dir>] [--here] <prompt words...>
   workit sync [--check]
+  workit group create|status|inbox|accept|start|pause|finish (see workit group --help)
   workit queue create|list|status|start|pause|cancel|reconcile (see workit queue --help)
   workit tick [--job ID]
   workit job list|status|checkpoint|pause|resume|cancel|verify (see workit job --help)
@@ -516,6 +518,7 @@ function configProvider(options: CliOptions, configured: ProviderMode | undefine
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "group") { await groupCLI(process.argv.slice(3)); return; }
   if (process.argv[2] === "queue") { await queueCLI(process.argv.slice(3)); return; }
   if (["tick", "job", "heartbeat"].includes(process.argv[2])) {
     await lifecycleCLI(process.argv.slice(2));

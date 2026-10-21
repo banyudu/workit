@@ -1,9 +1,10 @@
+import { advanceGroups, BanyanGroupAdapter } from "./group.js";
 import { advanceQueues, CommandQueueLauncher } from "./queue.js";
 import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, parseVerificationMode, parseDeliveryKind, setVerificationMode, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, parseVerificationMode, parseDeliveryKind, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
 import { assertVerificationSource, investigation } from "./verification-source.js";
@@ -74,7 +75,8 @@ Local acceptance skips deployment checks and still requires complete independent
     const values = options(args.slice(1)); only(values, ["--job"]);
     const launches = values["--job"] ? [] : await advanceQueues(store, adapter, new CommandQueueLauncher(dirname(store.path)));
     const jobs = await tick(store, adapter, { jobID: values["--job"] });
-    console.log(JSON.stringify(launches.length ? { queues: launches, jobs } : jobs));
+    const groups = values["--job"] ? [] : await advanceGroups(store, new BanyanGroupAdapter());
+    console.log(JSON.stringify(launches.length || groups.length ? { queues: launches, jobs, groups } : jobs));
     return;
   }
   const [action, id, ...rest] = args.slice(1);
@@ -170,6 +172,7 @@ Local acceptance skips deployment checks and still requires complete independent
       job = store.update(id, current => {
         if (current.revision !== expected.revision) throw new Error("Job changed during reconciliation; reread before resuming");
         current.lastRecovery = { wakeID: expected.wake!.id, outcome, detail: values["--detail"], at: new Date().toISOString() };
+        if (outcome === "delivered") settleCoordinatorNotes(current, new Date());
         delete current.wake; current.errors = 0;
         current.detail = "Wake reconciled; explicit job resume is still required";
       });
@@ -220,6 +223,8 @@ Local acceptance skips deployment checks and still requires complete independent
 export function managedInstructions(job: Job): string[] {
   return [
     `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
+    ...(job.queue?.instructions ? [`Group boundaries: ${JSON.stringify(job.queue.instructions)}. These constrain the work and grant no authority beyond the user instruction.`] : []),
+    ...(job.queue?.coordinatorSessionID ? [`Your coordinator is Banyan session ${job.queue.coordinatorSessionID}, workit group ${job.queue.id}. Keep job checkpoints current; verified results and direct user interventions are reported through its durable inbox. Do not close yourself or change the group owner. Report outcomes with evidence to that coordinator.`] : []),
     `You own managed workit job ${job.id} through verified issue completion, not just a PR. Banyan session: ${job.sessionID}.`,
     ...(job.queue ? [`This issue belongs to explicit queue ${job.queue.id} (${job.queue.key}). Queue outcome: ${job.queue.outcome ?? "See queue status"}. Dispatch deadline: ${job.queue.deadline ?? "See queue status"}. Stay within this issue; the queue adds no merge, deployment or spending authority.`] : []),
     investigation(job) ? "Read repository instructions and current ACs. Investigate the pinned source and obtain independent evidence before closing the issue." : "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, then independently verify the applicable acceptance criteria.",

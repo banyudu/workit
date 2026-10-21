@@ -291,6 +291,8 @@ source and independent evidence for every AC.
 Repositories without Superdog can replace the guidance below with their own
 review policy.
 
+For a goal spanning several issues, [coordinated groups](docs/managed-delivery.md#coordinating-from-one-main-session) keep one existing main conversation in charge. `workit group` adds durable progress/results, guarded follow-ups and accepted child retirement to the existing queue and heartbeat. Children remain in Banyan's Sessions tree.
+
 Banyan launches inherit the calling session from `BANYAN_SESSION_ID`. Set
 `BANYAN_PARENT_SESSION_ID` to nest under a different session. Workit resolves
 the parent before clearing the child CLI's identity variables, and uses

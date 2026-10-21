@@ -144,7 +144,7 @@ function runBanyan(
   worktree: WorktreeResult,
   sessionID?: string,
   parentFallback = true,
-  control?: { executable: string; quiet: boolean },
+  control?: { executable: string; quiet: boolean; parent?: string },
 ): void {
   const banyanctl = control?.executable ?? findBanyanctl();
   const args = [
@@ -157,7 +157,7 @@ function runBanyan(
   if (command) args.push("--command", `cd ${shellQuote(worktree.path)} && ${command}`);
   // A launch inside Banyan inherits its calling session unless an explicit
   // override is set. Resolve it before clearing the child CLI's identity.
-  const parent = process.env.BANYAN_PARENT_SESSION_ID?.trim() || process.env.BANYAN_SESSION_ID?.trim();
+  const parent = control?.parent ?? (process.env.BANYAN_PARENT_SESSION_ID?.trim() || process.env.BANYAN_SESSION_ID?.trim());
   const environment = { ...process.env };
   delete environment.BANYAN_SESSION_ID;
   delete environment.BANYAN_PARENT_SESSION_ID;
@@ -211,7 +211,13 @@ child.on('exit',(code)=>finish(!timedOut&&code===0?'complete':'failed'));
 process.on('SIGTERM',stop);process.on('SIGINT',stop);`;
   const command = [process.execPath, "-e", runner, "--", headlessPromptCommand(plan.command, prompt), run.outcomePath, String(run.timeoutSeconds)].map(shellQuote).join(" ");
   runBanyan(command, { ...job.issue, identifier: run.id, title: "Independent managed verification" },
-    { path: job.worktree, branch: "", sourceBranch: "", resumed: false }, run.sessionID, true, { executable: banyanctl, quiet: true });
+    { path: job.worktree, branch: "", sourceBranch: "", resumed: false }, run.sessionID, !job.queue?.coordinatorSessionID, { executable: banyanctl, quiet: true, parent: job.queue?.coordinatorSessionID });
+  if (job.queue?.coordinatorSessionID) {
+    const result = spawnSync(banyanctl, ["coordination", "helper", "--id", run.sessionID, "--parent", job.queue.coordinatorSessionID,
+      "--group-id", job.queue.id, "--worker", job.sessionID, "--run-id", run.id, "--job-id", job.id],
+      { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
+    if (result.error || result.status !== 0) throw new Error("Verifier launched but group ownership was not confirmed; inspect the original run");
+  }
 }
 
 function runIterm(

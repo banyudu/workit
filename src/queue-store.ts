@@ -11,6 +11,8 @@ export interface QueueItem {
   launchID?: string; slot?: boolean; reservedAt?: string; recovery?: { reason: string; at: string };
 }
 export interface WorkQueue {
+  coordinator?: { sessionID: string };
+  instructions?: string;
   schema: 1; id: string; revision: number; title: string; outcome: string;
   state: "paused" | "active" | "cancelled"; createdAt: string; deadline: string;
   maxConcurrent: number; maxStarts: number; maxContinuations: number;
@@ -74,6 +76,8 @@ with sqlite3.connect(db, timeout=10) as c:
             if cfg.get("delivery","implementation")!=i["delivery"] or cfg["verification"]!=i["verification"] or cfg.get("deploymentTarget")!=i.get("deploymentTarget"): raise ValueError("Launch acceptance differs from queue plan")
             if i.get("agent") and j["agent"]!=i["agent"]: raise ValueError("Launch agent differs from queue plan")
             j["queue"]={"id":q["id"],"key":i["key"],"launchID":r["token"],"outcome":q["outcome"],"deadline":q["deadline"]}
+            if q.get("coordinator"): j["queue"]["coordinatorSessionID"]=q["coordinator"]["sessionID"]
+            if q.get("instructions"): j["queue"]["instructions"]=q["instructions"]
             c.execute("INSERT INTO jobs VALUES (?,?,?)",(j["id"],j["revision"],json.dumps(j)))
             i["state"]="launching"; save(q); result=j
         elif op in ["confirm","uncertain","release","settle","reconcile","continuation"]:

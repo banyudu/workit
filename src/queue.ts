@@ -1,3 +1,4 @@
+import { BanyanGroupAdapter } from "./group.js";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
@@ -9,6 +10,8 @@ import type { TrackerIssue } from "./issue.js";
 import type { IssueDetails } from "./types.js";
 
 export interface QueueManifest {
+  coordinator?: { sessionID: string };
+  instructions?: string;
   title: string; outcome: string; deadline: string;
   maxConcurrent: number; maxStarts: number; maxContinuations: number;
   items: Array<{ key: string; repo: string; issue: string; provider?: "github" | "linear"; dependsOn?: string[];
@@ -29,6 +32,8 @@ export function assertQueueIssue(issue: TrackerIssue): void {
 export async function prepareQueue(value: unknown, resolveItem: (item: QueueManifest["items"][number]) => Promise<ResolvedItem>, command: string[], now = new Date()): Promise<WorkQueue> {
   const m = value as QueueManifest;
   if (!m || !text(m.title, 200) || !text(m.outcome) || !text(m.deadline) || !Number.isFinite(Date.parse(m.deadline)) || Date.parse(m.deadline) <= now.getTime()) throw new Error("Queue needs a title, outcome and future deadline");
+  if (m.instructions !== undefined && !text(m.instructions, 8000)) throw new Error("Group instructions must be bounded non-empty text");
+  if (m.coordinator && (!text(m.coordinator.sessionID, 128) || !/^[A-Za-z0-9_.-]+$/.test(m.coordinator.sessionID))) throw new Error("Coordinator requires an explicit Banyan session ID");
   for (const [key, max] of [["maxConcurrent", 16], ["maxStarts", 1000], ["maxContinuations", 10000]] as const) {
     if (!Number.isSafeInteger(m[key]) || m[key] < 1 || m[key] > max) throw new Error(`${key} must be a finite integer from 1 to ${max}`);
   }
@@ -65,16 +70,18 @@ export async function prepareQueue(value: unknown, resolveItem: (item: QueueMani
       deploymentTarget: resolved.deploymentTarget, state: "pending" });
   }
   return { schema: 1, id: "queue-" + randomUUID(), revision: 0, title: m.title.trim(), outcome: m.outcome.trim(),
-    state: "paused", createdAt: now.toISOString(), deadline: new Date(m.deadline).toISOString(), maxConcurrent: m.maxConcurrent,
+    state: "paused", instructions: m.instructions, coordinator: m.coordinator ? { sessionID: m.coordinator.sessionID } : undefined, createdAt: now.toISOString(), deadline: new Date(m.deadline).toISOString(), maxConcurrent: m.maxConcurrent,
     maxStarts: m.maxStarts, maxContinuations: m.maxContinuations, starts: 0, continuations: [], command, items };
 }
 
-export interface QueueLauncher { launch(queue: WorkQueue, item: QueueItem): Promise<void> }
+export interface QueueLauncher { preflight?(queue: WorkQueue): Promise<void>; launch(queue: WorkQueue, item: QueueItem): Promise<void> }
 export class CommandQueueLauncher implements QueueLauncher {
   constructor(private readonly stateDirectory: string) {}
+  async preflight(queue: WorkQueue): Promise<void> { if (queue.coordinator) await new BanyanGroupAdapter().bind(queue); }
   async launch(queue: WorkQueue, item: QueueItem): Promise<void> {
     const args = [...queue.command.slice(1), "--managed", "--banyan", "--no-resolve", "--provider", item.provider,
       "--repo-path", item.repo, "--delivery", item.delivery, "--verification", item.verification];
+    if (queue.coordinator) args.push("--no-parent-fallback");
     if (item.agent) args.push("--agent", item.agent);
     if (item.deploymentTarget) args.push("--deployment-target", item.deploymentTarget);
     args.push(item.issue);
@@ -82,7 +89,7 @@ export class CommandQueueLauncher implements QueueLauncher {
       await promisify(execFile)(queue.command[0], args, { cwd: item.repo, timeout: 120_000, maxBuffer: 1024 * 1024,
         env: { ...process.env, WORKIT_STATE_DIR: this.stateDirectory, WORKIT_QUEUE_ID: queue.id, WORKIT_QUEUE_LAUNCH_ID: item.launchID,
           // The heartbeat is not a live parent conversation.
-          BANYAN_SESSION_ID: "", BANYAN_PARENT_SESSION_ID: "" } });
+          BANYAN_SESSION_ID: "", BANYAN_PARENT_SESSION_ID: queue.coordinator?.sessionID ?? "", TMUX: "", TMUX_PANE: "" } });
     } catch { throw new Error("Queue launch outcome is uncertain; inspect its durable reservation and original session"); }
   }
 }
@@ -100,6 +107,10 @@ export async function advanceQueues(jobs: JobStore, adapter: LifecycleAdapter, l
         const session = await adapter.session(job);
         if (session?.status === "idle" && (!session.workflow || session.workflow.jobID === job.id && session.workflow.owner === "workit")) queues.release(queue.id, job.id, job.revision);
       } catch { /* Unknown liveness retains capacity conservatively. */ }
+    }
+    if (queue.coordinator && queue.state === "active") {
+      try { await launcher.preflight?.(queue); }
+      catch { results.push({ queueID: queue.id, key: "coordinator", result: "Original coordinator unavailable; no child was launched" }); continue; }
     }
     for (let count = 0; count < queue.items.length; count++) {
       const item = queues.reserve(queue.id, time());
@@ -128,7 +139,7 @@ export function queueStatus(queue: WorkQueue, jobs: JobStore, now = new Date()) 
       : job && ["needs-you", "paused", "cancelled"].includes(workGroup(job)) ? "blocked"
       : job ? workGroup(job) === "waiting" ? "waiting" : "working"
       : item.dependsOn.some(key => saved.get(queue.items.find(i => i.key === key)!.jobID)?.stage !== "verified") ? "dependency-blocked" : "remaining";
-    return { ...item, status, stage: job?.stage, detail: job?.detail, nextWakeAt: job?.nextWakeAt };
+    return { ...item, status, stage: job?.stage, detail: job?.detail, nextWakeAt: job?.nextWakeAt, coordinatorNotes: job?.coordinatorNotes };
   });
   return { ...queue, expired: Date.parse(queue.deadline) <= now.getTime(),
     budget: { startsRemaining: queue.maxStarts - queue.starts, continuationsRemaining: queue.maxContinuations - queue.continuations.length,

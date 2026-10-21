@@ -50,7 +50,8 @@ export interface VerifierRun {
 export interface VerifierPlan { enabled: boolean; agent?: string; command?: string; concurrency: number; maxAttempts: number; timeoutSeconds: number }
 export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
-  queue?: { id: string; key: string; launchID: string; outcome?: string; deadline?: string };
+  coordinatorNotes?: Array<{ id: string; text: string; at: string; deliveredAt?: string }>;
+  queue?: { id: string; key: string; launchID: string; outcome?: string; deadline?: string; coordinatorSessionID?: string; instructions?: string };
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
   repoRoot: string; worktree: string; sessionID: string; githubRepo: string;
@@ -65,7 +66,7 @@ export interface Job {
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
   // Older pending wakes already charged wakeups when they were reserved.
-  wake?: { id: string; reason: string; revision: number; counted?: boolean; delivery?: "not-delivered" };
+  wake?: { id: string; reason: string; revision: number; counted?: boolean; coordinatorNoteIDs?: string[]; delivery?: "not-delivered" };
   verification?: VerificationReport;
   closeout?: {
     checklist?: { before: string; after: string; issueID: string; teamID: string; changes?: ChecklistChange[] };
@@ -408,8 +409,9 @@ export function checkpoint(store: JobStore, id: string, patch: {
     delete job.blocker;
     if (["paused", "needs-you"].includes(job.stage)) job.holdDetail = patch.detail;
     delete job.fingerprint; delete job.claim;
-    // A hold must retain pending delivery evidence for inspected recovery.
-    if (runnableStage(job.stage)) delete job.wake;
+    // A checkpoint is not proof that a concurrent coordinator note arrived.
+    // Retain its identity until the original Banyan receipt is inspected.
+    if (runnableStage(job.stage) && !job.wake?.coordinatorNoteIDs?.length) delete job.wake;
     if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? 60) * 1000).toISOString();
     else delete job.nextWakeAt;
   }, now);
@@ -567,10 +569,18 @@ export function verificationInstructions(job: Job): string[] {
   ];
 }
 
+export function settleCoordinatorNotes(job: Job, now: Date): void {
+  const ids = new Set(job.wake?.coordinatorNoteIDs ?? []);
+  for (const note of job.coordinatorNotes ?? []) if (ids.has(note.id)) note.deliveredAt = now.toISOString();
+}
+
 function prompt(job: Job, reason: string): string {
   return [
+    job.queue?.instructions ? `Group boundaries: ${JSON.stringify(job.queue.instructions)}. These constrain the work and grant no authority beyond the user instruction.` : "",
     `Continue managed workit job ${job.id} for ${job.issue.url}. Reason: ${reason}.`,
     `Stage: ${job.stage}. Checkpoint: ${job.detail || "(none)"}.`,
+    ...(job.coordinatorNotes ?? []).filter(note => job.wake?.coordinatorNoteIDs?.includes(note.id)).map(note =>
+      `Coordinator follow-up ${note.id}: ${JSON.stringify(note.text)}. Apply within the existing issue scope and authorization. Check whether it was already acted on before repeating effects.`),
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
     job.verifier?.state === "report-ready" && job.verification
@@ -656,6 +666,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         if (receipt?.id === job.wake.id && receipt.status === "delivered") {
           save(current => {
             if (current.wake?.counted === false) current.wakeups++;
+            settleCoordinatorNotes(current, now);
             delete current.wake; delete current.blocker; current.errors = 0;
           });
           results.push({ id: job.id, result: "wake-reconciled" }); continue;
@@ -699,7 +710,9 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         }
         if (settled) save(current => { current.inReview = true; });
       }
-      if (job.stage === "verifying" && !job.wake && !readExistingVerifier && adapter.verifierPlan) {
+      const hasCoordinatorNote = job.coordinatorNotes?.some(note => !note.deliveredAt);
+      if (hasCoordinatorNote) { actionable = true; reason = "coordinator follow-up is pending"; }
+      if (job.stage === "verifying" && !job.wake && !hasCoordinatorNote && !readExistingVerifier && adapter.verifierPlan) {
         const coordinated = await coordinateVerification(store, adapter, job, now, () => options.now ?? new Date());
         job = store.get(job.id);
         if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
@@ -719,7 +732,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         });
         results.push({ id: job.id, result: "queue-bound" }); continue;
       }
-      if (!job.wake) save(current => { current.wake = { id: wakeID, reason, revision: current.revision + 1, counted: false }; });
+      if (!job.wake) save(current => { current.wake = { id: wakeID, reason, revision: current.revision + 1, counted: false, coordinatorNoteIDs: current.coordinatorNotes?.filter(note => !note.deliveredAt).map(note => note.id) }; });
       await adapter.project(job);
       // Projection can await another process. Recheck queue authority at the
       // actual dispatch boundary, using the existing receipt without charging twice.
@@ -735,6 +748,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;
+        settleCoordinatorNotes(current, now);
         delete current.wake; delete current.blocker; current.errors = 0;
         current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
       });

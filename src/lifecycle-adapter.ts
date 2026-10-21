@@ -33,7 +33,7 @@ export async function commandJSON(command: string[], cwd: string, extraEnv: Reco
       throw new Error(`${command[0]} JSON output exceeded the ${COMMAND_JSON_MAX_BUFFER / 1024 / 1024} MiB buffer limit`);
     }
     // A timeout/signal or HTTP 5xx remains a failure even if stdout contains a refusal.
-    if (command[1] === "workflow" && typeof failure.code === "number" && !failure.killed && !failure.signal &&
+    if (["workflow", "coordination"].includes(command[1]) && typeof failure.code === "number" && !failure.killed && !failure.signal &&
         !/\bHTTP 5\d\d\b/i.test(failure.stderr ?? "")) {
       let value: unknown;
       try { value = JSON.parse(failure.stdout ?? ""); } catch { /* genuine command failure */ }
@@ -44,7 +44,7 @@ export async function commandJSON(command: string[], cwd: string, extraEnv: Reco
   }
   let value: unknown;
   try { value = JSON.parse(stdout); } catch { throw new Error(`${basename(command[0])} did not return JSON`); }
-  const refusal = command[1] === "workflow" ? workflowRefusal(value) : undefined;
+  const refusal = ["workflow", "coordination"].includes(command[1]) ? workflowRefusal(value) : undefined;
   if (refusal) throw refusal;
   return value;
 }

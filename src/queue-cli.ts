@@ -1,3 +1,4 @@
+import { BanyanGroupAdapter } from "./group.js";
 import { readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { chooseAgent } from "./agents.js";
@@ -9,7 +10,7 @@ import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js
 import { assertQueueIssue, prepareQueue, queueStatus } from "./queue.js";
 import { QueueStore } from "./queue-store.js";
 
-export async function queueCLI(args: string[]): Promise<void> {
+export async function queueCLI(args: string[], coordinated = false): Promise<void> {
   if (!args.length || args.includes("--help")) {
     console.log(`workit queue create MANIFEST.json
 workit queue list
@@ -26,7 +27,9 @@ Inspect uncertain launches before reconciliation. They never replay automaticall
   const jobs = new JobStore(), queues = new QueueStore(jobs);
   const [action, id, ...rest] = args;
   if (action === "create" && id && !rest.length) {
-    const queue = await prepareQueue(JSON.parse(readFileSync(resolve(id), "utf8")), async item => {
+    const manifest = JSON.parse(readFileSync(resolve(id), "utf8"));
+    if (coordinated && !manifest.coordinator?.sessionID) throw new Error("Group manifest requires coordinator.sessionID (the current main session)");
+    const queue = await prepareQueue(manifest, async item => {
       const repo = realpathSync(repositoryRoot(item.repo)), remote = originRemote(repo);
       const resolved = resolveConfig(repo, { remote });
       const provider = inferBackend(item.issue, item.provider ?? resolved.config.provider);
@@ -43,6 +46,7 @@ Inspect uncertain launches before reconciliation. They never replay automaticall
       const agent = item.agent ? chooseAgent(resolved.config, item.agent, undefined, resolved.aliasIndex).name : undefined;
       return { repo, issue, delivery, verification, deploymentTarget, agent };
     }, [process.execPath, ...process.execArgv, resolve(process.argv[1])]);
+    if (queue.coordinator) await new BanyanGroupAdapter().requireOwner(queue);
     console.log(JSON.stringify(queueStatus(queues.create(queue), jobs), null, 2)); return;
   }
   if (action === "list" && !id) { console.log(JSON.stringify(queues.list().map(queue => queueStatus(queue, jobs)), null, 2)); return; }
@@ -58,6 +62,10 @@ Inspect uncertain launches before reconciliation. They never replay automaticall
   const revision = Number(values["--expected-revision"]);
   if (["start", "pause", "cancel"].includes(action)) {
     const state = action === "start" ? "active" : action === "pause" ? "paused" : "cancelled";
+    const queue = queues.get(id);
+    if (coordinated && !queue.coordinator) throw new Error("Use queue commands for an uncoordinated queue");
+    if (queue.coordinator) await new BanyanGroupAdapter().requireOwner(queue);
+    if (state === "active" && queue.coordinator) await new BanyanGroupAdapter().bind(queue);
     console.log(JSON.stringify(queueStatus(queues.control(id, state, revision), jobs), null, 2)); return;
   }
   if (action === "release") {

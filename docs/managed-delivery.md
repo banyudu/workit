@@ -654,3 +654,77 @@ and becomes `needs-you` until the original session is recovered. Explicit job or
 Banyan workflow holds take precedence. Every worker handoff still passes the
 ordinary liveness, delivery-receipt, wake-budget and queue pause/deadline/budget
 checks.
+
+## Coordinating from one main session
+
+A coordinated group adds an owner conversation and durable inbox to the existing
+bounded queue. Its workers and independent verification sessions appear under
+that main session in Banyan's existing Sessions tree. Native subagents remain a
+useful choice for short investigation or review; managed issue workers provide
+separate worktrees and recoverable delivery across turns and runtimes.
+
+Use `banyanctl session current` inside the main conversation to resolve its exact
+identity. Add these fields to the queue manifest above:
+
+```json
+{
+  "coordinator": { "sessionID": "CURRENT_MAIN_SESSION_ID" },
+  "instructions": "Keep the existing UI. Implement both issues, but do not merge the second."
+}
+```
+
+Persist the group's restrictions and agreed shipping scope in `instructions`;
+children do not inherit the owner's conversation. The instructions accompany
+both the first launch and managed continuations. Resolve verification profiles
+from the actual ACs and use a future deadline. Then run:
+
+```bash
+workit group create /absolute/plan.json
+workit group start GROUP_ID --expected-revision CURRENT_REVISION
+workit group status GROUP_ID
+workit group inbox GROUP_ID
+workit group tell GROUP_ID --item retry --text 'Inspect the retry race before shipping'
+```
+
+Creation, controls, follow-ups and acceptance run from the saved main session.
+Background launches preserve that parent explicitly; missing ownership stops the
+launch instead of creating unrelated top-level conversations. Ordinary queues
+and single-issue work retain their existing behavior. Existing jobs are not
+silently adopted or relaunched.
+
+The existing heartbeat records meaningful progress, current verified results
+and direct user submissions to children. It notifies the original owner through
+a guarded, durable receipt when the owner is available. Busy turns, drafts and
+human prompts retain the notification for later. Owner notifications share the
+queue's continuation budget. Lost responses are reconciled against Banyan's
+receipt; ambiguous delivery is retained for inspection, never blindly replayed.
+
+The main agent reads evidence and updates the main conversation. The user may
+still open and talk to any child; new input invalidates earlier acceptance for
+cleanup. To accept an inspected current result:
+
+```bash
+workit group accept GROUP_ID --message RESULT_MESSAGE_ID --reason 'Inspected current independent AC evidence and direct user input'
+```
+
+The heartbeat then retires the quiet original worker and its completed verifier
+helpers into Banyan history. Selected, busy, held, changed, unobserved or uncertain
+sessions stay open. Cleanup refusals appear on the accepted message's `error`
+field in status/inbox. Helper input requires explicit inspection before cleanup;
+workit does not automatically acknowledge it. Transcripts, evidence and worktrees
+are preserved, and the main session stays open.
+
+```bash
+workit group pause GROUP_ID --expected-revision CURRENT_REVISION
+workit group cancel GROUP_ID --expected-revision CURRENT_REVISION
+workit group reconcile GROUP_ID --message MESSAGE_ID --outcome delivered --reason 'Inspected the original conversation and receipt'
+workit group finish GROUP_ID
+```
+
+Pause/cancel prevent future dispatch and retirement; a turn already running can
+finish. A follow-up does not release a job hold. Reconcile only after inspecting
+an uncertain owner notification; use `queue reconcile` for uncertain launches.
+Finish requires current accepted and retired results for every item, then releases
+the main session to coordinate a later group. The Mac must remain awake with
+Banyan, authentication and the existing heartbeat available. This adds neither
+a scheduler nor a replacement sidebar.

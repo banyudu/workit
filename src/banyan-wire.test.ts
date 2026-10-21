@@ -44,7 +44,7 @@ test("compiled Banyan CLI preserves capabilities, workflow metadata and authenti
       if (!workflow || workflow.jobID !== body.jobID || workflow.revision !== Number(body.revision) ||
           workflow.wake?.id !== body.wakeID) {
         response.writeHead(409, { "content-type": "application/json" });
-        response.end(JSON.stringify({ data: { ok: false, error: { code: "workflow_refused", message: "matching receipt required" } } }));
+        response.end(JSON.stringify({ ok: false, error: { code: "workflow_refused", message: "matching receipt required" } }));
         return;
       }
       if (body.outcome === "delivered") workflow.wake.status = "delivered";
@@ -52,7 +52,7 @@ test("compiled Banyan CLI preserves capabilities, workflow metadata and authenti
     }
     response.writeHead(200, { "content-type": "application/json" });
     const matches = !url.searchParams.has("id") || url.searchParams.get("id") === session.id;
-    response.end(JSON.stringify({ data: url.pathname === "/list" ? { workflowProtocol: 1, sessions: matches ? [session] : [] } : { ok: true } }));
+    response.end(JSON.stringify({ ok: true, data: url.pathname === "/list" ? { workflowProtocol: 1, sessions: matches ? [session] : [] } : { ok: true } }));
   });
   t.after(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }));
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
