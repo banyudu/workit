@@ -141,3 +141,41 @@ fs.writeFileSync(reportPath,JSON.stringify({jobID,issueURL,acHash,mergeSha,check
     assert.doesNotMatch(text, /Persistent goal \(Codex only\)/);
   }
 });
+
+test("managed investigation CLI pins observed source and verifies without any PR lookup", async t => {
+  const { directory, read, store } = fixture(t);
+  const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: "pipe" });
+  git(directory, ["init", "-b", "main"]);
+  writeFileSync(join(directory, ".workit.yml"), JSON.stringify({ codingAgents: null, provider: "github", default: "fixture",
+    agents: { fixture: { command: "fixture-implementer", weight: 1 } },
+    launch: { target: "banyan", logFile: join(directory, "launch.log") },
+    worktree: { copyEnv: false, baseBranch: "main" }, lifecycle: { verification: "deployed",
+      deploymentTargets: { backup: { probe: ["fixture-probe"], environment: "lab", target: "backup" } } } }));
+  git(directory, ["add", ".workit.yml"]);
+  const commit = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit"];
+  git(directory, [...commit, "-m", "fixture source"]);
+  git(directory, ["remote", "add", "origin", "https://github.com/example/project.git"]);
+  execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), fileURLToPath(new URL("./cli.ts", import.meta.url)),
+    "--managed", "--delivery", "investigation", "--deployment-target", "backup", "--verification", "local", "--agent", "fixture", "--none", "23"],
+    { cwd: directory, stdio: "pipe", env: process.env });
+  const job = store.list()[0];
+  const command = read().calls.find((call: string[]) => call[1] === "session" && call[2] === "new");
+  const promptFile = command[command.indexOf("--command") + 1].match(/cat '([^']+)'/)[1];
+  t.after(() => rmSync(promptFile, { force: true }));
+  const prompt = readFileSync(promptFile, "utf8");
+  assert.doesNotMatch(prompt, /Superdog|commit and push|create_goal/);
+  assert.match(prompt, /Investigate the pinned source/);
+  assert.equal(job.config.delivery, "investigation"); assert.equal(job.config.deploymentTarget, "backup");
+  assert.equal(job.observedSourceSha, git(job.worktree, ["rev-parse", "HEAD"]).toString().trim());
+  store.update(job.id, current => { current.stage = "verifying"; });
+  const value = { jobID: job.id, issueURL: issue.url, acHash: job.acHash, sourceSha: job.observedSourceSha, checkedAt: new Date().toISOString(),
+    reviewer: { runID: "independent-investigator", independent: true }, criteria: job.acLabels.map(label => ({ label, status: "pass", evidence: [{ kind: "test", reference: "artifact://investigation", observed: "Finding reproduced" }] })) };
+  const path = join(directory, "report.json"); writeFileSync(path, JSON.stringify(value));
+  t.mock.method(console, "log", () => {});
+  await lifecycleCLI(["job", "verify", job.id, "--report", path]);
+  assert.equal(store.get(job.id).stage, "verified");
+  assert.ok(read().calls.every((call: string[]) => !(call[0] === "gh" && call[1] === "pr")));
+  git(job.worktree, [...commit, "--allow-empty", "-m", "changed observation"]);
+  await assert.rejects(lifecycleCLI(["job", "closeout", job.id]), /Investigation source changed/);
+  assert.equal(store.get(job.id).stage, "verifying");
+});

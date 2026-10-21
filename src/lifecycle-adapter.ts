@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { verificationSource } from "./verification-source.js";
+import { selectDeploymentTarget } from "./deployment-target.js";
 import { basename } from "node:path";
 import { fetchIssue, fetchLinearCloseoutIssue, updateLinearCloseoutIssue, markLinearIssueDone, markLinearIssueInReview } from "./issue.js";
 import { agentDefinitionsByTag, resolveConfig } from "./config.js";
@@ -126,22 +128,33 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
       checks: pending ? "pending" : failed ? "fail" : "pass",
       ready: value.state === "OPEN" && !pending && !failed && value.mergeStateStatus === "CLEAN" && value.reviewDecision !== "CHANGES_REQUESTED" };
   }
+  async observedSource(job: Pick<Job, "worktree">): Promise<string> {
+    await exec("git", ["diff", "--quiet", "HEAD", "--"], { cwd: job.worktree, timeout: 10_000 });
+    const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: job.worktree, timeout: 10_000 });
+    if (!sha(stdout.trim())) throw new Error("Observed source must be a full commit SHA");
+    return stdout.trim();
+  }
+  trustedTarget(job: Job, name: string) {
+    return selectDeploymentTarget(resolveConfig(job.repoRoot, { remote: originRemote(job.repoRoot) }).config.lifecycle ?? {}, name);
+  }
   async deployment(job: Job): Promise<Deployment | undefined> {
     const command = job.config.deploymentProbe;
     if (!command?.length) throw new Error("Configure a read-only lifecycle.deploymentProbe");
     const value = await commandJSON(command, job.repoRoot, {
-      WORKIT_JOB_ID: job.id, WORKIT_ISSUE_URL: job.issue.url, WORKIT_MERGE_SHA: job.mergeSha ?? "",
+      WORKIT_JOB_ID: job.id, WORKIT_ISSUE_URL: job.issue.url, WORKIT_MERGE_SHA: job.mergeSha ?? "", WORKIT_SOURCE_SHA: verificationSource(job) ?? "", WORKIT_DEPLOYMENT_TARGET: job.config.deploymentTarget ?? "",
     }) as Partial<Deployment> & { ready?: boolean };
     if (value?.ready === false) return undefined;
     if (!value || value.ready !== true || !sha(value.sourceSha) ||
         typeof value.environment !== "string" || !value.environment.trim() || typeof value.target !== "string" || !value.target.trim() || typeof value.version !== "string" || !value.version.trim()) {
       throw new SourceProvenanceError("Deployment probe needs ready, environment, target, full sourceSha and version");
     }
+    if (job.config.deploymentBinding && (value.environment !== job.config.deploymentBinding.environment || value.target !== job.config.deploymentBinding.target)) throw new SourceProvenanceError("Deployment probe returned a different named target or environment");
     return { environment: value.environment, target: value.target, sourceSha: value.sourceSha, version: value.version };
   }
   async containsMerge(job: Job, sourceSha: string): Promise<boolean> {
-    if (!sha(job.mergeSha) || !sha(sourceSha)) return false;
-    const value = await commandJSON(["gh", "api", `repos/${job.githubRepo}/compare/${job.mergeSha}...${sourceSha}`], job.repoRoot) as { status?: string };
+    const source = verificationSource(job);
+    if (!sha(source) || !sha(sourceSha)) return false;
+    const value = await commandJSON(["gh", "api", `repos/${job.githubRepo}/compare/${source}...${sourceSha}`], job.repoRoot) as { status?: string };
     return value.status === "identical" || value.status === "ahead";
   }
   async verifierPlan(job: Job): Promise<VerifierPlan> {

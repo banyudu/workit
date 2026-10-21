@@ -4,11 +4,14 @@ import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IssueDetails } from "./types.js";
+import { selectDeploymentTarget, type DeploymentTarget } from "./deployment-target.js";
+import { assertVerificationSource, investigation, verificationSource } from "./verification-source.js";
 import { coordinateVerification, refreshHeldFacts } from "./closeout.js";
 
-export const stages = ["implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
+export const stages = ["investigating", "implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
 export type Stage = typeof stages[number];
+export type DeliveryKind = "implementation" | "investigation";
 export type VerificationMode = "deployed" | "local";
 export interface Deployment {
   environment: string; target: string; sourceSha: string; version: string;
@@ -16,6 +19,10 @@ export interface Deployment {
 export interface LifecycleConfig {
   /** Preserve an issue's explicit human-only closeout authorization. */
   trackerCompletion?: "human" | "automatic";
+  delivery?: DeliveryKind;
+  deploymentTarget?: string;
+  deploymentTargets?: Record<string, DeploymentTarget>;
+  deploymentBinding?: { environment: string; target: string };
   enabled?: boolean;
   intervalSeconds?: number;
   maxWakeups?: number;
@@ -47,7 +54,7 @@ export interface Job {
   agent: string; stage: Stage; detail: string; config: LifecycleConfig;
   controlCommand?: string[]; stateDirectory?: string;
   createdAt: string; updatedAt: string; lastProgressAt?: string; nextWakeAt?: string;
-  pr?: string; mergeSha?: string; deployment?: Deployment;
+  pr?: string; mergeSha?: string; observedSourceSha?: string; deployment?: Deployment;
   /** Tracker handoff recorded once the merged PR was handed to human review. */
   inReview?: boolean;
   /** Readback confirmed the verified Linear issue reached Done. */
@@ -63,14 +70,14 @@ export interface Job {
   };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
   acceptanceChangedAt?: string;
-  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string }>;
+  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string }>;
   holdDetail?: string;
   blocker?: Blocker;
   facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
   verifier?: VerifierRun; verifierHistory?: VerifierRun[]; verifierAttempts?: number;
 }
 export interface VerificationReport {
-  jobID: string; issueURL: string; acHash: string; mergeSha: string; checkedAt: string;
+  jobID: string; issueURL: string; acHash: string; mergeSha?: string; sourceSha?: string; checkedAt: string;
   reviewer: { runID: string; independent: boolean };
   deployment?: Deployment;
   criteria: Array<{ label: string; status: "pass" | "fail" | "blocked";
@@ -165,7 +172,13 @@ export function parseVerificationMode(value: unknown): VerificationMode {
   return value;
 }
 
+export function parseDeliveryKind(value: unknown): DeliveryKind {
+  if (value !== "implementation" && value !== "investigation") throw new Error("Delivery kind must be implementation or investigation");
+  return value;
+}
+
 function validateVerificationMode(config: LifecycleConfig, body: string): void {
+  parseDeliveryKind(config.delivery ?? "implementation");
   const mode = parseVerificationMode(config.verification);
   if (mode === "deployed" && !config.deploymentProbe?.length) {
     throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
@@ -219,12 +232,13 @@ export function workflowState(stage: Stage): string {
 export function createJob(input: {
   issue: IssueDetails; repoRoot: string; worktree: string; githubRepo: string; agent: string;
   config?: LifecycleConfig; now?: Date;
-  acceptance?: "local" | "deployed";
+  acceptance?: "local" | "deployed"; observedSourceSha?: string;
 }): Job {
   const now = (input.now ?? new Date()).toISOString();
   const id = digest(input.repoRoot + "\n" + input.issue.url).slice(0, 24);
-  const config = { verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config,
-    ...(input.acceptance ? { verification: input.acceptance } : {}) };
+  const config = selectDeploymentTarget({ verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config,
+    ...(input.acceptance ? { verification: input.acceptance } : {}) }, input.config?.deploymentTarget);
+  if (config.delivery === "investigation" && !sha(input.observedSourceSha)) throw new Error("Investigation requires a pinned observed source SHA");
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
@@ -235,9 +249,10 @@ export function createJob(input: {
   validateVerificationMode(config, input.issue.body);
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
-    sessionID: "workit-" + id, agent: input.agent, stage: "implementing", detail: "",
+    sessionID: "workit-" + id, agent: input.agent, stage: config.delivery === "investigation" ? "investigating" : "implementing", detail: "",
+    ...(config.delivery === "investigation" ? { observedSourceSha: input.observedSourceSha } : {}),
     config, createdAt: now, updatedAt: now, lastProgressAt: now,
-    nextWakeAt: new Date(Date.parse(now) + config.intervalSeconds * 1000).toISOString(), errors: 0, wakeups: 0 };
+    nextWakeAt: new Date(Date.parse(now) + (config.intervalSeconds ?? 60) * 1000).toISOString(), errors: 0, wakeups: 0 };
 }
 
 // Python's standard-library SQLite keeps Node 20 support, avoids a native npm
@@ -317,7 +332,7 @@ export class JobStore {
     for (let attempt = 0; attempt < 10; attempt++) {
       const job = this.get(id);
       const expected = job.revision;
-      const progress = (value: Job) => JSON.stringify([value.stage, value.detail, value.pr, value.mergeSha, value.deployment, value.verification, value.acHash]);
+      const progress = (value: Job) => JSON.stringify([value.stage, value.detail, value.pr, value.mergeSha, value.observedSourceSha, value.deployment, value.verification, value.acHash]);
       const before = progress(job);
       change(job);
       if (progress(job) !== before) job.lastProgressAt = now.toISOString();
@@ -365,6 +380,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
     }
     if (patch.verification !== undefined) setVerificationMode(job, patch.verification);
     if (patch.trackerCompletion !== undefined) job.config = { ...job.config, trackerCompletion: patch.trackerCompletion };
+    if (investigation(job) && (patch.pr || patch.mergeSha)) throw new Error("Investigation jobs use a pinned observed source, not an implementation PR");
     if (patch.pr !== undefined) {
       const match = patch.pr.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/);
       if (!match || match[1].toLowerCase() !== job.githubRepo.toLowerCase()) throw new Error("PR must belong to this job's repository");
@@ -378,7 +394,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
       job.mergeSha = patch.mergeSha;
     }
     if (patch.stage === "waiting-ci" && !job.pr) throw new Error("waiting-ci requires a PR");
-    if (["waiting-deploy", "verifying"].includes(patch.stage) && (!job.pr || !job.mergeSha)) throw new Error("Post-merge stages require PR and merge SHA");
+    if (["waiting-deploy", "verifying"].includes(patch.stage) && (investigation(job) ? !sha(job.observedSourceSha) : !job.pr || !job.mergeSha)) throw new Error("Post-merge stages require PR and merge SHA");
     if (patch.stage === "waiting-deploy" && job.config.verification === "local") throw new Error("Local verification proceeds directly to verifying after merge");
     if (patch.stage === "waiting-deploy" && !job.config.deploymentProbe) throw new Error("Configure lifecycle.deploymentProbe before waiting for deployment");
     if (patch.stage === "verifying" && job.config.verification !== "local" && !job.deployment) throw new Error("Establish the deployed version through waiting-deploy before verifying");
@@ -402,9 +418,11 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
   validateVerificationMode(job.config, currentBody);
-  if (!sha(job.mergeSha) || report.mergeSha !== job.mergeSha || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
+  const source = verificationSource(job);
+  const sourceMatches = investigation(job) ? report.sourceSha === source && report.mergeSha === undefined : report.mergeSha === source;
+  if (!sha(source) || !sourceMatches || report.reviewer?.independent !== true || !report.reviewer.runID?.trim() ||
       [job.id, job.sessionID].includes(report.reviewer.runID)) {
-    throw new Error("Verification needs the merged source and an independent reviewer run");
+    throw new Error("Verification needs the bound source and an independent reviewer run");
   }
   const checked = Date.parse(report.checkedAt);
   if (!Number.isFinite(checked) || checked < Date.parse(job.acceptanceChangedAt ?? job.createdAt) || checked > now.getTime() + 60_000) throw new Error("Invalid verification time");
@@ -485,6 +503,7 @@ export interface LifecycleAdapter {
   project(job: Job): Promise<void>;
   wake(job: Job, wakeID: string, text: string): Promise<void>;
   pr(job: Job): Promise<PRSnapshot>;
+  observedSource?(job: Job): Promise<string>;
   deployment(job: Job): Promise<Deployment | undefined>;
   containsMerge(job: Job, sourceSha: string): Promise<boolean>;
   currentIssue?(job: Job): Promise<IssueDetails>;
@@ -526,6 +545,12 @@ export function controlCommand(job: Job): string {
 }
 
 export function verificationInstructions(job: Job): string[] {
+  if (investigation(job)) return [
+    `Delivery kind: investigation. Pinned observed source: ${job.observedSourceSha}. Acceptance profile: ${job.config.verification}.`,
+    "Investigate and record findings against this source. Do not fabricate a change, PR or merge to finish a diagnosis-only task. This contract does not waive any current AC or authorize implementation/deployment.",
+    "When the investigation is ready, checkpoint verifying for local acceptance or waiting-deploy for serving-bound acceptance. Obtain independent evidence for every current AC. Reports use sourceSha instead of mergeSha, and the tracked worktree must remain clean at the pinned source.",
+    "If the observed source or target is wrong, inspect job acceptance and use its revision/current-AC guarded correction with a reason. Existing holds remain authoritative.",
+  ];
   return [
     `Verification mode for this issue: ${job.config.verification ?? "deployed"}. Choose acceptance scope from the current ACs; the repository setting is a default.`,
     `When every AC can be reliably proven locally (for example a local CLI, tooling or documentation change), select local with this CLI's job checkpoint ${job.id} --stage STAGE --verification local --detail TEXT and explain the local acceptance coverage. Keep deployed for ACs that require a serving environment; never downgrade a deployment AC to local. A local-only issue does not need deployment authorization or a deployment wait to complete.`,
@@ -543,7 +568,7 @@ function prompt(job: Job, reason: string): string {
     job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
     job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
     "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
-    "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
+    investigation(job) ? "Own the investigation, evidence and issue closeout under repository policy." : "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
     ...verificationInstructions(job),
     "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
     `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
@@ -633,8 +658,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           reason = "PR checks or reviews changed";
         }
       } else if (job.stage === "waiting-deploy") {
-        const pr = await adapter.pr(job);
-        if (!pr.merged || pr.mergeSha !== job.mergeSha) throw new Error("Expected merge is not established by GitHub");
+        await assertVerificationSource(adapter, job);
         const deployment = await adapter.deployment(job);
         actionable = deployment !== undefined;
         if (deployment) {

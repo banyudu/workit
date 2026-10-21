@@ -168,6 +168,8 @@ export interface ResolvedConfig {
 
 export interface CliOptions {
   managed?: boolean;
+  delivery?: import("./lifecycle.js").DeliveryKind;
+  deploymentTarget?: string;
   acceptance?: "local" | "deployed";
   verification?: import("./lifecycle.js").VerificationMode;
   sessionID?: string;
