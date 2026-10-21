@@ -4,6 +4,7 @@ import { sanitizedDetail, type Job } from "./lifecycle.js";
 export type WorkGroup = "working" | "waiting" | "needs-you" | "paused" | "verified" | "cancelled";
 export function workGroup(job: Job): WorkGroup {
   if (["needs-you", "paused", "verified", "cancelled"].includes(job.stage)) return job.stage as WorkGroup;
+  if (jobBlockers(job).some(item => item.owner === "owner")) return "needs-you";
   if (job.stage.startsWith("waiting-") || job.verifier?.state === "running" || job.verifier?.state === "report-ready") return "waiting";
   return "working";
 }
@@ -19,7 +20,8 @@ function webLink(value?: string): string | undefined {
 /** A versioned display contract. Never expose commands, paths, issue bodies or auth. */
 export function overview(jobs: Job[], limit = 500, now = new Date()) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("overview limit must be 1–1000");
-  const ordered = [...jobs].sort((a, b) => (b.lastProgressAt ?? b.createdAt).localeCompare(a.lastProgressAt ?? a.createdAt) || a.id.localeCompare(b.id));
+  const priority: Record<WorkGroup, number> = { "needs-you": 0, working: 1, waiting: 2, paused: 3, verified: 4, cancelled: 5 };
+  const ordered = [...jobs].sort((a, b) => priority[workGroup(a)] - priority[workGroup(b)] || (b.lastProgressAt ?? b.createdAt).localeCompare(a.lastProgressAt ?? a.createdAt) || a.id.localeCompare(b.id));
   return {
     version: 1 as const, generatedAt: now.toISOString(), total: jobs.length, truncated: jobs.length > limit,
     jobs: ordered.slice(0, limit).map(job => {

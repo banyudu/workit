@@ -37,3 +37,21 @@ test("heartbeat bookkeeping never appears as meaningful progress; checkpoints do
   store.update(original.id, current => { current.detail = "Implementation ready for review"; current.stage = "reviewing"; }, later);
   assert.equal(store.get(original.id).lastProgressAt, later.toISOString());
 });
+
+
+test("owner interventions appear under decisions even when the lifecycle remains verifying", () => {
+  const waiting = job(); waiting.stage = "verifying";
+  waiting.blocker = { reason: "acceptance-decision", owner: "owner", observedAt: new Date().toISOString(), nextAction: "Review changed ACs", recheckTrigger: "correction" };
+  assert.equal(overview([waiting]).jobs[0].group, "needs-you");
+  waiting.stage = "paused";
+  assert.equal(overview([waiting]).jobs[0].group, "paused");
+});
+
+
+test("bounded overview keeps older owner decisions ahead of newer completed history", () => {
+  const decision = job(); decision.stage = "needs-you"; decision.lastProgressAt = "2020-01-01T00:00:00Z";
+  const history = Array.from({ length: 500 }, (_, i) => ({ ...job(), id: String(i), stage: "verified" as const }));
+  const result = overview([...history, decision]);
+  assert.equal(result.jobs[0].id, decision.id);
+  assert.equal(result.truncated, true);
+});
