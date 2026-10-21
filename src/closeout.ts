@@ -1,3 +1,4 @@
+import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -138,7 +139,7 @@ export async function checkVerification(adapter: LifecycleAdapter, expected: Job
         !await observe(() => adapter.containsMerge(expected, deployment.sourceSha))) throw new Error("Serving deployment changed; rerun applicable verification");
   }
   const issue = await observe(() => adapter.currentIssue!(expected));
-  if (issue.url !== expected.issue.url) throw new Error("Current issue identity changed");
+  assertTracker(expected, issue);
   return { report: validateReport(expected, value, issue.body, now), finished: issueFinished(issue) && (issue.backend !== "linear" || provenChecklist(issue.body, expected.acLabels) === issue.body) };
 }
 export function completeVerification(store: JobStore, expected: Job, report: VerificationReport, now = new Date()): Job {

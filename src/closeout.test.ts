@@ -268,7 +268,7 @@ test("acceptance changes invalidate cached report/deployment/dispatch while reta
   assert.equal(corrected.stage, "paused"); assert.equal(corrected.nextWakeAt, undefined);
   assert.equal(corrected.verifier!.state, "invalidated"); assert.equal(corrected.verifier!.id, before.verifier!.id);
   assert.equal(corrected.deployment, undefined); assert.equal(corrected.verification, undefined);
-  assert.throws(() => validateReport(corrected, report(corrected), body, new Date(at.getTime() + 180_000)), /time/);
+  assert.throws(() => validateReport({ ...corrected, verifier: undefined }, report(corrected), body, new Date(at.getTime() + 180_000)), /time/);
   await run(new Date(at.getTime() + 180_000));
   assert.equal(adapter.launches.length, 1);
 });
@@ -424,4 +424,43 @@ test("transient fact failures retain valid evidence and never spend another veri
   await run(new Date(at.getTime() + 240_000));
   assert.equal(store.get(job.id).stage, "verified");
   assert.equal(adapter.launches.length, 1);
+});
+
+test("CLI closeout preserves active verifier identities and invalidated capacity", async t => {
+  const { closeoutJob } = await import("./lifecycle-closeout.js");
+  for (const state of ["running", "report-ready", "invalidated"] as const) {
+    const { store, job, adapter, run } = fixture(t);
+    await run();
+    store.update(job.id, current => { current.verifier!.state = state; });
+    const current = store.get(job.id);
+    const value = report(current, state === "invalidated" ? current.verifier!.id : "replacement-reviewer");
+    const closeoutAdapter = Object.assign(adapter, { updateIssue: async () => { throw new Error("Unexpected tracker write"); } });
+    await assert.rejects(closeoutJob(store, closeoutAdapter, job.id, { report: value }), /Reconcile the existing verifier/);
+    assert.equal(store.get(job.id).stage, "verifying");
+    assert.equal(store.get(job.id).verifier!.state, state);
+  }
+});
+
+test("automatic closeout honors current tracker holds even when every checkbox and state is complete", async t => {
+  const { job, adapter } = fixture(t);
+  for (const hold of ["label", "archived", "snoozed"]) {
+    const heldIssue = { ...issue, backend: "linear" as const, identifier: "TASK-1", url: "https://linear.app/example/issue/TASK-1",
+      body: body.replaceAll("[ ]", "[x]"), state: "Done", stateType: "completed", labels: hold === "label" ? ["owner-hold"] : [],
+      linear: { id: "fixture", teamID: "team", stateID: "done", updatedAt: at.toISOString(), completedStateID: "done",
+        archivedAt: hold === "archived" ? at.toISOString() : null, snoozedUntilAt: hold === "snoozed" ? at.toISOString() : null } };
+    const heldJob = { ...job, issue: heldIssue };
+    await assert.rejects(checkVerification({ ...adapter, pr: adapter.pr.bind(adapter), deployment: adapter.deployment.bind(adapter),
+      containsMerge: adapter.containsMerge.bind(adapter), session: adapter.session.bind(adapter), project: adapter.project.bind(adapter),
+      wake: adapter.wake.bind(adapter), markInReview: adapter.markInReview.bind(adapter), markDone: adapter.markDone.bind(adapter),
+      currentIssue: async () => heldIssue }, heldJob, report(heldJob), new Date(at.getTime() + 60_000)), /owner hold/);
+  }
+});
+
+test("local launch and report validation preserve deployed obligations under test tags", t => {
+  const { job } = fixture(t);
+  const runtime = { ...issue, body: body.replace("The CLI command passes its isolated fixtures.", "Run the actual deployed production journey.") };
+  assert.throws(() => createJob({ issue: runtime, repoRoot: job.repoRoot, worktree: job.worktree, githubRepo: job.githubRepo,
+    agent: job.agent, acceptance: "local" }), /deployment Acceptance Criterion/);
+  const legacy = { ...job, issue: runtime, ...acceptance(runtime.body) };
+  assert.throws(() => validateReport(legacy, report(legacy), runtime.body, new Date(at.getTime() + 60_000)), /deployment Acceptance Criterion/);
 });

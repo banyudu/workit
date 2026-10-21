@@ -460,3 +460,12 @@ An unavailable fact reader retains the report for retry. A lost launch response
 requires inspected `job verifier-reconcile`; it never triggers blind replay.
 When dispatch is disabled, ordinary managed continuation remains available.
 These limits count dispatches and elapsed verifier time, not tokens or dollars.
+
+`workit job overview --format json [--limit 1..1000]` is the version 1 display
+contract for the Banyan Work sidebar. It includes all job states, regardless of
+conversation availability, with capped text, links, AC counts and next actions.
+`lastProgressAt` records meaningful checkpoint/source/evidence changes; heartbeat
+claims and unchanged polling do not update it. Older records omit that timestamp
+until their next meaningful change. `generatedAt` means the local snapshot read
+time, not a fresh tracker or deployment observation. Clients must show truncation
+and keep previous results visibly stale if refresh fails.

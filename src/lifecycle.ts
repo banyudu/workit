@@ -46,7 +46,7 @@ export interface Job {
   repoRoot: string; worktree: string; sessionID: string; githubRepo: string;
   agent: string; stage: Stage; detail: string; config: LifecycleConfig;
   controlCommand?: string[]; stateDirectory?: string;
-  createdAt: string; updatedAt: string; nextWakeAt?: string;
+  createdAt: string; updatedAt: string; lastProgressAt?: string; nextWakeAt?: string;
   pr?: string; mergeSha?: string; deployment?: Deployment;
   /** Tracker handoff recorded once the merged PR was handed to human review. */
   inReview?: boolean;
@@ -122,7 +122,7 @@ function checklistCriteria(body: string) {
   finish();
   return criteria.map(item => ({ ...item,
     label: item.text.match(/\[(?:test|code|ci|query|deploy|mobile|human):([a-z0-9-]+)\]/)?.[1] ?? "ac-" + digest(item.text).slice(0, 12),
-    human: /\[human(?::[a-z0-9-]+)?\]/.test(item.text) }));
+    human: requiresHuman(item.text) }));
 }
 
 // Keep the text-only parser contract shared with acceptance planning (#10).
@@ -170,7 +170,7 @@ function validateVerificationMode(config: LifecycleConfig, body: string): void {
   if (mode === "deployed" && !config.deploymentProbe?.length) {
     throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
   }
-  if (mode === "local" && acceptanceCriteria(body).some(line => /\[deploy(?::[a-z0-9-]+)?\]/.test(line))) {
+  if (mode === "local" && acceptanceCriteria(body).some(requiresDeployed)) {
     throw new Error("Local verification cannot satisfy a deployment Acceptance Criterion");
   }
 }
@@ -236,7 +236,7 @@ export function createJob(input: {
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
     sessionID: "workit-" + id, agent: input.agent, stage: "implementing", detail: "",
-    config, createdAt: now, updatedAt: now,
+    config, createdAt: now, updatedAt: now, lastProgressAt: now,
     nextWakeAt: new Date(Date.parse(now) + config.intervalSeconds * 1000).toISOString(), errors: 0, wakeups: 0 };
 }
 
@@ -317,7 +317,10 @@ export class JobStore {
     for (let attempt = 0; attempt < 10; attempt++) {
       const job = this.get(id);
       const expected = job.revision;
+      const progress = (value: Job) => JSON.stringify([value.stage, value.detail, value.pr, value.mergeSha, value.deployment, value.verification, value.acHash]);
+      const before = progress(job);
       change(job);
+      if (progress(job) !== before) job.lastProgressAt = now.toISOString();
       job.revision++;
       job.updatedAt = now.toISOString();
       if (this.call<boolean>("cas", { expected, job })) return job;
@@ -392,6 +395,10 @@ export function checkpoint(store: JobStore, id: string, patch: {
 
 export function validateProgressReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
   const report = value as VerificationReport;
+  if (job.verifier && ["reserved", "running", "uncertain", "invalidated", "report-ready"].includes(job.verifier.state) &&
+      (job.verifier.state === "invalidated" || report?.reviewer?.runID !== job.verifier.id)) {
+    throw new Error("Reconcile the existing verifier before replacing its report or identity");
+  }
   if (!report || report.jobID !== job.id || report.issueURL !== job.issue.url ||
       report.acHash !== job.acHash || acceptance(currentBody).acHash !== job.acHash) throw new Error("Verification issue/AC binding is stale or mismatched");
   validateVerificationMode(job.config, currentBody);

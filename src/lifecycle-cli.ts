@@ -4,6 +4,7 @@ import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
 import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, parseVerificationMode, setVerificationMode, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
+import { overview } from "./overview.js";
 import { heartbeatCLI } from "./heartbeat.js";
 
 function options(args: string[]): Record<string, string> {
@@ -31,6 +32,7 @@ export async function lifecycleCLI(args: string[]): Promise<void> {
     console.log(`workit tick [--job ID]
 workit job list
 workit job status ID
+workit job overview [--format json] [--limit 1..1000]
 workit job attention [--format json|text]
 workit job acceptance ID
 workit job acceptance ID --profile local|deployed --reason TEXT --expected-revision N --expected-ac-hash HASH
@@ -72,6 +74,11 @@ Local acceptance skips deployment checks and still requires complete independent
   }
   const [action, id, ...rest] = args.slice(1);
   if (action === "list" && !id) { console.log(JSON.stringify(store.list(), null, 2)); return; }
+  if (action === "overview") {
+    const values = options(args.slice(2)); only(values, ["--format", "--limit"]);
+    if (values["--format"] && values["--format"] !== "json") throw new Error("overview supports --format json");
+    console.log(JSON.stringify(overview(store.list(), values["--limit"] === undefined ? undefined : Number(values["--limit"])))); return;
+  }
   if (action === "attention") {
     const values = options(args.slice(2)); only(values, ["--format"]);
     if (values["--format"] && !["json", "text"].includes(values["--format"])) throw new Error("attention --format requires json or text");
