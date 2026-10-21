@@ -203,7 +203,7 @@ test("Banyan wire envelopes, explicit verifier ownership and cleanup order agree
   const f = await fixture(t); f.verify(); await f.run();
   const executable = join(f.dir, "banyanctl"), log = join(f.dir, "calls.jsonl"), outcome = join(f.dir, "outcome.json");
   writeFileSync(executable, `#!/usr/bin/env node
-import {appendFileSync} from 'node:fs';
+const {appendFileSync}=require('node:fs');
 const args=process.argv.slice(2);appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+'\\n');
 const val=k=>args[args.indexOf(k)+1];
 const data=args[1]==='observe'?{session:{id:val('--id'),parent:val('--parent'),status:'idle'}}:
