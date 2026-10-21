@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -168,4 +168,25 @@ test("progress reports owner blockers and closed sessions require inspected capa
   await f.advance(); assert.deepEqual(f.launches, ["first"]);
   f.queues.settle(f.queue.id, id, "Confirmed original process and verifier are stopped", f.queues.get(f.queue.id).revision, now);
   await f.advance(); assert.deepEqual(f.launches, ["first", "second"]);
+});
+
+
+test("verification failure handoffs consume the same queue budget and obey queue pause", async t => {
+  for (const mode of ["budget", "paused", "allowed"] as const) {
+    const f = await fixture(t, { maxContinuations: mode === "budget" ? 1 : 2 });
+    f.control("active"); await f.advance(); const id = f.queue.items[0].jobID;
+    checkpoint(f.jobs, id, { stage: "verifying", detail: "Ready for acceptance", pr: "https://github.com/example/project/pull/1", mergeSha: "a".repeat(40) }, now);
+    await tick(f.jobs, f.adapter, { now: new Date(now.getTime() + 60_000), process: "fixture", alive: () => false });
+    const job = f.jobs.get(id), verifier = job.verifier!; assert.equal(f.verifiers.length, 1);
+    writeFileSync(verifier.reportPath, JSON.stringify({ jobID: id, issueURL: job.issue.url, acHash: job.acHash, mergeSha: job.mergeSha,
+      checkedAt: new Date(now.getTime() + 61_000).toISOString(), reviewer: { runID: verifier.id, independent: true },
+      criteria: job.acLabels.map(label => ({ label, status: "fail", evidence: [{ kind: "test", reference: "artifact://failure", observed: "Fixture reproduced the incorrect result" }] })) }));
+    writeFileSync(verifier.outcomePath, JSON.stringify({ status: "complete" }));
+    if (mode === "paused") f.control("paused");
+    await tick(f.jobs, f.adapter, { now: new Date(now.getTime() + 120_000), process: "fixture", alive: () => false });
+    assert.equal(f.jobs.get(id).stage, "fixing"); assert.equal(f.verifiers.length, 1);
+    assert.equal(f.jobs.get(id).verification?.criteria[0].status, "fail");
+    assert.equal(f.wakes.length, mode === "allowed" ? 1 : 0);
+    assert.equal(f.queues.get(f.queue.id).continuations.length, mode === "allowed" ? 2 : 1);
+  }
 });

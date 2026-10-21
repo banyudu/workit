@@ -611,3 +611,38 @@ blocked and remaining items, slot usage and remaining budgets. Launched jobs als
 appear in `job overview` and Banyan's Work sidebar. Queue runtime state stays in
 workit's native SQLite database alongside jobs; no session history or runtime
 state is written into shared agent instructions.
+
+## Continuing from independent observations
+
+A structurally valid independent report can contain failed, blocked or missing
+AC results. The coordinator retains those observations and hands the report path
+and criterion statuses back to the **original** worker for repair or missing
+evidence. Implementation jobs return to `fixing`; investigations return to
+`investigating`. An unproven human AC keeps the job held for actual confirmation.
+Stale issue/source/version bindings, wrong reviewer identities and malformed
+reports remain rejected; a valid failure is not a passing acceptance claim.
+
+The completed verifier stays `report-ready`, so repeated idle checks continue the
+worker under its normal wake budget instead of launching another verifier for
+the same observations. An explicit source or serving-binding change retires that
+completed identity to history and requires fresh independent evidence. Active or
+uncertain verifier identities still require inspected reconciliation. If extra
+observations are needed at the same source, inspect the finished report/outcome,
+use revision-guarded `job verifier-reconcile --outcome completed`, and checkpoint
+`verifying` to request fresh evidence. This retains history and attempt budgets;
+it does not turn incomplete observations into acceptance.
+
+For a complete passing GitHub report on an open issue, the original worker can
+perform tracker closeout under current repository policy and run `job closeout`
+against the retained evidence. `trackerCompletion: human` keeps this handoff held.
+The coordinator does not merge, close GitHub issues or deploy as part of this
+handoff. Linear's existing validated checklist/state reconciliation remains in
+place.
+
+Already-running verifier outcomes can be consumed when the original conversation
+is missing or busy. A missing worker is never recreated automatically. Passing
+complete evidence can establish completion; unfinished work retains its evidence
+and becomes `needs-you` until the original session is recovered. Explicit job or
+Banyan workflow holds take precedence. Every worker handoff still passes the
+ordinary liveness, delivery-receipt, wake-budget and queue pause/deadline/budget
+checks.
