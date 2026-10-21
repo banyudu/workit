@@ -725,6 +725,10 @@ Pause/cancel prevent future dispatch and retirement; a turn already running can
 finish. A follow-up does not release a job hold. Reconcile only after inspecting
 an uncertain owner notification; use `queue reconcile` for uncertain launches.
 Finish requires current accepted and retired results for every item, then releases
-the main session to coordinate a later group. The Mac must remain awake with
+the main session to coordinate a later group. For a cancelled group, inspect its
+remaining children and reconcile uncertain owner notifications before running
+`banyanctl coordination release --id OWNER_ID --group-id GROUP_ID`. Releasing
+that binding lets the main session own a later group; it does not close children
+or reactivate cancelled work. The Mac must remain awake with
 Banyan, authentication and the existing heartbeat available. This adds neither
 a scheduler nor a replacement sidebar.
