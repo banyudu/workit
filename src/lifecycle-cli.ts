@@ -167,7 +167,7 @@ Local acceptance skips deployment checks and still requires complete independent
           !["delivered", "not-delivered"].includes(outcome) || !values["--detail"]?.trim()) {
         throw new Error("Inspect the original conversation first; reconcile requires a paused/human-blocked pending wake, --delivery and --detail");
       }
-      await adapter.project(expected);
+      // Inspect first: projecting here could overwrite identity/revision drift.
       await adapter.reconcile(expected, outcome, values["--detail"]);
       job = store.update(id, current => {
         if (current.revision !== expected.revision) throw new Error("Job changed during reconciliation; reread before resuming");

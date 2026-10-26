@@ -502,8 +502,12 @@ export interface Session {
 }
 export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean; headSha?: string; mergeState?: string; checks?: "pending" | "pass" | "fail" }
 export class WorkflowRefusedError extends Error {
-  readonly code = "workflow_refused";
   override name = "WorkflowRefusedError";
+  constructor(readonly reason: string,
+    readonly code: "workflow_refused" | "workflow_wake_refused" = "workflow_refused",
+    readonly delivery: "not-delivered" | "delivered" | "uncertain" = code === "workflow_refused" ? "not-delivered" : "uncertain") {
+    super(sanitizedDetail(reason));
+  }
 }
 export class SourceProvenanceError extends Error {}
 export interface LifecycleAdapter {
@@ -756,14 +760,26 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
     } catch (error) {
       try {
         save(current => {
-          current.detail = sanitizedDetail(error instanceof Error ? error.message : "Heartbeat failed");
+          current.detail = sanitizedDetail(error instanceof WorkflowRefusedError ? `${error.code}: ${error.message}`
+            : error instanceof Error ? error.message : "Heartbeat failed");
           current.blocker = { reason: error instanceof SourceProvenanceError ? "source-provenance" : /uncertain/.test(current.detail) ? "uncertain-delivery" : "runner-error",
             owner: error instanceof SourceProvenanceError ? "external" : /uncertain/.test(current.detail) ? "owner" : "system",
             dependency: error instanceof SourceProvenanceError ? dependencyIdentity(current, "provenance") : undefined,
             observedAt: now.toISOString(), recheckTrigger: error instanceof SourceProvenanceError ? "serving-provenance-repaired" : "tool-repaired-or-inspected-recovery",
             nextAction: error instanceof SourceProvenanceError ? "Repair the runtime's actual serving source/version probe; health alone cannot establish acceptance" : "Inspect tool authentication, local logs and delivery receipts before retrying" };
           if (error instanceof WorkflowRefusedError) {
-            if (current.wake) current.wake.delivery = "not-delivered";
+            if (current.wake && error.delivery === "delivered") {
+              if (current.wake.counted === false) current.wakeups++;
+              settleCoordinatorNotes(current, now);
+              delete current.wake; delete current.blocker; current.errors = 0;
+            } else if (current.wake && error.delivery === "uncertain") {
+              delete current.wake.delivery;
+              current.stage = "needs-you";
+              current.blocker = { reason: "uncertain-delivery", owner: "owner", observedAt: now.toISOString(),
+                recheckTrigger: "inspected-recovery", nextAction: "Inspect the original conversation and reconcile its guarded native receipt before resuming" };
+              delete current.nextWakeAt;
+              return;
+            } else if (current.wake) current.wake.delivery = "not-delivered";
             current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
             return;
           }

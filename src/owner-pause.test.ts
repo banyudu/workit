@@ -84,6 +84,18 @@ console.log(JSON.stringify(args[0] === "session" ? {workflowProtocol:1,sessions:
   wake:{id:${JSON.stringify(job.wake.id)},status:"uncertain"}}
 }]} : {ok:true}));
 `, { mode: 0o700 });
+  // Recovery must inspect the stale revision before writing any projection.
+  const beforeRecovery = store.get(job.id);
+  assert.throws(() => invoke(["reconcile", job.id, "--delivery", "not-delivered", "--detail", "Inspected"]),
+    /original session's readable, current held workflow/);
+  assert.deepEqual(store.get(job.id), beforeRecovery);
+  // The ordinary held-job heartbeat can retry the previously failed projection.
+  execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "tick", "--job", job.id], {
+    encoding: "utf8", env: { ...process.env, WORKIT_STATE_DIR: directory,
+      WORKIT_BANYANCTL: ctl, PAUSE_PROJECTION_FILE: projectionPath }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(store.get(job.id).stage, "paused");
+  assert.deepEqual(store.get(job.id).wake, job.wake);
   const reconciled = invoke(["reconcile", job.id, "--delivery", "not-delivered", "--detail", "Inspected original conversation; no delivery"]);
   assert.equal(reconciled.stage, "paused");
   assert.equal(reconciled.nextWakeAt, undefined);

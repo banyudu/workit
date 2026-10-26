@@ -47,10 +47,13 @@ test("oversized JSON reports the buffer limit instead of an authentication error
 
 test("commandJSON preserves structured workflow refusals on nonzero and zero exits", async t => {
   const { run } = fixture(t);
-  for (const exit of ["75", "0"]) {
-    for (const operation of ["set", "wake", "resolve"]) {
-      await assert.rejects(run(refusal, { WORKIT_TEST_EXIT: exit, WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 409\n" }, ["workflow", operation]),
-        error => error instanceof WorkflowRefusedError && error.code === "workflow_refused" && error.message === refusal.error.message);
+  for (const code of ["workflow_refused", "workflow_wake_refused"] as const) {
+    const response = { ...refusal, error: { ...refusal.error, code } };
+    for (const exit of ["75", "0"]) {
+      for (const operation of ["set", "wake", "resolve"]) {
+        await assert.rejects(run(response, { WORKIT_TEST_EXIT: exit, WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 409\n" }, ["workflow", operation]),
+          error => error instanceof WorkflowRefusedError && error.code === code && error.reason === response.error.message && error.message === response.error.message);
+      }
     }
   }
   assert.deepEqual(await run({ ok: true }), { ok: true });
@@ -58,24 +61,38 @@ test("commandJSON preserves structured workflow refusals on nonzero and zero exi
 
 test("non-JSON, unavailable, 5xx, malformed refusals and signal failures remain errors", async t => {
   const { directory, run } = fixture(t);
-  for (const [value, env] of [
-    [refusal, { WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 503\n", WORKIT_TEST_EXIT: "64" }],
-    [refusal, { WORKIT_TEST_SIGNAL: "1" }],
-    [refusal, { WORKIT_TEST_OUTPUT: "not JSON" }],
-    [null, { WORKIT_TEST_STDERR: "Banyan control server is unavailable", WORKIT_TEST_EXIT: "69" }],
-    [{ ok: false, error: { code: "server_error", message: "unavailable" } }, { WORKIT_TEST_EXIT: "64" }],
-    [{ ok: false, error: { code: "workflow_refused", message: "" } }, { WORKIT_TEST_EXIT: "75" }],
-    [{ ok: false, error: { code: "workflow_refused", message: 42 } }, { WORKIT_TEST_EXIT: "75" }],
-  ] as const) {
-    await assert.rejects(run(value, env), error => error instanceof Error && !(error instanceof WorkflowRefusedError));
+  for (const code of ["workflow_refused", "workflow_wake_refused"]) {
+    const refusal = { ok: false, error: { code, message: "gate refused" } };
+    for (const [value, env] of [
+      [refusal, { WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 401\n", WORKIT_TEST_EXIT: "64" }],
+      [refusal, { WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 403\n", WORKIT_TEST_EXIT: "64" }],
+      [refusal, { WORKIT_TEST_STDERR: "banyanctl: server returned HTTP 503\n", WORKIT_TEST_EXIT: "64" }],
+      [refusal, { WORKIT_TEST_SIGNAL: "1" }],
+      [refusal, { WORKIT_TEST_OUTPUT: "not JSON" }],
+      [null, { WORKIT_TEST_STDERR: "Banyan control server is unavailable", WORKIT_TEST_EXIT: "69" }],
+      [{ ok: false, error: { code: "server_error", message: "unavailable" } }, { WORKIT_TEST_EXIT: "64" }],
+      [{ ok: false, error: { code, message: "" } }, { WORKIT_TEST_EXIT: "75" }],
+      [{ ok: false, error: { code, message: 42 } }, { WORKIT_TEST_EXIT: "75" }],
+    ] as const) {
+      await assert.rejects(run(value, env), error => error instanceof Error && !(error instanceof WorkflowRefusedError));
+    }
+    await assert.rejects(run(refusal, { WORKIT_TEST_EXIT: "75" }, ["session", "list"]),
+      error => error instanceof Error && !(error instanceof WorkflowRefusedError));
   }
-  await assert.rejects(run(refusal, { WORKIT_TEST_EXIT: "75" }, ["session", "list"]),
-    error => error instanceof Error && !(error instanceof WorkflowRefusedError));
   await assert.rejects(commandJSON([join(directory, "missing-cli")], directory), /failed or timed out/);
 });
 
 test("a command timeout remains an error even after printing a structured refusal", async t => {
   const { run } = fixture(t);
-  await assert.rejects(run(refusal, { WORKIT_TEST_HANG: "1" }),
-    error => error instanceof Error && !(error instanceof WorkflowRefusedError) && /failed or timed out/.test(error.message));
+  await Promise.all(["workflow_refused", "workflow_wake_refused"].map(code =>
+    assert.rejects(run({ ok: false, error: { code, message: "gate refused" } }, { WORKIT_TEST_HANG: "1" }),
+      error => error instanceof Error && !(error instanceof WorkflowRefusedError) && /failed or timed out/.test(error.message))));
+});
+
+test("refusal retains the raw reason while its display remains sanitized", async t => {
+  const { run } = fixture(t);
+  const reason = "busy\ninspect /tmp/private/session token=fixture-secret";
+  await assert.rejects(run({ ok: false, error: { code: "workflow_wake_refused", message: reason } }), error =>
+    error instanceof WorkflowRefusedError && error.reason === reason && error.code === "workflow_wake_refused" &&
+    !error.message.includes("fixture-secret") && !error.message.includes("/tmp/private"));
 });

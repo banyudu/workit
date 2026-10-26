@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { JobStore, checkpoint, createJob, tick, type Job, type LifecycleAdapter } from "./lifecycle.js";
+import { JobStore, WorkflowRefusedError, checkpoint, createJob, tick, type Job, type LifecycleAdapter } from "./lifecycle.js";
 import { QueueStore, type QueueItem, type WorkQueue } from "./queue-store.js";
 import { assertQueueIssue, advanceQueues, prepareQueue, queueStatus, type QueueManifest } from "./queue.js";
 
@@ -189,4 +189,20 @@ test("verification failure handoffs consume the same queue budget and obey queue
     assert.equal(f.wakes.length, mode === "allowed" ? 1 : 0);
     assert.equal(f.queues.get(f.queue.id).continuations.length, mode === "allowed" ? 2 : 1);
   }
+});
+
+test("a refusal with unresolved delivery cannot release a queue slot", async t => {
+  const f = await fixture(t); f.control("active"); await f.advance();
+  const id = f.queue.items[0].jobID;
+  f.adapter.wake = async () => { throw new WorkflowRefusedError("Matching native receipt requires inspection", "workflow_wake_refused", "uncertain"); };
+  await tick(f.jobs, f.adapter, { now: new Date(now.getTime() + 60_000), alive: () => false });
+  const held = f.jobs.get(id);
+  assert.equal(held.stage, "needs-you");
+  assert.ok(held.wake);
+  assert.equal(held.wake.delivery, undefined);
+  assert.equal(held.errors, 0); assert.equal(held.wakeups, 0);
+  assert.equal(f.queues.release(f.queue.id, id, held.revision), false);
+  await f.advance();
+  assert.deepEqual(f.launches, ["first"]);
+  assert.equal(f.queues.get(f.queue.id).items[0].slot, true);
 });

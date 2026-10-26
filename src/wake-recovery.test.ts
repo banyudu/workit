@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -5,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
 import { lifecycleCLI } from "./lifecycle-cli.js";
-import { createJob, JobStore, type Session } from "./lifecycle.js";
+import { createJob, JobStore, tick, type Session } from "./lifecycle.js";
 
 // Model the native receipt guard: Workit's persisted intent does not imply
 // that Banyan admitted delivery and created a matching receipt.
@@ -32,6 +34,15 @@ if (args[0] === "session" && args[1] === "list") {
   fixture.session.workflow = {owner:value("--owner"),jobID:value("--job-id"),
     revision:Number(value("--revision")),state:value("--state"),wake:previous?.wake};
   output = {ok:true};
+} else if (args[0] === "workflow" && args[1] === "wake") {
+  const workflow = fixture.session.workflow;
+  if (fixture.receiptStatus) workflow.wake = {id:value("--wake-id"),status:fixture.receiptStatus};
+  if (fixture.drift) Object.assign(workflow, fixture.drift);
+  if (fixture.unreadableAfterWake) fixture.listUnavailable = true;
+  fs.writeFileSync(file, JSON.stringify(fixture));
+  console.log(JSON.stringify({ok:false,error:{code:fixture.refusalCode ?? "workflow_wake_refused",message:"agent is busy or delivery unconfirmed"}}));
+  console.error("banyanctl: server returned HTTP 409");
+  process.exit(75);
 } else if (args[0] === "workflow" && args[1] === "resolve") {
   const workflow = fixture.session.workflow;
   if (fixture.changeBeforeResolve) { workflow.revision += 1; workflow.state = "paused"; }
@@ -207,3 +218,90 @@ test("a native revision change after inspection still blocks matched receipt res
   assert.equal(f.read().session.workflow.revision, f.job.revision + 1);
   assert.deepEqual(f.read().session.workflow.wake, { id: "undelivered-intent", status: "uncertain" });
 });
+
+for (const compiled of [false, true]) {
+  test(`${compiled ? "compiled artifact" : "adapter"} reconciles wake refusals before deciding delivery`, {
+    skip: compiled && !process.env.WORKIT_TEST_CLI,
+  }, async t => {
+    for (const code of ["workflow_refused", "workflow_wake_refused"]) {
+      for (const status of [undefined, "not-delivered", "delivered", "pending", "uncertain", "future-status"]) {
+        const f = fixture(t);
+        const current = f.store.update(f.job.id, job => {
+          job.stage = "implementing"; delete job.pr; delete job.mergeSha; delete job.wake;
+        });
+        const native = f.read();
+        native.session.status = "idle";
+        native.session.workflow.state = "working";
+        native.session.workflow.revision = current.revision;
+        native.refusalCode = code; native.receiptStatus = status;
+        f.write(native);
+        const run = async () => compiled
+          ? promisify(execFile)(process.execPath, [process.env.WORKIT_TEST_CLI!, "tick", "--job", f.job.id], { env: process.env })
+          : tick(f.store, f.adapter, { jobID: f.job.id, now: new Date(Date.now() + 60_000) });
+        await run();
+        const saved = f.store.get(f.job.id);
+        assert.equal(saved.errors, 0);
+        assert.match(saved.detail, new RegExp(`^${code}: agent is busy`));
+        assert.equal(saved.wakeups, status === "delivered" ? 1 : 0);
+        assert.equal(saved.wake?.delivery, !status || status === "not-delivered" ? "not-delivered" : undefined);
+        assert.equal(saved.stage, ["pending", "uncertain", "future-status"].includes(status ?? "") ? "needs-you" : "implementing");
+        if (saved.stage === "needs-you") {
+          assert.ok(saved.wake);
+          assert.equal(saved.nextWakeAt, undefined);
+          const receipt = f.read().session.workflow.wake;
+          await run();
+          await assert.rejects(compiled
+            ? promisify(execFile)(process.execPath, [process.env.WORKIT_TEST_CLI!, "job", "resume", f.job.id], { env: process.env })
+            : lifecycleCLI(["job", "resume", f.job.id]), /Pending wake/);
+          assert.deepEqual(f.store.get(f.job.id).wake, saved.wake);
+          assert.deepEqual(f.read().session.workflow.wake, receipt);
+        }
+        if (status === "delivered") assert.equal(saved.wake, undefined);
+        const calls = f.read().calls as string[][];
+        assert.equal(calls.filter(args => args[1] === "wake").length, 1);
+        assert.ok(calls.every(args => (args[0] === "session" && args[1] === "list") ||
+          (args[0] === "workflow" && ["set", "wake"].includes(args[1]))));
+      }
+    }
+  });
+}
+
+test("wake refusal retains intent on unreadable receipts and workflow identity/revision drift", async t => {
+  for (const change of [{ drift: { revision: 999 } }, { drift: { jobID: "other" } },
+    { drift: { owner: "other" } }, { unreadableAfterWake: true }]) {
+    const f = fixture(t);
+    const current = f.store.update(f.job.id, job => {
+      job.stage = "implementing"; delete job.pr; delete job.mergeSha; delete job.wake;
+    });
+    const native = f.read();
+    native.session.status = "idle";
+    native.session.workflow.state = "working";
+    native.session.workflow.revision = current.revision;
+    f.write({ ...native, ...change });
+    await tick(f.store, f.adapter, { jobID: f.job.id });
+    const saved = f.store.get(f.job.id);
+    assert.equal(saved.stage, "needs-you");
+    assert.equal(saved.errors, 0);
+    assert.equal(saved.wakeups, 0);
+    assert.ok(saved.wake);
+    assert.equal(saved.wake.delivery, undefined);
+    assert.equal(f.read().calls.filter((args: string[]) => args[1] === "wake").length, 1);
+  }
+});
+
+for (const compiled of [false, true]) {
+  test(`${compiled ? "compiled artifact" : "CLI"} recovery cannot project away a stale held workflow`, {
+    skip: compiled && !process.env.WORKIT_TEST_CLI,
+  }, async t => {
+    for (const revisionChange of [-1, 1]) {
+      const f = fixture(t);
+      const native = f.read(); native.session.workflow.revision += revisionChange; f.write(native);
+      const args = ["job", "reconcile", f.job.id, "--delivery", "not-delivered", "--detail", "Inspected"];
+      await assert.rejects(compiled
+        ? promisify(execFile)(process.execPath, [process.env.WORKIT_TEST_CLI!, ...args], { env: process.env })
+        : lifecycleCLI(args), /original session's readable, current held workflow/);
+      assert.deepEqual(f.store.get(f.job.id), f.job);
+      assert.ok(f.read().calls.every((args: string[]) => args[0] === "session"));
+    }
+  });
+}
