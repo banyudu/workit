@@ -16,9 +16,10 @@ const exec = promisify(execFile);
 const COMMAND_JSON_MAX_BUFFER = 32 * 1024 * 1024;
 function workflowRefusal(value: unknown): WorkflowRefusedError | undefined {
   const response = value as { ok?: unknown; error?: { code?: unknown; message?: unknown } } | null;
-  if (response?.ok === false && response.error?.code === "workflow_refused" &&
-      typeof response.error.message === "string" && response.error.message.trim()) {
-    return new WorkflowRefusedError(sanitizedDetail(response.error.message));
+  const error = response?.error;
+  if (response?.ok === false && (error?.code === "workflow_refused" || error?.code === "workflow_wake_refused") &&
+      typeof error.message === "string" && error.message.trim()) {
+    return new WorkflowRefusedError(error.message, error.code);
   }
 }
 export async function commandJSON(command: string[], cwd: string, extraEnv: Record<string, string> = {}): Promise<unknown> {
@@ -32,9 +33,9 @@ export async function commandJSON(command: string[], cwd: string, extraEnv: Reco
     if (failure.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
       throw new Error(`${command[0]} JSON output exceeded the ${COMMAND_JSON_MAX_BUFFER / 1024 / 1024} MiB buffer limit`);
     }
-    // A timeout/signal or HTTP 5xx remains a failure even if stdout contains a refusal.
+    // Timeouts, signals, auth failures and HTTP 5xx override any refusal on stdout.
     if (["workflow", "coordination"].includes(command[1]) && typeof failure.code === "number" && !failure.killed && !failure.signal &&
-        !/\bHTTP 5\d\d\b/i.test(failure.stderr ?? "")) {
+        !/\bHTTP (?:401|403|5\d\d)\b/i.test(failure.stderr ?? "")) {
       let value: unknown;
       try { value = JSON.parse(failure.stdout ?? ""); } catch { /* genuine command failure */ }
       const refusal = workflowRefusal(value);
@@ -76,8 +77,33 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
     if (value?.ok !== true) throw new Error("Banyan did not confirm the workflow projection; inspect it before closing the session");
   }
   async wake(job: Job, wakeID: string, text: string): Promise<void> {
-    await commandJSON([this.banyanctl, "workflow", "wake", "--id", job.sessionID,
-      "--job-id", job.id, "--revision", String(job.revision), "--wake-id", wakeID, "--text", text], job.repoRoot);
+    try {
+      await commandJSON([this.banyanctl, "workflow", "wake", "--id", job.sessionID,
+        "--job-id", job.id, "--revision", String(job.revision), "--wake-id", wakeID, "--text", text], job.repoRoot);
+    } catch (error) {
+      if (!(error instanceof WorkflowRefusedError)) throw error;
+      // A wake refusal can follow admission or a lost delivery acknowledgement.
+      // Only a fresh, readable receipt from this exact workflow can settle intent.
+      let delivery: "delivered" | "not-delivered" | "uncertain" = "uncertain";
+      try {
+        const value = await commandJSON([this.banyanctl, "session", "list", "--id", job.sessionID], job.repoRoot) as {
+          workflowProtocol?: number; sessions?: Session[];
+        };
+        const matches = value.sessions?.filter(session => session.id === job.sessionID) ?? [];
+        const session = matches.length === 1 ? matches[0] : undefined;
+        const workflow = session?.workflow;
+        if (value.workflowProtocol === 1 && session?.cwd === job.worktree && session.workflowRecoveryError == null &&
+            workflow?.owner === "workit" && workflow.jobID === job.id && workflow.revision === job.revision &&
+            workflow.state === workflowState(job.stage)) {
+          const receipt = workflow.wake;
+          if (receipt?.id === wakeID) {
+            if (["delivered", "not-delivered"].includes(receipt.status)) delivery = receipt.status as typeof delivery;
+          } else if (!receipt || (typeof receipt.id === "string" && receipt.id.trim() &&
+              ["delivered", "not-delivered"].includes(receipt.status))) delivery = "not-delivered";
+        }
+      } catch { /* Unreadable evidence retains the intent and holds delivery. */ }
+      throw new WorkflowRefusedError(error.reason, error.code, delivery);
+    }
   }
   async reconcile(job: Job, outcome: string, detail: string): Promise<void> {
     if (!["paused", "needs-you"].includes(job.stage) || !job.wake ||

@@ -22,7 +22,7 @@ if (name === "banyanctl") {
   if (args[0] === "workflow" && args[1] === fixture.refusal?.operation) {
     fixture.attempts.push(value("--wake-id"));
     fs.writeFileSync(file, JSON.stringify(fixture));
-    process.stdout.write(JSON.stringify({ok: false, error: {code: "workflow_refused", message: fixture.refusal.message}}));
+    process.stdout.write(JSON.stringify({ok: false, error: {code: fixture.refusal.code ?? "workflow_refused", message: fixture.refusal.message}}));
     process.stderr.write("banyanctl: server returned HTTP 409\n");
     process.exit(75);
   }
@@ -251,7 +251,8 @@ test("real adapter refusals survive restart, appear in status and heartbeat logs
   t.mock.method(console, "log", (value: string) => logs.push(value));
   const store = new JobStore();
   const adapter = new BanyanLifecycleAdapter(cli);
-  for (const [index, operation] of ["set", "wake"].entries()) {
+  for (const [index, [operation, code]] of [["set", "workflow_refused"], ["wake", "workflow_refused"],
+    ["wake", "workflow_wake_refused"]].entries()) {
     const message = operation === "set" ? "stale workflow revision" : "workflow is needs-you";
     const job = createJob({ issue: { backend: "github", identifier: String(index), title: "Resume", labels: [],
       url: `https://github.com/example/project/issues/${index + 1}`,
@@ -261,11 +262,11 @@ test("real adapter refusals survive restart, appear in status and heartbeat logs
       now: new Date(Date.now() - 60_000) });
     store.insert(job);
     writeFileSync(file, JSON.stringify({ session: { id: job.sessionID, cwd: directory, status: "idle" },
-      refusal: { operation, message }, attempts: [], wakes: [] }));
+      refusal: { operation, code, message }, attempts: [], wakes: [] }));
     await lifecycleCLI(["tick", "--job", job.id]);
-    assert.deepEqual(JSON.parse(logs.at(-1)!), [{ id: job.id, result: "workflow-refused", detail: message }]);
+    assert.deepEqual(JSON.parse(logs.at(-1)!), [{ id: job.id, result: "workflow-refused", detail: `${code}: ${message}` }]);
     await lifecycleCLI(["job", "status", job.id]);
-    assert.equal(JSON.parse(logs.at(-1)!).detail, message);
+    assert.equal(JSON.parse(logs.at(-1)!).detail, `${code}: ${message}`);
     const current = new JobStore().get(job.id);
     assert.equal(current.stage, "implementing");
     assert.equal(current.errors, 0);

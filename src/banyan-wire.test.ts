@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { createJob, type Session } from "./lifecycle.js";
+import { createJob, WorkflowRefusedError, type Session } from "./lifecycle.js";
 
 // Optional cross-repository check: use the actual compiled companion CLI with
 // an isolated authenticated HTTP fixture. No user app, daemon or agent is used.
@@ -93,4 +93,70 @@ test("compiled Banyan CLI preserves capabilities, workflow metadata and authenti
   assert.equal(requests.filter(request => request.path === "/workflow-resolve").length, 1);
   assert.equal(requests.filter(request => request.path === "/workflow-wake").length, 1);
   assert.ok(requests.every(request => request.token === "fixture-token"));
+});
+
+test("compiled Banyan CLI preserves HTTP 409 refusal codes and never mutates fixture delivery", {
+  skip: !process.env.WORKIT_TEST_BANYANCTL,
+}, async t => {
+  const directory = mkdtempSync(join(tmpdir(), "workit-banyan-refusal-wire-"));
+  const savedEnv = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    rmSync(directory, { recursive: true, force: true });
+  });
+  mkdirSync(join(directory, "Banyan"));
+  writeFileSync(join(directory, "Banyan", "control-token"), "fixture-token", { mode: 0o600 });
+  const job = createJob({ issue: { backend: "github", identifier: "24", title: "Refusal", labels: [],
+    url: "https://github.com/example/project/issues/24",
+    body: "## Acceptance Criteria\n- [ ] `[test:refusal]` Refusal is retained.\n- [ ] `[code:receipt]` Receipts are unchanged." },
+    repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture", config: { verification: "local" } });
+  const session: Session = { id: job.sessionID, cwd: directory, status: "idle", workflow: {
+    owner: "workit", jobID: job.id, revision: job.revision, state: "working",
+  } };
+  let code = "workflow_refused";
+  const reason = "agent is busy, unobserved, or awaiting human input";
+  const requests: string[] = [];
+  const fixtureState = { session, turnCount: 3 };
+  const server = createServer(async (request, response) => {
+    requests.push(request.url!);
+    assert.equal(request.headers["x-banyan-token"], "fixture-token");
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/workflow-wake") {
+      const body = JSON.parse(text);
+      assert.equal(body.apiVersion, "v1");
+      assert.equal(body.id, job.sessionID);
+      assert.equal(body.jobID, job.id);
+      assert.equal(Number(body.revision), job.revision);
+      assert.equal(body.wakeID, "held-wake");
+      response.writeHead(409);
+      response.end(JSON.stringify({ ok: false, error: { code, message: reason } }));
+    } else if (request.url === `/list?id=${job.sessionID}`) {
+      response.end(JSON.stringify({ ok: true, data: { workflowProtocol: 1, sessions: [session] } }));
+    } else {
+      response.writeHead(500); response.end(JSON.stringify({ ok: false }));
+    }
+  });
+  t.after(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }));
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  Object.assign(process.env, { BANYAN_FIXTURE_DATA_HOME: directory, PUCK_HOME: join(directory, "puck"),
+    BANYAN_FIXTURE_CONTROL_URL: `http://127.0.0.1:${address.port}` });
+  const adapter = new BanyanLifecycleAdapter(process.env.WORKIT_TEST_BANYANCTL!);
+  for (code of ["workflow_refused", "workflow_wake_refused"]) {
+    for (const status of [undefined, "pending", "uncertain", "delivered", "not-delivered"]) {
+      session.workflow!.wake = status ? { id: "held-wake", status } : undefined;
+      const before = JSON.stringify(fixtureState);
+      await assert.rejects(adapter.wake(job, "held-wake", "Fixture continuation"), error =>
+        error instanceof WorkflowRefusedError && error.code === code && error.reason === reason && error.message === reason &&
+        error.delivery === (status === "delivered" ? "delivered" : !status || status === "not-delivered" ? "not-delivered" : "uncertain"));
+      assert.equal(JSON.stringify(fixtureState), before);
+    }
+  }
+  assert.equal(requests.filter(path => path === "/workflow-wake").length, 10);
+  assert.equal(requests.filter(path => path.startsWith("/list?")).length, 10);
+  assert.ok(requests.every(path => path === "/workflow-wake" || path === `/list?id=${job.sessionID}`));
 });

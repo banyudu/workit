@@ -244,7 +244,14 @@ Workit may have saved an intent that Banyan never admitted. For this inspected
 `not-delivered` outcome, reconciliation can clear only Workit's intent when
 protocol v1 confirms the original session's readable, current held workflow has
 no matching receipt and no other unresolved wake. Any older settled native
-receipt is preserved. Matching receipts still use Banyan's guarded resolution;
+receipt is preserved. Both `workflow_refused` and `workflow_wake_refused` retain
+Banyan's code and reason. A wake refusal alone never proves non-delivery: Workit
+reads the original workflow's receipt first. Matching pending, uncertain or
+unreadable receipts retain the intent and hold further input, resume and queue
+slot release. A matching delivered receipt settles the existing intent without
+another input; only confirmed non-delivery permits retrying the same wake ID.
+Recovery inspects the held native revision before projection, so projection
+cannot repair drift implicitly. Matching receipts still use Banyan's guarded resolution;
 an absent receipt never establishes a `delivered` outcome.
 Missing/ambiguous conversation identity, unreadable journals, removed worktrees
 and uncertain launches never fall back to replaying the initial task in a new

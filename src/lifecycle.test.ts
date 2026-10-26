@@ -283,47 +283,49 @@ test("a proven pre-delivery refusal retries the same persisted wake", async t =>
   assert.notEqual(store.get(job.id).stage, "needs-you");
 });
 
-test("workflow_refused keeps a changed-review wake runnable without spending either budget", async t => {
-  for (const operation of ["project", "wake"] as const) {
-    const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 2, maxWakeups: 1 });
-    checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
-    await run();
-    adapter.snapshot.fingerprint = "review-added";
-    const original = { project: adapter.project, wake: adapter.wake };
-    const attempts: string[] = [];
-    const message = operation === "project" ? "stale workflow revision" : "agent is busy, unobserved, or awaiting human input";
-    adapter[operation] = async current => {
-      if (current.wake) attempts.push(current.wake.id);
-      throw new WorkflowRefusedError(message);
-    };
-    let wakeID: string | undefined;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const at = new Date(store.get(job.id).nextWakeAt!);
-      const result = await run(at);
-      const current = store.get(job.id);
-      assert.equal(current.stage, "waiting-ci");
-      assert.equal(current.errors, 0);
-      assert.equal(current.wakeups, 0);
-      assert.equal(current.detail, message);
-      assert.equal(current.claim, undefined);
-      assert.equal(current.nextWakeAt, new Date(at.getTime() + 17_000).toISOString());
-      assert.ok(current.wake);
-      wakeID ??= current.wake.id;
-      assert.equal(current.wake.id, wakeID);
-      assert.equal(current.wake.reason, "PR checks or reviews changed");
-      assert.deepEqual(result, [{ id: job.id, result: "workflow-refused", detail: message }]);
+test("both refusal codes keep deterministic changed-review wakes runnable without spending either budget", async t => {
+  for (const code of ["workflow_refused", "workflow_wake_refused"] as const) {
+    for (const operation of ["project", "wake"] as const) {
+      const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 2, maxWakeups: 1 });
+      checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
+      await run();
+      adapter.snapshot.fingerprint = "review-added";
+      const original = { project: adapter.project, wake: adapter.wake };
+      const attempts: string[] = [];
+      const message = operation === "project" ? "stale workflow revision" : "agent is busy, unobserved, or awaiting human input";
+      adapter[operation] = async current => {
+        if (current.wake) attempts.push(current.wake.id);
+        throw new WorkflowRefusedError(message, code, "not-delivered");
+      };
+      let wakeID: string | undefined;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const at = new Date(store.get(job.id).nextWakeAt!);
+        const result = await run(at);
+        const current = store.get(job.id);
+        assert.equal(current.stage, "waiting-ci");
+        assert.equal(current.errors, 0);
+        assert.equal(current.wakeups, 0);
+        assert.equal(current.detail, `${code}: ${message}`);
+        assert.equal(current.claim, undefined);
+        assert.equal(current.nextWakeAt, new Date(at.getTime() + 17_000).toISOString());
+        assert.ok(current.wake);
+        wakeID ??= current.wake.id;
+        assert.equal(current.wake.id, wakeID);
+        assert.equal(current.wake.reason, "PR checks or reviews changed");
+        assert.deepEqual(result, [{ id: job.id, result: "workflow-refused", detail: `${code}: ${message}` }]);
+      }
+      assert.ok(attempts.every(id => id === wakeID));
+      assert.equal(adapter.wakes.length, 0);
+      Object.assign(adapter, original);
+      await run(new Date(store.get(job.id).nextWakeAt!));
+      assert.deepEqual(adapter.wakes, [wakeID]);
+      assert.equal(store.get(job.id).wakeups, 1);
+      assert.equal(store.get(job.id).wake, undefined);
+      adapter.snapshot.ready = true;
+      await run(new Date(store.get(job.id).nextWakeAt!));
+      assert.equal(store.get(job.id).stage, "needs-you");
+      assert.equal(adapter.wakes.length, 1);
     }
-    assert.ok(attempts.every(id => id === wakeID));
-    assert.equal(adapter.wakes.length, 0);
-    Object.assign(adapter, original);
-    await run(new Date(store.get(job.id).nextWakeAt!));
-    assert.deepEqual(adapter.wakes, [wakeID]);
-    assert.equal(store.get(job.id).wakeups, 1);
-    assert.equal(store.get(job.id).wake, undefined);
-    adapter.snapshot.ready = true;
-    await run(new Date(store.get(job.id).nextWakeAt!));
-    assert.equal(store.get(job.id).stage, "needs-you");
-    assert.equal(adapter.wakes.length, 1);
   }
 });
 
