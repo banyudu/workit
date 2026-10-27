@@ -190,7 +190,7 @@ export function launchIndependentVerifier(job: Job, run: VerifierRun, plan: Veri
     `Independently verify managed job ${job.id}. Reviewer run ID: ${run.id}.`,
     `Issue: ${job.issue.url}. ${investigation(job) ? "Observed source" : "Merged source"}: ${verificationSource(job)}. Current AC hash: ${job.acHash}.`,
     `Acceptance profile: ${job.config.verification}. AC labels: ${job.acLabels.join(", ")}.`,
-    job.deployment ? `Expected serving binding: ${JSON.stringify(job.deployment)}.` : "All acceptance must be proven locally; deployment evidence is unnecessary.",
+    job.deployment ? `Expected serving binding: ${JSON.stringify(job.deployment)}.` : "No serving deployment is required. Local does not mean all evidence must be local; explicitly required CI runs need actual CI evidence (kind: ci), not local tests or estimates.",
     `Read the current issue and repository instructions. Write the complete JSON VerificationReport to ${run.reportPath}.`,
     `Use reviewer: {runID: "${run.id}", independent: true}, jobID, issueURL, acHash, ${investigation(job) ? "sourceSha" : "mergeSha"}, checkedAt and one criterion with actual evidence per current AC.`,
     "Each criterion needs label, status and evidence entries with kind, reference and observed. Deployed journeys also need the actual environment, target, sourceSha and version on the report and evidence.",

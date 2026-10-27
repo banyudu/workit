@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobStore, SourceProvenanceError, acceptance, checkpoint, createJob, tick, validateReport,
-  assertLocalAcceptance, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun, type VerificationReport } from "./lifecycle.js";
+  assertLocalAcceptance, requiresDeployed, verificationInstructions, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import { overview } from "./overview.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier, verifierBinding } from "./closeout.js";
 
@@ -541,4 +541,72 @@ test("current GitHub owner holds retain completed verifier outcomes without waki
   }
   const { store, job, adapter, run } = fixture(t); adapter.issue.labels = ["owner-hold"];
   await run(); assert.equal(store.get(job.id).stage, "needs-you"); assert.equal(adapter.launches.length, 0);
+});
+
+
+// Verbatim ENG-17532 ACs: filenames describe workflow fixtures, while CI must run.
+const ciOnlyBody = `## Acceptance Criteria
+- [ ] \`[code:agent-shards]\` cf-prod agent 测试使用多于原 28 个的分片，保留完整 inventory、原测试断言和隔离；记录基于当前权重的分配与余量。
+- [ ] \`[code:gateway-shards]\` cf-prod 的 all、model-gateway、billing-model-gateway 目标将原完整 model-gateway suite 分片，所有分片成功才可继续相关部署，其他目标与 verify/credentials 原有语义保持正确。
+- [ ] \`[test:coverage-and-gates]\` \`node --test .github/scripts/deploy-test-shard.test.mjs .github/scripts/model-gateway-production-workflow.test.mjs .github/scripts/conductor-production-test-workflow.test.mjs\` 通过；覆盖 agent 与 gateway inventory 恰好一次、分片失败/跳过时阻止部署以及目标选择。
+- [ ] \`[ci:shard-runtime]\` 在可用的非生产 CI 验证中执行所有新增分片，记录 source SHA、每片耗时及结论，确认完整覆盖并无 300 秒超时；不能以估算替代实际运行证据。`;
+
+test("ci-only-profile: exact ENG-17532 criteria allow no serving journey but still require actual CI evidence", t => {
+  const { job } = fixture(t);
+  const current = { ...job, issue: { ...issue, body: ciOnlyBody }, ...acceptance(ciOnlyBody) };
+  assert.doesNotThrow(() => assertLocalAcceptance(ciOnlyBody));
+  const value = report(current);
+  const ci = value.criteria.find(item => item.label === "shard-runtime")!;
+  assert.throws(() => validateReport(current, value, ciOnlyBody, new Date(at.getTime() + 60_000)), /actual CI evidence/);
+  ci.evidence = [{ kind: "ci", reference: "https://github.com/example/project/actions/runs/40", observed: `All 40 shards passed on ${mergeSha}; measured durations below 300s` }];
+  assert.doesNotThrow(() => validateReport(current, value, ciOnlyBody, new Date(at.getTime() + 60_000)));
+  assert.throws(() => validateReport(current, { ...value, criteria: value.criteria.slice(0, -1) }, ciOnlyBody, new Date(at.getTime() + 60_000)), /every AC/);
+  ci.evidence[0].kind = "estimate";
+  assert.throws(() => validateReport(current, value, ciOnlyBody, new Date(at.getTime() + 60_000)), /actual CI evidence/);
+  for (const command of [
+    "node --test .github/scripts/model-gateway-production-workflow.test.mjs",
+    'node --test "./tests/production.test.mjs"',
+    "node --test 'production.test.mjs'",
+    "node --test tests/staging/test.mjs --config=./production.json",
+    "node --test --test-name-pattern=production ./tests/workflow.test.mjs",
+    'node --test --test-name-pattern="production workflow" ./tests/workflow.test.mjs',
+    "node --test --test-skip-pattern 'production workflow' ./tests/workflow.test.mjs",
+  ]) {
+    assert.equal(requiresDeployed(`\`[test:ci]\` \`${command}\` passes.`), false, command);
+  }
+  assert.equal(requiresDeployed("[ci:run] All shards pass in non-production CI; record actual durations."), false);
+  assert.equal(requiresDeployed("[ci:run] All shards pass in non production CI; record actual durations."), false);
+  for (const profile of ["local", "deployed"] as const) {
+    const guidance = verificationInstructions({ ...current, config: { ...current.config, verification: profile } }).join("\n");
+    assert.match(guidance, /no serving deployment is required/);
+    assert.match(guidance, /actual CI evidence, not local tests or estimates/);
+    assert.match(guidance, /human requirements and holds/);
+  }
+});
+
+test("deployment-gates: paths, quoting and fixture language cannot hide real deployment requirements", () => {
+  for (const path of ["./tests/production.test.mjs", "./tests/local.test.mjs"]) {
+    for (const quote of ["", "'", '\"', "`"] ) {
+      const command = `node --test ${quote}${path}${quote}`;
+      for (const criterion of [
+        `[deploy:runtime] ${command} passes.`,
+        `[test:runtime] ${command} passes against the production runtime.`,
+        `[test:runtime] Tests cover ${command}; run the actual production journey.`,
+        `[test:runtime] Tests cover ${command} --env=${quote}production${quote}.`,
+        `[test:runtime] Tests cover ${command} --environment ${quote}production${quote}.`,
+        `[test:runtime] Tests cover ${command} -e ${quote}production${quote}.`,
+        `[test:runtime] Tests cover ENV=${quote}production${quote} ${command}.`,
+        `[test:runtime] ${command} passes in ${quote}production${quote}.`,
+        `[test:runtime] ${command} passes in production/staging.`,
+        `[test:runtime] Run smoke against ${quote}production.example.com${quote} after merge.`,
+        `[test:runtime] ${command} --base-url ${quote}production.example.com${quote} passes.`,
+        `[test:runtime] ${command} passes in non-production CI; verify the production runtime too.`,
+        `[test:runtime] Tests cover ${command} --test-name-pattern=production --env=${quote}production${quote}.`,
+        `[test:runtime] ${command} --test-name-pattern='production workflow'; run the production journey.`,
+      ]) {
+        assert.equal(requiresDeployed(criterion), true, criterion);
+        assert.throws(() => assertLocalAcceptance(`## Acceptance Criteria\n- [ ] ${criterion}\n- [ ] [code:types] Types exist.`), /cannot bypass/, criterion);
+      }
+    }
+  }
 });

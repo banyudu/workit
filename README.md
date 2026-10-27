@@ -284,10 +284,12 @@ durable heartbeat and guarded Banyan continuation instead of the built-in native
 goal instruction, and it performs the Linear review handoff itself once it
 observes the merge, so that guidance is dropped from managed prompts.
 Managed verification follows the issue's ACs. Use
-`workit --managed --verification local ENG-123` for locally verifiable tooling;
+`workit --managed --verification local ENG-123` when no serving deployment is
+required, including CI-only work;
 `job checkpoint` and `job resume` also accept `--verification local|deployed` to
 correct an inherited default for one job. Local mode still requires merged
-source and independent evidence for every AC.
+source and independent evidence for every AC. Required CI runs still need actual
+CI evidence; local tests and estimates cannot replace them.
 Repositories without Superdog can replace the guidance below with their own
 review policy.
 
