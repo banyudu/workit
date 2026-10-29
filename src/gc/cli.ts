@@ -8,6 +8,7 @@ const HELP = `workit gc — lifecycle-aware worktree recycling (dry-run by defau
 
   workit gc [--dry-run | --apply] [--repo PATH] [--worktree PATH]
             [--json] [--output PATH] [--max-actions N]
+            [--lock-wait SECONDS]
   workit gc register --worktree PATH --role implementation|review|pool|unclassified
                      [--job-file PATH] [--issue ID] [--pid PID] [--keep]
   workit gc keep --worktree PATH [--off]
@@ -36,6 +37,7 @@ export function gcCLI(argv: string[]): void {
   if (!supported.includes(command)) throw new Error(`Unknown GC command: ${command}`);
   let worktree: string | undefined, role: Role | undefined, jobFile: string | undefined, pid: number | undefined, issue: string | undefined, output: string | undefined, maxActions: number | undefined;
   let stateDirectory: string | undefined;
+  let lockWaitSeconds = 0;
   let apply = false, json = false, keep = false, off = false, interrupted = false, dryRun = false, remnantsOnly = false;
   const repos: string[] = [];
   const onlyRepositories: string[] = [];
@@ -48,7 +50,7 @@ export function gcCLI(argv: string[]): void {
     if (flag === "--off") { off = true; continue; }
     if (flag === "--interrupted") { interrupted = true; continue; }
     if (flag === "--remnants-only") { remnantsOnly = true; continue; }
-    if (!["--worktree", "--role", "--job-file", "--pid", "--issue", "--repo", "--only-repo", "--output", "--max-actions", "--state"].includes(flag)) throw new Error(`Unknown GC option: ${flag}`);
+    if (!["--worktree", "--role", "--job-file", "--pid", "--issue", "--repo", "--only-repo", "--output", "--max-actions", "--state", "--lock-wait"].includes(flag)) throw new Error(`Unknown GC option: ${flag}`);
     const value = argv[++i];
     if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
     if (flag === "--worktree") worktree = expand(value);
@@ -58,6 +60,11 @@ export function gcCLI(argv: string[]): void {
     if (flag === "--issue") issue = value;
     if (flag === "--output") output = expand(value);
     if (flag === "--state") stateDirectory = expand(value);
+    if (flag === "--lock-wait") {
+      const seconds = Number(value);
+      if (!Number.isSafeInteger(seconds) || seconds < 0) throw new Error("--lock-wait requires a non-negative integer");
+      lockWaitSeconds = seconds;
+    }
     if (flag === "--role") {
       if (!["implementation", "review", "pool", "unclassified"].includes(value)) throw new Error(`Unknown role: ${value}`);
       role = value as Role;
@@ -90,7 +97,7 @@ export function gcCLI(argv: string[]): void {
     setLifecycle(worktree!, { pid, release: true, phase: command === "finish" ? interrupted ? "interrupted" : "finished" : "idle" }, registry);
     if (command === "release" || !apply) { console.log("Lifecycle recorded"); return; }
   }
-  const execute = () => runGC({ apply, worktree, repositories: repos, onlyRepositories: onlyRepositories.length ? onlyRepositories : undefined, remnantsOnly, maxActions, registry, includeLegacy: true, completionOwner: command === "finish" ? pid : undefined });
+  const execute = () => runGC({ apply, worktree, repositories: repos, onlyRepositories: onlyRepositories.length ? onlyRepositories : undefined, remnantsOnly, maxActions, lockWaitMs: lockWaitSeconds * 1000, registry, includeLegacy: true, completionOwner: command === "finish" ? pid : undefined });
   if (apply) { try { setPriority(Math.max(10, getPriority())); } catch { /* Best effort on restricted hosts. */ } }
   const report = execute();
   const rendered = JSON.stringify({ dryRun: !apply, at: new Date().toISOString(), ...report }, null, 2);
