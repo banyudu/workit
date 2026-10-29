@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { resolveConfig } from "../config.js";
@@ -346,6 +346,9 @@ export function removeCache(path: string): void {
     if ((s.mode & 0o700) !== 0o700) chmodSync(current, s.mode | 0o700);
     for (const item of readdirSync(current, { withFileTypes: true })) if (item.isDirectory() && !item.isSymbolicLink()) makeWritable(join(current, item.name));
   };
+  // rmSync(recursive) stats through a symlink and silently no-ops when the
+  // target is gone, which left dangling caches in place and aborted recycling.
+  try { if (lstatSync(path).isSymbolicLink()) { unlinkSync(path); return; } } catch { return; }
   makeWritable(path);
   rmSync(path, { recursive: true, force: true });
 }
