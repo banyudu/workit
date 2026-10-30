@@ -111,7 +111,7 @@ test("local jobs verify merged source directly and launch/heartbeat guidance res
   assert.equal(adapter.wakes.length, 1);
   for (const prompt of [managedInstructions(job).join("\n"), adapter.prompts[0]]) {
     assert.match(prompt, /Verification mode for this issue: local/);
-    assert.match(prompt, /every AC against the merged source locally/);
+    assert.match(prompt, /every AC against the merged source, including required CI runs/);
     assert.match(prompt, /complete independent AC evidence/);
     assert.doesNotMatch(prompt, /await the scheduled deployment|actual serving source\/version/i);
   }

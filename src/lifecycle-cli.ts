@@ -65,8 +65,9 @@ Deployed acceptance requires journey evidence bound to the observed serving vers
 Human ACs require human evidence with confirmedBy and a reference to actual confirmation.
 Validated Linear closeout automatically checks proven ACs and completes the actual team workflow.
 Retry/reconcile one job with job closeout ID; stored evidence is revalidated against current AC/source/version.
-Local acceptance skips deployment checks and still requires complete independent AC evidence.
---verification overrides this job only; include local acceptance coverage in --detail when correcting a job.`);
+Local means no serving deployment required, not that all evidence must be local. Required CI runs need actual CI evidence (kind: "ci"), not local tests or estimates.
+Both profiles still require complete independent AC evidence.
+--verification overrides this job only; explain coverage for every AC in --detail when correcting a job.`);
     return;
   }
   const store = new JobStore();

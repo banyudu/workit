@@ -47,8 +47,11 @@ Report the actual serving source/version, not newest main or mere deploy-job
 success. Workit checks GitHub ancestry against the merged PR. Trusted probe argv
 is snapshotted from launch configuration; issue text and checkpoints cannot
 supply new probe commands. Verification scope is per issue: the repository
-setting is a default, and a local CLI, tooling or documentation issue should use
-`local` when every AC has reliable local acceptance. Override the default at
+setting is a default, and a CI-only, CLI, tooling or documentation issue should use
+`local` when no AC requires a serving deployment. `local` does not mean all
+evidence must be local. Explicit CI criteria still require actual CI runs and
+`kind: "ci"` evidence bound to the relevant source; local tests or estimates
+cannot replace them. Override the default at
 launch without changing other jobs:
 
 ```bash
@@ -71,7 +74,7 @@ incompatible options.
 
 `--acceptance local|deployed` overrides the configured profile for one managed
 launch. Select local only after reviewing **all current ACs** and establishing
-local acceptance probes for each. Workit rejects local scope when an AC requires
+independent evidence for each, including actual CI runs where required. Workit rejects local scope when an AC requires
 deployment. Human ACs still require actual attributed confirmation; profile
 correction refuses to narrow an outstanding human requirement. Scope is never inferred from changed filenames.
 Local implementation reports still need a merged source, an independent reviewer and complete
@@ -82,7 +85,7 @@ and live issue binding, then explicitly correct it:
 
 ```bash
 workit job acceptance JOB_ID
-workit job acceptance JOB_ID --profile local --reason "All current CLI/type ACs have isolated local probes" --expected-revision 12 --expected-ac-hash CURRENT_AC_HASH
+workit job acceptance JOB_ID --profile local --reason "Current ACs require code, tests and actual CI evidence, with no serving deployment" --expected-revision 12 --expected-ac-hash CURRENT_AC_HASH
 ```
 
 Inspection is read-only and returns the job revision, saved/current AC hashes,
@@ -205,7 +208,7 @@ held by checkpointing the same stage. To explicitly release the hold and correct
 the mode together:
 
 ```bash
-workit job resume JOB_ID --verification local --detail "Every AC has local acceptance; deployment is outside this issue's scope"
+workit job resume JOB_ID --verification local --detail "Every AC has independent code/test/CI coverage; no serving deployment is required"
 ```
 
 Mode corrections affect only that job, clear stale deployment/report evidence,

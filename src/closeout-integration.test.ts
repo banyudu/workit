@@ -137,6 +137,9 @@ fs.writeFileSync(reportPath,JSON.stringify({jobID,issueURL,acHash,mergeSha,check
     assert.equal(command[command.indexOf("--id") + 1], launched.verifier!.sessionID);
     const text = command[command.indexOf("--command") + 1];
     assert.match(text, /Do not start paid\/provider journeys/);
+    assert.match(text, /No serving deployment is required/);
+    assert.match(text, /actual CI evidence \(kind: ci\), not local tests or estimates/);
+    assert.doesNotMatch(text, /All acceptance must be proven locally/);
     assert.match(text, /create native goals/);
     assert.doesNotMatch(text, /Persistent goal \(Codex only\)/);
   }
@@ -207,4 +210,77 @@ test("queue CLI creates a paused plan and the ordinary heartbeat launches its re
   const status = JSON.parse(cli("queue", "status", queued.id));
   assert.equal(status.items[0].state, "launched"); assert.equal(status.starts, 1);
   assert.equal(read().calls.filter((call: string[]) => call[0] === "banyanctl" && call[1] === "session" && call[2] === "new").length, 1);
+});
+
+test("managed-correction: CI-only profile correction is guarded, retains holds and accepts only a fresh independent CI report", async t => {
+  const { directory, file, read, store } = fixture(t);
+  const ciIssue = { ...issue, body: "## Acceptance Criteria\n- [ ] `[test:coverage-and-gates]` `node --test .github/scripts/deploy-test-shard.test.mjs .github/scripts/model-gateway-production-workflow.test.mjs .github/scripts/conductor-production-test-workflow.test.mjs` 通过；覆盖 agent 与 gateway inventory 恰好一次、分片失败/跳过时阻止部署以及目标选择。\n- [ ] `[ci:shard-runtime]` 在可用的非生产 CI 验证中执行所有新增分片，记录 source SHA、每片耗时及结论，确认完整覆盖并无 300 秒超时；不能以估算替代实际运行证据。" };
+  const output: string[] = [];
+  t.mock.method(console, "log", (value: string) => output.push(value));
+  for (const stage of ["needs-you", "paused"] as const) {
+    const currentIssue = { ...ciIssue, url: `${issue.url}-${stage}` };
+    const job = createJob({ issue: currentIssue, repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture",
+      config: { deploymentProbe: ["unrelated-serving-probe"] }, now: new Date(Date.now() - 60_000) });
+    job.stage = stage; job.holdDetail = "Owner hold: inspect before resuming";
+    job.pr = "https://github.com/example/project/pull/42"; job.mergeSha = source;
+    store.insert(job);
+    const setIssue = (body: string) => writeFileSync(file, JSON.stringify({ ...read(), issue: { ...currentIssue, body } }));
+    setIssue(currentIssue.body);
+    await lifecycleCLI(["job", "acceptance", job.id]);
+    const plan = JSON.parse(output.at(-1)!);
+    assert.equal(plan.profile, "deployed"); assert.equal(plan.localEligible, true);
+    assert.equal(plan.current.acHash, job.acHash);
+    const correct = (revision: number, hash: string) => lifecycleCLI(["job", "acceptance", job.id, "--profile", "local",
+      "--reason", "CI-only ACs require real CI evidence but no serving deployment", "--expected-revision", String(revision), "--expected-ac-hash", hash]);
+    await assert.rejects(correct(job.revision + 1, plan.current.acHash), /revision mismatch/);
+    await assert.rejects(correct(job.revision, "stale"), /AC binding is stale/);
+    assert.deepEqual(store.get(job.id), job);
+    for (const requirement of [
+      "`[deploy:runtime]` Run the production journey.",
+      "`[test:runtime]` Tests cover `node --test ./production.test.mjs --env='production'`.",
+      "`[human:owner]` Owner accepts the result.",
+    ]) {
+      setIssue(currentIssue.body + `\n- [ ] ${requirement}`);
+      await lifecycleCLI(["job", "acceptance", job.id]);
+      const changed = JSON.parse(output.at(-1)!);
+      assert.equal(changed.localEligible, false);
+      await assert.rejects(correct(job.revision, changed.current.acHash), /cannot bypass/);
+      assert.deepEqual(store.get(job.id), job);
+    }
+    setIssue(currentIssue.body);
+    await correct(plan.revision, plan.current.acHash);
+    const corrected = store.get(job.id);
+    assert.equal(corrected.config.verification, "local");
+    assert.equal(corrected.stage, stage); assert.equal(corrected.holdDetail, job.holdDetail);
+    assert.equal(corrected.nextWakeAt, undefined); assert.equal(corrected.deployment, undefined);
+    assert.equal(corrected.acceptanceHistory?.length, 1);
+    assert.equal(corrected.acceptanceHistory![0].acHash, job.acHash);
+    const report = { jobID: job.id, issueURL: currentIssue.url, acHash: job.acHash, mergeSha: source,
+      checkedAt: new Date().toISOString(), reviewer: { runID: "independent-ci-verifier", independent: true }, criteria: [
+        { label: "coverage-and-gates", status: "pass", evidence: [{ kind: "test", reference: "artifact://targeted-tests", observed: "All targeted tests passed" }] },
+        { label: "shard-runtime", status: "pass", evidence: [{ kind: "ci", reference: "https://github.com/example/project/actions/runs/40", observed: `All 40 shards passed on ${source}; actual durations below 300s` }] },
+      ] };
+    const reportPath = join(directory, `ci-report-${stage}.json`);
+    const submit = (value: unknown) => {
+      writeFileSync(reportPath, JSON.stringify(value));
+      return lifecycleCLI(["job", "verify", job.id, "--report", reportPath]);
+    };
+    await assert.rejects(submit(report), /must be in verifying/);
+    assert.equal(store.get(job.id).stage, stage);
+    await lifecycleCLI(["job", "resume", job.id, "--detail", "Inspected owner hold; explicitly released for independent CI acceptance"]);
+    assert.equal(store.get(job.id).stage, "verifying");
+    await assert.rejects(submit({ ...report, checkedAt: job.createdAt }), /verification time/);
+    await assert.rejects(submit({ ...report, acHash: "stale" }), /binding is stale/);
+    await assert.rejects(submit({ ...report, mergeSha: "b".repeat(40) }), /bound source/);
+    await assert.rejects(submit({ ...report, reviewer: { runID: job.sessionID, independent: true } }), /independent reviewer/);
+    await assert.rejects(submit({ ...report, criteria: report.criteria.slice(0, 1) }), /every AC/);
+    const localOnly = structuredClone(report); localOnly.criteria[1].evidence[0].kind = "test";
+    await assert.rejects(submit(localOnly), /actual CI evidence/);
+    await submit(report);
+    assert.equal(store.get(job.id).stage, "verified");
+    assert.equal(read().projection.state, "verified");
+    assert.equal(read().issue.body, currentIssue.body);
+    assert.ok(read().calls.every((call: string[]) => call[0] === "gh" ? ["pr", "issue"].includes(call[1]) && call[2] === "view"
+      : call[1] === "workflow" && call[2] === "set"));
+  }
 });

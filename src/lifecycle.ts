@@ -206,8 +206,36 @@ function localContractDescription(criterion: string): boolean {
   const description = criterion.replace(/`?\[(?:test|code):[a-z0-9-]+\]`?/g, "").trim();
   return /^(?:tests? (?:cover|reject|reconcile|group|establish|enforce|preserve)|a fixture\b|documentation (?:describes|documents|explains|lists)|document\b|describe\b)/i.test(description);
 }
+/** Remove artifact tokens, not code spans: a command can still target production. */
+function deploymentRequirementText(criterion: string): string {
+  return criterion
+    // These Node test selectors name tests, not target environments. Parse only
+    // their value; never discard the containing command or adjacent arguments.
+    .replace(/--test-(?:name|skip)-pattern(?:=|\s+)(?:"[^"\n]*"|'[^'\n]*'|[^\s`;&|]+)/g, " ")
+    .replace(/[`'"“”‘’]/g, "")
+    .replace(/[^\s<>()\[\]{},;]+/g, token => {
+      // A path may also be an option value. Keep URLs and ambiguous prose
+      // such as production/staging; only mask filenames or explicit paths.
+      const equals = token.indexOf("=");
+      const value = token.slice(equals + 1);
+      if (value.startsWith("-") || value.includes("://")) return token;
+      const path = value.replace(/[.:!?]+$/, "");
+      if (!/^[a-z0-9_~@*?.:/\\-]+$/i.test(path)) return token;
+      // Bare hosts (production.example.com) are runtime references, not files.
+      // Unknown extensions stay visible rather than narrowing acceptance.
+      const artifact = /^(?:[.~][^/\\]*[/\\]|[/\\]|[a-z]:[/\\])/i.test(path) ||
+        /\.(?:[cm]?[jt]sx?|jsonc?|ya?ml|toml|ini|conf|md|mdx|txt|sh|bash|zsh|py|go|rs|rb|java|c|cpp|h|hpp|css|scss|html|vue|svelte|svg|xml|sql|proto|lock|csv|log)(?::\d+)?$/i.test(path);
+      return artifact ? token.slice(0, equals + 1) + " " : token;
+    })
+    // This names the CI environment, not a serving runtime. Keep any adjacent
+    // deployment requirement visible (including a later production instruction).
+    .replace(/\bnon[ -]production\s+CI\b/gi, "CI");
+}
 export function requiresDeployed(criterion: string): boolean {
   if (/\[deploy(?::|\])/i.test(criterion)) return true;
+  // Environment selectors override a fixture/documentation description too.
+  if (/(?:--?(?:e|env|environment|target|stage)|\b[A-Z_]*ENV(?:IRONMENT)?)\s*(?:=\s*|\s+)(?:production|prod|staging|stage|dev|development|live)\b/i.test(criterion.replace(/[`'"]/g, ""))) return true;
+  criterion = deploymentRequirementText(criterion);
   // A fixture/documentation contract can describe deployed behavior without
   // requiring runtime execution. Direct runtime instructions still take priority.
   const directRuntime = /\b(?:run|runs|execute|executed|exercise|verify|verified|probe)\b[^.\n]{0,80}\b(?:deployed|production|staging|live runtime)\b/i.test(criterion);
@@ -450,6 +478,10 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
         !item.evidence.some(entry => entry.kind === "human" && typeof entry.confirmedBy === "string" && entry.confirmedBy.trim())) {
       throw new Error(`AC '${label}' needs real human confirmation (human evidence with confirmedBy and a confirmation reference)`);
     }
+    if (item.status === "pass" && /\[ci(?::|\])/i.test(checklistCriteria(currentBody).find(criterion => criterion.label === label)!.text) &&
+        !item.evidence.some(entry => entry.kind === "ci")) {
+      throw new Error(`AC '${label}' needs actual CI evidence; local tests or estimates cannot replace the required run`);
+    }
   }
   if (job.config.verification !== "local") {
     if (report.deployment && !matchesDeployment(job, report.deployment)) throw new Error("Verification deployment binding is stale");
@@ -560,14 +592,14 @@ export function verificationInstructions(job: Job): string[] {
   if (investigation(job)) return [
     `Delivery kind: investigation. Pinned observed source: ${job.observedSourceSha}. Acceptance profile: ${job.config.verification}.`,
     "Investigate and record findings against this source. Do not fabricate a change, PR or merge to finish a diagnosis-only task. This contract does not waive any current AC or authorize implementation/deployment.",
-    "When the investigation is ready, checkpoint verifying for local acceptance or waiting-deploy for serving-bound acceptance. Obtain independent evidence for every current AC. Reports use sourceSha instead of mergeSha, and the tracked worktree must remain clean at the pinned source.",
+    "When the investigation is ready, checkpoint verifying when no serving deployment is required, or waiting-deploy for serving-bound acceptance. Local permits required CI evidence; it does not mean all checks run locally. Obtain independent evidence for every current AC, including actual CI runs when required. Reports use sourceSha instead of mergeSha, and the tracked worktree must remain clean at the pinned source.",
     "If the observed source or target is wrong, inspect job acceptance and use its revision/current-AC guarded correction with a reason. Existing holds remain authoritative.",
   ];
   return [
     `Verification mode for this issue: ${job.config.verification ?? "deployed"}. Choose acceptance scope from the current ACs; the repository setting is a default.`,
-    `When every AC can be reliably proven locally (for example a local CLI, tooling or documentation change), select local with this CLI's job checkpoint ${job.id} --stage STAGE --verification local --detail TEXT and explain the local acceptance coverage. Keep deployed for ACs that require a serving environment; never downgrade a deployment AC to local. A local-only issue does not need deployment authorization or a deployment wait to complete.`,
+    `Select local when no serving deployment is required (including CI-only, CLI, tooling or documentation changes). Local does not mean all evidence must be local: explicitly required CI runs still need actual CI evidence, not local tests or estimates. Inspect this CLI's job acceptance ${job.id} and use its revision/current-AC guarded correction to fix an inherited default; job checkpoint also supports --verification local with coverage in --detail. Keep deployed for ACs that require a serving environment, and preserve human requirements and holds.`,
     job.config.verification === "local"
-      ? "After an authorized merge, proceed directly to verifying and obtain independent evidence for every AC against the merged source locally. Local verification requires no deployment probe, serving version or deployed journey evidence."
+      ? "After an authorized merge, proceed directly to verifying and obtain independent evidence for every AC against the merged source, including required CI runs. Local verification requires no deployment probe, serving version or deployed journey evidence."
       : "In deployed mode, await the scheduled deployment after an authorized merge, then independently verify applicable journeys against the actual serving source/version. If the serving version changes, checkpoint waiting-deploy and rerun the affected acceptance probes.",
     "Use workit job --help for the report contract. Both verification modes require a merged PR and complete independent AC evidence accepted by job verify --report.",
   ];
