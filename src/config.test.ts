@@ -139,6 +139,10 @@ test("launch instructions default to the delivery + review block", () => {
   assert.deepEqual(resolved.config.launch?.instructions, DEFAULT_LAUNCH_INSTRUCTIONS);
 });
 
+test("default launch instructions do not create a native Codex goal", () => {
+  assert.doesNotMatch(DEFAULT_LAUNCH_INSTRUCTIONS.join("\n"), /create_goal|get_goal|Persistent goal/i);
+});
+
 test("project launch.instructions replaces the default block", () => {
   const root = mkdtempSync(join(tmpdir(), "workit-instr-override-"));
   writeFileSync(join(root, ".workit.yml"), [
