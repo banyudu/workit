@@ -135,10 +135,9 @@ waits consume no agent turn. Readiness wakes an agent to assess repository
 policy; it does not authorize a merge/deployment. There is no global stability
 sleep. Optional verifier capacity is reserved in the same durable store.
 
-Use one scheduler per issue. Managed guidance suppresses the built-in Codex
-goal instruction and asks agents not to add native goals or schedules. Handle an
-already-active unrelated goal explicitly before onboarding that conversation.
-Workit does not pick additional backlog issues.
+Use one scheduler per issue. Managed guidance asks agents not to add native goals
+or schedules. Handle an already-active unrelated goal explicitly before
+onboarding that conversation. Workit does not pick additional backlog issues.
 
 ## Tracker handoff
 

@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { resolveConfig } from "../config.js";
@@ -346,6 +346,9 @@ export function removeCache(path: string): void {
     if ((s.mode & 0o700) !== 0o700) chmodSync(current, s.mode | 0o700);
     for (const item of readdirSync(current, { withFileTypes: true })) if (item.isDirectory() && !item.isSymbolicLink()) makeWritable(join(current, item.name));
   };
+  // rmSync(recursive) stats through a symlink and silently no-ops when the
+  // target is gone, which left dangling caches in place and aborted recycling.
+  try { if (lstatSync(path).isSymbolicLink()) { unlinkSync(path); return; } } catch { return; }
   makeWritable(path);
   rmSync(path, { recursive: true, force: true });
 }
@@ -476,7 +479,17 @@ export interface GCReport {
   durationMs: number; archiveBytes: number; restoredBytes: number;
 }
 
-/** All destructive GC paths share one nonblocking worker, including finish. */
+/** All destructive GC paths share one worker lock, including finish. */
+function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+function acquireSweepLock(registry: Registry, token: string, owner: { pid: number; identity: string }, waitMs: number): boolean {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (let delay = 500; ; delay = Math.min(delay * 2, 5_000)) {
+    if (registry.lock("sweep", token, owner)) return true;
+    if (Date.now() + delay > deadline) return false;
+    sleepSync(delay);
+  }
+}
+
 export function runGC(options: Parameters<typeof runGCWorker>[0] = {}): GCReport {
   const started = Date.now(), registry = options.registry || new Registry();
   const deferred = (reason: string): GCReport => ({
@@ -496,11 +509,21 @@ export function runGC(options: Parameters<typeof runGCWorker>[0] = {}): GCReport
   if (!options.apply) return execute();
   const token = randomUUID(), owner = { pid: process.pid, identity: processIdentity(process.pid) };
   if (!owner.identity) throw new Error("Cannot determine cleanup worker identity");
-  if (!registry.lock("sweep", token, owner)) return deferred("cleanup worker busy; lifecycle remains pending");
+  // Launchers, finish hooks and the periodic sweep all contend for this lock.
+  // Giving up immediately produced an empty report and exit 0, which looked
+  // exactly like "nothing to clean" while the disk filled up.
+  const waitMs = Math.max(0, options.lockWaitMs ?? 0), waitStarted = Date.now();
+  if (!acquireSweepLock(registry, token, owner, waitMs)) {
+    const report = deferred("cleanup worker busy; lifecycle remains pending");
+    // Callers that asked to wait treat exhaustion as a failure. Nonblocking
+    // lifecycle callers keep the existing silent-defer contract.
+    if (waitMs > 0) report.errors.push(`cleanup worker busy after ${((Date.now() - waitStarted) / 1000).toFixed(1)}s; another GC operation held the sweep lock`);
+    return report;
+  }
   try { return execute(); } finally { registry.unlock("sweep", token); }
 }
 
-function runGCWorker(options: { apply?: boolean; worktree?: string; repositories?: string[]; onlyRepositories?: string[]; remnantsOnly?: boolean; maxActions?: number; completionOwner?: number; registry?: Registry; activity?: Activity; now?: number; includeLegacy?: boolean; policy?: GCConfig } = {}): { decisions: Decision[]; errors: string[]; actions: number } {
+function runGCWorker(options: { apply?: boolean; worktree?: string; repositories?: string[]; onlyRepositories?: string[]; remnantsOnly?: boolean; maxActions?: number; lockWaitMs?: number; completionOwner?: number; registry?: Registry; activity?: Activity; now?: number; includeLegacy?: boolean; policy?: GCConfig } = {}): { decisions: Decision[]; errors: string[]; actions: number } {
   const started = Date.now();
   const registry = options.registry || new Registry();
   const userPolicy = resolveConfig(homedir()).config.gc || {};

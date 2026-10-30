@@ -270,22 +270,13 @@ in `src/config.ts`) asks the agent to:
   `workit job verify` accepts the report, with heartbeat retries for tracker failures.
 - Stay within the issue and review scope.
 
-For Codex, the prompt explicitly requests `get_goal` and `create_goal` before
-starting, so the delivery and review objective can persist across turns. It
-reuses a matching active goal and reports unrelated unfinished or inactive
-goals instead of replacing or resuming them automatically. If native goal tools
-are unavailable, the agent is asked to disclose that limitation and continue
-the review loop. Other agents receive the review-loop instructions without a
-request to use Codex's goal tools.
-
-For unmanaged launches this is prompt guidance; continuation depends on the
-selected agent. [Managed issue delivery](docs/managed-delivery.md) uses workit's
-durable heartbeat and guarded Banyan continuation instead of the built-in native
-goal instruction, and it performs the Linear review handoff itself once it
-observes the merge, so that guidance is dropped from managed prompts.
-Managed verification follows the issue's ACs. Use
+The default prompt does not create a native Codex goal. For unmanaged launches
+this is prompt guidance; continuation depends on the selected agent. [Managed
+issue delivery](docs/managed-delivery.md) uses workit's durable heartbeat and
+guarded Banyan continuation, and it performs the Linear review handoff itself
+once it observes the merge. Managed verification follows the issue's ACs. Use
 `workit --managed --verification local ENG-123` when no serving deployment is
-required, including CI-only work;
+required, including CI-only, CLI, tooling, or documentation work;
 `job checkpoint` and `job resume` also accept `--verification local|deployed` to
 correct an inherited default for one job. Local mode still requires merged
 source and independent evidence for every AC. Required CI runs still need actual
