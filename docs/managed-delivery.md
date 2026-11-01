@@ -486,6 +486,15 @@ holds or grant execution authority. Fact-only held-PR reconciliation does not
 advance `lastProgressAt`, including when its descriptive text or merge facts
 change. Previously recorded timestamps are retained, not retroactively rewritten.
 
+Overview rows also expose the issue lifecycle separately from the coarse work
+group. `phase` is `investigation`, `implementation`, `pr-open`, `merged`,
+`verified`, or `cancelled`; a merged PR remains `merged` while deployment and AC
+verification continue. `attention` is a presentation lane: `act` needs a human,
+`watch` is expected to continue without one, and `settled` is paused, verified,
+or cancelled. `groupID` and the sanitized `groupTitle` identify umbrella queues
+without changing job or queue state. Clients may use these fields to hide quiet
+work without suspending it; legacy clients can ignore them.
+
 ## Investigation outcomes and named serving targets
 
 Implementation is the default delivery kind and still requires an authorized

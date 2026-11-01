@@ -29,6 +29,33 @@ test("overview retains jobs without conversations, bounds output and omits execu
   assert.equal(overview([jobs[0]]).jobs[0].lastProgressAt, undefined);
 });
 
+test("overview exposes the merge boundary separately from attention and group identity", () => {
+  const implementation = job(); implementation.stage = "implementing";
+  const review = job(); review.stage = "waiting-ci"; review.pr = "https://github.com/example/project/pull/2";
+  const merged = job(); merged.stage = "needs-you"; merged.pr = "https://github.com/example/project/pull/2"; merged.mergeSha = "a".repeat(40);
+  merged.queue = { id: "group-a", key: "first", launchID: "launch-a", title: "Private queue title" };
+  const verified = job(); verified.stage = "verified"; verified.mergeSha = "b".repeat(40);
+
+  const rows = overview([implementation, review, merged, verified], 500, new Date(),
+    new Map([["group-a", "Visible umbrella title"]])).jobs;
+  const byPhase = new Map(rows.map(row => [row.phase, row]));
+  assert.equal(byPhase.get("implementation")?.attention, "watch");
+  assert.equal(byPhase.get("pr-open")?.attention, "watch");
+  assert.equal(byPhase.get("merged")?.attention, "act");
+  assert.equal(byPhase.get("verified")?.attention, "settled");
+  assert.equal(byPhase.get("merged")?.groupID, "group-a");
+  assert.equal(byPhase.get("merged")?.groupTitle, "Visible umbrella title");
+  assert.equal(byPhase.get("implementation")?.groupID, undefined);
+});
+
+test("overview treats a post-merge hold as merged rather than review-ready", () => {
+  const mergedHold = job(); mergedHold.stage = "paused"; mergedHold.inReview = true;
+  const row = overview([mergedHold]).jobs[0];
+  assert.equal(row.phase, "merged");
+  assert.equal(row.attention, "settled");
+  assert.equal(row.group, "paused");
+});
+
 test("heartbeat bookkeeping never appears as meaningful progress; checkpoints do", t => {
   const directory = mkdtempSync(join(tmpdir(), "workit-overview-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));

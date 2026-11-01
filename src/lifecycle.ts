@@ -51,7 +51,7 @@ export interface VerifierPlan { enabled: boolean; agent?: string; command?: stri
 export interface ChecklistChange { label: string; checked: boolean }
 export interface Job {
   coordinatorNotes?: Array<{ id: string; text: string; at: string; deliveredAt?: string }>;
-  queue?: { id: string; key: string; launchID: string; outcome?: string; deadline?: string; coordinatorSessionID?: string; instructions?: string };
+  queue?: { id: string; key: string; launchID: string; title?: string; outcome?: string; deadline?: string; coordinatorSessionID?: string; instructions?: string };
   schema: 1; id: string; revision: number; projectedRevision?: number;
   issue: IssueDetails; acHash: string; acLabels: string[];
   repoRoot: string; worktree: string; sessionID: string; githubRepo: string;

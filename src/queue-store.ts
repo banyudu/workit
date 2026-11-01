@@ -75,7 +75,7 @@ with sqlite3.connect(db, timeout=10) as c:
             cfg=j["config"]
             if cfg.get("delivery","implementation")!=i["delivery"] or cfg["verification"]!=i["verification"] or cfg.get("deploymentTarget")!=i.get("deploymentTarget"): raise ValueError("Launch acceptance differs from queue plan")
             if i.get("agent") and j["agent"]!=i["agent"]: raise ValueError("Launch agent differs from queue plan")
-            j["queue"]={"id":q["id"],"key":i["key"],"launchID":r["token"],"outcome":q["outcome"],"deadline":q["deadline"]}
+            j["queue"]={"id":q["id"],"key":i["key"],"launchID":r["token"],"title":q["title"],"outcome":q["outcome"],"deadline":q["deadline"]}
             if q.get("coordinator"): j["queue"]["coordinatorSessionID"]=q["coordinator"]["sessionID"]
             if q.get("instructions"): j["queue"]["instructions"]=q["instructions"]
             c.execute("INSERT INTO jobs VALUES (?,?,?)",(j["id"],j["revision"],json.dumps(j)))

@@ -1,5 +1,6 @@
 import { advanceGroups, BanyanGroupAdapter } from "./group.js";
 import { advanceQueues, CommandQueueLauncher } from "./queue.js";
+import { QueueStore } from "./queue-store.js";
 import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -84,7 +85,8 @@ Local acceptance skips deployment checks and still requires complete independent
   if (action === "overview") {
     const values = options(args.slice(2)); only(values, ["--format", "--limit"]);
     if (values["--format"] && values["--format"] !== "json") throw new Error("overview supports --format json");
-    console.log(JSON.stringify(overview(store.list(), values["--limit"] === undefined ? undefined : Number(values["--limit"])))); return;
+    const groupTitles = new Map(new QueueStore(store).list().map(queue => [queue.id, queue.title]));
+    console.log(JSON.stringify(overview(store.list(), values["--limit"] === undefined ? undefined : Number(values["--limit"]), undefined, groupTitles))); return;
   }
   if (action === "attention") {
     const values = options(args.slice(2)); only(values, ["--format"]);

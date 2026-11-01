@@ -2,11 +2,31 @@ import { jobBlockers } from "./closeout.js";
 import { sanitizedDetail, type Job } from "./lifecycle.js";
 
 export type WorkGroup = "working" | "waiting" | "needs-you" | "paused" | "verified" | "cancelled";
+export type WorkPhase = "investigation" | "implementation" | "pr-open" | "merged" | "verified" | "cancelled";
+export type WorkAttention = "act" | "watch" | "settled";
 export function workGroup(job: Job): WorkGroup {
   if (["needs-you", "paused", "verified", "cancelled"].includes(job.stage)) return job.stage as WorkGroup;
   if (jobBlockers(job).some(item => item.owner === "owner")) return "needs-you";
   if (job.stage.startsWith("waiting-") || job.verifier?.state === "running" || (job.verifier?.state === "report-ready" && !job.verifier.handoff && job.stage === "verifying")) return "waiting";
   return "working";
+}
+
+/** The merge boundary, independent of the renderer's coarse work group. */
+export function workPhase(job: Job): WorkPhase {
+  if (job.stage === "cancelled") return "cancelled";
+  if (job.stage === "verified") return "verified";
+  if (job.config.delivery === "investigation") return "investigation";
+  if (job.mergeSha || job.inReview || ["waiting-deploy", "verifying"].includes(job.stage)) return "merged";
+  if (job.pr || job.stage === "waiting-ci") return "pr-open";
+  return "implementation";
+}
+
+/** A presentation lane, not permission to release a hold or replay a wake. */
+export function workAttention(job: Job): WorkAttention {
+  const group = workGroup(job);
+  if (group === "paused" || group === "verified" || group === "cancelled") return "settled";
+  if (group === "needs-you") return "act";
+  return "watch";
 }
 function webLink(value?: string): string | undefined {
   try {
@@ -46,7 +66,7 @@ export function displayStatus(job: Job) {
 }
 
 /** A versioned display contract. Never expose commands, paths, issue bodies or auth. */
-export function overview(jobs: Job[], limit = 500, now = new Date()) {
+export function overview(jobs: Job[], limit = 500, now = new Date(), groupTitles?: ReadonlyMap<string, string>) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("overview limit must be 1–1000");
   const priority: Record<WorkGroup, number> = { "needs-you": 0, working: 1, waiting: 2, paused: 3, verified: 4, cancelled: 5 };
   const ordered = [...jobs].sort((a, b) => priority[workGroup(a)] - priority[workGroup(b)] || (b.lastProgressAt ?? b.createdAt).localeCompare(a.lastProgressAt ?? a.createdAt) || a.id.localeCompare(b.id));
@@ -58,7 +78,10 @@ export function overview(jobs: Job[], limit = 500, now = new Date()) {
       return {
         id: job.id, revision: job.revision, title: sanitizedDetail(job.issue.title).slice(0, 300),
         issueURL: webLink(job.issue.url), sessionID: job.sessionID,
-        stage: job.stage, group: workGroup(job), detail: sanitizedDetail(job.detail),
+        stage: job.stage, group: workGroup(job), phase: workPhase(job), attention: workAttention(job),
+        groupID: job.queue?.id,
+        groupTitle: sanitizedDetail(groupTitles?.get(job.queue?.id ?? "") ?? job.queue?.title ?? "").slice(0, 300) || undefined,
+        detail: sanitizedDetail(job.detail),
         display: { kind: display.kind, label: display.label },
         stopReason: ["paused", "needs-you"].includes(job.stage) ? sanitizedDetail(job.holdDetail ?? job.detail) : undefined,
         lastProgressAt: job.lastProgressAt, createdAt: job.createdAt, nextWakeAt: job.nextWakeAt,
