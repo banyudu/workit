@@ -114,7 +114,7 @@ fs.writeFileSync(reportPath,JSON.stringify({jobID,issueURL,acHash,mergeSha,check
 `);
     writeFileSync(join(directory, ".workit.yml"), JSON.stringify({ lifecycle: { verifier: { enabled: true, agent: "fixture-review", concurrency: 1, maxAttempts: 1, timeoutSeconds: 1 } },
       codingAgents: { agents: { "fixture-review": { command: `${process.execPath} ${agentPath}`, tags: ["review"], weight: 1 } } } }));
-    const created = new Date(Date.now() - 120_000);
+    const created = new Date(Date.now() - 301_000);
     const job = createJob({ issue, repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture-implementer",
       acceptance: "local", now: created });
     job.stage = "verifying"; job.pr = "https://github.com/example/project/pull/42"; job.mergeSha = source;
@@ -127,7 +127,7 @@ fs.writeFileSync(reportPath,JSON.stringify({jobID,issueURL,acHash,mergeSha,check
     assert.equal(launched.verifier!.state, "running");
     const outcome = JSON.parse(readFileSync(launched.verifier!.outcomePath, "utf8"));
     assert.equal(outcome.status, timeout ? "failed" : "complete");
-    await tick(store, adapter, { now: new Date(Date.now() + 61_000) });
+    await tick(store, adapter, { now: new Date(store.get(job.id).nextWakeAt!) });
     assert.equal(store.get(job.id).stage, timeout ? "verifying" : "verified");
     const calls: string[][] = read().calls;
     assert.equal(calls.filter(call => call[1] === "session" && call[2] === "new").length, 1);
@@ -136,7 +136,7 @@ fs.writeFileSync(reportPath,JSON.stringify({jobID,issueURL,acHash,mergeSha,check
     const command = calls.find(call => call[1] === "session" && call[2] === "new")!;
     assert.equal(command[command.indexOf("--id") + 1], launched.verifier!.sessionID);
     const text = command[command.indexOf("--command") + 1];
-    assert.match(text, /Do not start paid\/provider journeys/);
+    assert.match(text, /do not implement[^\n]+start paid\/provider journeys/);
     assert.match(text, /create native goals/);
     assert.doesNotMatch(text, /Persistent goal \(Codex only\)/);
   }

@@ -29,7 +29,7 @@ async function fixture(t: { after: (fn: () => void) => void }, maxContinuations 
   control("active");
   const reservation = queues.reserve(queue.id, now)!;
   const job = queues.attach(queue.id, reservation.launchID!, createJob({ issue, repoRoot: dir, worktree: dir,
-    githubRepo: "example/project", agent: "fixture", config: { verification: "local" }, now }), now);
+    githubRepo: "example/project", agent: "fixture", config: { verification: "local", intervalSeconds: 60 }, now }), now);
   queues.confirm(queue.id, job.id, reservation.launchID!);
   let receipt: CoordinationReceipt = { coordinationProtocol: 1, groupID: queue.id, revision: 0, state: "working" };
   const deliveries: string[] = [], retirements: string[] = [];
@@ -173,6 +173,7 @@ test("coordinator follow-ups use original worker receipts and preserve holds", a
   f.jobs.update(f.job.id, job => { job.stage = "implementing"; job.nextWakeAt = now.toISOString(); }, now);
   await tick(f.jobs, worker, { now, process: "worker", alive: () => false });
   assert.equal(prompts.length, 1); assert.match(prompts[0], /Inspect the retry race/);
+  assert.match(prompts[0], /group status/);
   const note = f.jobs.get(f.job.id).coordinatorNotes![0]; assert(note.deliveredAt);
   assert.equal(f.queues.get(f.queue.id).continuations.length, 1);
   f.verify();
@@ -215,6 +216,7 @@ console.log(JSON.stringify(args[1]==='current'?{id:'parent-original'}:{ok:true,d
   assert.equal(await adapter.requireOwner(f.queue), "parent-original");
   assert.equal((await adapter.bind(f.queue)).groupID, f.queue.id);
   assert.equal((await adapter.session(job))?.id, job.sessionID);
+  await adapter.deliver(f.queue, { ...f.groups.get(f.queue.id).messages[0], sequence: 1 });
   job.verifier = { id: "review-run", sessionID: "review-session", agent: "fixture", binding: "fixture", state: "accepted",
     reportPath: join(f.dir, "report.json"), outcomePath: outcome, timeoutSeconds: 60, reservedAt: now.toISOString() };
   launchIndependentVerifier(job, job.verifier, { enabled: true, command: "fixture", concurrency: 1, maxAttempts: 1, timeoutSeconds: 60 }, executable);
@@ -222,6 +224,10 @@ console.log(JSON.stringify(args[1]==='current'?{id:'parent-original'}:{ok:true,d
   await adapter.retire(f.queue, job, f.groups.get(f.queue.id).messages[0]);
   const calls: string[][] = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
   const launch = calls.find(args => args[0] === "session" && args[1] === "new")!;
+  const delivery = calls.find(args => args[1] === "deliver")!;
+  const notification = delivery[delivery.indexOf("--text") + 1];
+  assert.match(notification, /workit group inbox/);
+  assert.ok(notification.length < 500);
   assert(launch); assert.equal(launch[launch.indexOf("--parent") + 1], "parent-original");
   assert(!launch.includes("--no-parent"));
   assert(calls.some(args => args[1] === "helper" && args.includes(job.sessionID)));

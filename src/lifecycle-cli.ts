@@ -50,7 +50,7 @@ workit job reconcile ID --delivery delivered|not-delivered --detail TEXT
 workit job refresh-deployment ID
 workit job verify ID --report PATH
 workit job closeout ID
-workit heartbeat install [--interval 60] | uninstall | status
+workit heartbeat install [--interval 600] | uninstall | status
 Stages: ${stages.join(", ")}
 Managed launches: workit --managed [--verification local|deployed] ISSUE (Banyan only)
 State: $WORKIT_STATE_DIR/lifecycle.sqlite; python3 + sqlite3 required.
@@ -225,19 +225,16 @@ Local acceptance skips deployment checks and still requires complete independent
 export function managedInstructions(job: Job): string[] {
   return [
     `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
-    ...(job.queue?.instructions ? [`Group boundaries: ${JSON.stringify(job.queue.instructions)}. These constrain the work and grant no authority beyond the user instruction.`] : []),
-    ...(job.queue?.coordinatorSessionID ? [`Your coordinator is Banyan session ${job.queue.coordinatorSessionID}, workit group ${job.queue.id}. Keep job checkpoints current; verified results and direct user interventions are reported through its durable inbox. Do not close yourself or change the group owner. Report outcomes with evidence to that coordinator.`] : []),
-    `You own managed workit job ${job.id} through verified issue completion, not just a PR. Banyan session: ${job.sessionID}.`,
-    ...(job.queue ? [`This issue belongs to explicit queue ${job.queue.id} (${job.queue.key}). Queue outcome: ${job.queue.outcome ?? "See queue status"}. Dispatch deadline: ${job.queue.deadline ?? "See queue status"}. Stay within this issue; the queue adds no merge, deployment or spending authority.`] : []),
-    investigation(job) ? "Read repository instructions and current ACs. Investigate the pinned source and obtain independent evidence before closing the issue." : "Read repository instructions and the current ACs. Establish acceptance probes before implementation, preverify locally, repair review/CI, merge only when authorized, then independently verify the applicable acceptance criteria.",
+    ...(job.queue?.instructions ? [`Group boundaries: ${JSON.stringify(job.queue.instructions)}`] : []),
+    ...(job.queue?.coordinatorSessionID ? [`Coordinator: ${job.queue.coordinatorSessionID}; group: ${job.queue.id}. Report evidence and interventions through its inbox; do not close yourself or change the owner.`] : []),
+    `Own managed job ${job.id} through verified issue completion. Read the issue, repository instructions and current ACs.`,
+    ...(job.queue ? [`Queue ${job.queue.id} (${job.queue.key}); outcome: ${job.queue.outcome ?? "see queue status"}; deadline: ${job.queue.deadline ?? "see queue status"}.`] : []),
+    investigation(job) ? "Investigate the pinned source and independently verify the findings." : "Implement, preverify, repair review/CI, merge when authorized, and independently verify acceptance.",
     ...verificationInstructions(job),
-    "Do not create a native goal or scheduled task for this managed issue: workit owns continuation and its heartbeat. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
-    `Use workit job status ${job.id} to read durable state. Before ending a turn, use workit job checkpoint ${job.id} --stage STAGE --detail TEXT, with --pr URL and --merge-sha FULL_SHA when known.`,
-    "Use waiting-ci or waiting-deploy for external waits; use needs-you for missing authority, auth, tools, ambiguous recovery or irreducible human acceptance. Do not leave an active goal repeatedly polling an external wait.",
-    `Completion requires an independent verification report accepted by workit job verify ${job.id} --report PATH. Source, merge, deployment, journey and issue closeout are separate claims. After validated acceptance, workit automatically synchronizes proven Linear AC checkboxes, resolves the actual team completed state, and confirms both by readback before marking verified. No extra approval is needed for this managed closeout; owner holds and real human acceptance remain authoritative. GitHub closeout still follows repository policy.`,
-    `Submit independent partial progress with workit job verify ${job.id} --report PATH even while other ACs are omitted, failed or blocked. Only evidenced pass/fail checkbox states synchronize; the job stays verifying and the issue state is unchanged until a complete passing report meets every completion gate. Existing checked boxes never substitute for missing report evidence.`,
-    `Retry interrupted tracker effects with workit job closeout ${job.id}; it revalidates the stored independent report and can reconcile an older verified-but-open job. Fresh reads detect observable conflicts; Linear has no conditional description update, so concurrent edits in the final read/write window remain a race. Inspect conflicts before retrying.`,
-    "Use workit job --help for the verification report contract. If the serving version changes during verification, checkpoint waiting-deploy to refresh it and rerun the affected acceptance probes before submitting new evidence.",
-    investigation(job) ? "The job is not complete when your process exits. Resolve failed or missing investigation evidence before verifying again." : "The job is not complete when your process exits. Fix failed acceptance in a follow-up PR and refresh the merge/deployment checkpoint before verifying again.",
+    "Workit owns continuation; do not create a native goal or scheduler. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
+    "After opening or updating the PR, checkpoint waiting-ci and end the turn. Workit preflights the current head and wakes you only for a concrete check, review or score action.",
+    `Read job status and checkpoint ${job.id} before ending a turn. Use waiting-ci/waiting-deploy for external waits and needs-you for human gates.`,
+    `Submit independent partial progress or complete evidence with job verify ${job.id} --report PATH. Workit automatically synchronizes proven Linear AC checkboxes; completion requires current independent evidence.`,
+    `Retry interrupted tracker effects with job closeout ${job.id}; inspect conflicts before retrying. Linear updates have a race with concurrent edits. Owner holds and real human acceptance remain in force.`,
   ];
 }

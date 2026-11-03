@@ -24,11 +24,32 @@ repository configuration or a user-config project override:
 lifecycle:
   enabled: true
   verification: deployed
-  intervalSeconds: 60
-  maxWakeups: 40
+  intervalSeconds: 300
+  maxWakeups: 6
   maxErrors: 5
+  reviewProbe: [scripts/pr/review-map.sh]
+  reviewScoreRequired: true
   deploymentProbe: [direnv, exec, ., bun, run, scripts/deployment-probe.ts]
 ```
+
+`reviewProbe` is optional. It is trusted, read-only argv snapshotted at launch;
+workit appends the numeric PR number and supplies `WORKIT_PR_NUMBER`,
+`WORKIT_PR_URL`, `WORKIT_GITHUB_REPO` and `WORKIT_PR_HEAD_SHA`. The command must
+emit one JSON object shaped like Clawly's `scripts/pr/review-map.sh`:
+`head.sha`, `checks.pending[]`/`checks.failing[]`, `reviewDecision`,
+`threads.items[]` and `superdog.summaries[]` with `{head, score, stale}`. A
+provider-neutral wrapper may emit the same fields. `reviewScoreRequired: true`
+means only a non-stale passing score whose `head` equals the PR head makes the
+PR merge-ready. Workit skips the review probe while checks are still running or
+failing, so review metadata cannot spend an agent turn early.
+
+For an open PR, workit preflights the current head before waking the agent.
+Pending checks and missing/stale review scores stay parked. Failing checks,
+unresolved findings, a below-passing current-head score, conflicts, a behind
+head or a draft produce one bounded action prompt. A passing current-head score
+with terminal passing checks produces an explicit merge-readiness prompt; it
+does not ask the agent to repeat review work. Prompt text and any long findings
+remain in durable `job status` facts rather than being copied into every wake.
 
 The probe is an example repository-owned command, not a bundled script.
 It must be read-only, bounded, and emit one JSON object on stdout. It receives
@@ -109,7 +130,7 @@ No SQLite edits or automatic migration of existing jobs are needed.
 Build/install the compiled CLI, then explicitly install its per-user LaunchAgent:
 
 ```bash
-workit heartbeat install --interval 60
+workit heartbeat install --interval 600
 workit heartbeat status
 workit tick
 workit heartbeat uninstall
@@ -127,10 +148,12 @@ after sleep; they cannot run while asleep. Checkpoints survive app/process
 restarts. Use an always-on host for unattended operation.
 
 Ticks cheaply inspect due jobs, skip busy/parked/frozen/human-blocked sessions,
-and continue the same conversation only when actionable. Unchanged CI/deployment
-waits consume no agent turn. Readiness wakes an agent to assess repository
-policy; it does not authorize a merge/deployment. There is no global stability
-sleep. Optional verifier capacity is reserved in the same durable store.
+and continue the same conversation only when actionable. PR checks and review
+scores are read before the wake decision: unchanged/pending CI, missing evidence
+and stale scores consume no agent turn. Readiness wakes an agent to assess
+repository policy; it does not authorize a merge/deployment. There is no global
+stability sleep. Optional verifier capacity is reserved in the same durable
+store.
 
 Use one scheduler per issue. Managed guidance asks agents not to add native goals
 or schedules. Handle an already-active unrelated goal explicitly before

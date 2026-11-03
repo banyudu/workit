@@ -122,26 +122,26 @@ function buildAliasIndex(config: WorkitConfig): Record<string, string> {
  * performs the handoff itself once it observes the merge.
  */
 export const LINEAR_HANDOFF_INSTRUCTION =
-  "Tracker handoff (Linear): after the pull request is merged, attach the PR to the issue and set the issue state to In Review. After every acceptance criterion is independently verified and the evidence/checklist is reconciled, move it to Done. Preserve explicit human holds.";
+  "Tracker handoff (Linear): attach the merged PR and set In Review; move to Done after independent acceptance and checklist reconciliation. Preserve human holds.";
 
 /** Default guidance the managed lifecycle owns instead of the launched agent. */
 export const MANAGED_OWNED_INSTRUCTION_PREFIXES: string[] = [
   "Persistent goal (Codex only):",
   "Tracker handoff (Linear):",
+  "Review:",
+  "Wait for pending reviews.",
 ];
 
 /**
  * Guidance appended to every issue prompt unless the repository overrides
- * `launch.instructions`. Delivery includes repeated review repairs until the
- * current PR head receives Superdog 5/5. Declared above DEFAULT_AGENT_KEYS
- * because that evaluates defaultConfig() at module load.
+ * `launch.instructions`. The agent inspects current-head checks and review
+ * facts before acting, while the managed heartbeat owns polling. Declared above
+ * DEFAULT_AGENT_KEYS because that evaluates defaultConfig() at module load.
  */
 export const DEFAULT_LAUNCH_INSTRUCTIONS: string[] = [
-  "Delivery: when the implementation is complete and tests pass, commit and push your work, then open a pull request (not draft) that describes the change and links this issue.",
-  "If a pull request already exists for this branch, reuse it instead of opening a new one.",
-  "Review loop: for both new and existing PRs, wait for Superdog to review the current head commit. Fetch unresolved review comments, including automated/bot and CI feedback, address actionable feedback, run relevant checks, commit and push fixes, and request another review when needed. Repeat this wait/fix/test/push cycle until Superdog scores the current head 5/5, actionable review feedback is addressed, and required checks pass.",
-  "Verify the Superdog score against the reviewed commit SHA using review/check metadata. An older commit's score, missing review, or pending review is not success. Mark the work complete only after verifying the current head meets all completion criteria.",
-  "Wait for pending reviews. If Superdog is not configured, the review service is unavailable, or another external blocker prevents verification or repair, report the blocker and evidence instead of claiming 5/5 or completion.",
+  "Delivery: test, commit and push; open a ready PR linking the issue, or reuse the existing PR.",
+  "Review: inspect the current PR head, checks, review findings and score before acting. Repair only failures or actionable findings; do not rerun unchanged review work. While checks or review are pending, stop polling and let the scheduler continue you.",
+  "Wait for pending reviews. Report unavailable review services or other blockers with evidence; do not claim completion without verification.",
   LINEAR_HANDOFF_INSTRUCTION,
   "Stay within the scope of the issue and the review feedback; do not expand into unrelated refactors.",
 ];

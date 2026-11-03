@@ -228,6 +228,8 @@ for (const compiled of [false, true]) {
         const f = fixture(t);
         const current = f.store.update(f.job.id, job => {
           job.stage = "implementing"; delete job.pr; delete job.mergeSha; delete job.wake;
+          (job.coordinatorNotes ??= []).push({ id: `wake-refusal-${code}-${status ?? "none"}`,
+            text: "Retry the pending coordinator action", at: new Date().toISOString() });
         });
         const native = f.read();
         native.session.status = "idle";
@@ -272,6 +274,7 @@ test("wake refusal retains intent on unreadable receipts and workflow identity/r
     const f = fixture(t);
     const current = f.store.update(f.job.id, job => {
       job.stage = "implementing"; delete job.pr; delete job.mergeSha; delete job.wake;
+      (job.coordinatorNotes ??= []).push({ id: "wake-drift", text: "Retry the pending coordinator action", at: new Date().toISOString() });
     });
     const native = f.read();
     native.session.status = "idle";

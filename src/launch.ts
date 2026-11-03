@@ -191,12 +191,11 @@ export function launchIndependentVerifier(job: Job, run: VerifierRun, plan: Veri
     `Issue: ${job.issue.url}. ${investigation(job) ? "Observed source" : "Merged source"}: ${verificationSource(job)}. Current AC hash: ${job.acHash}.`,
     `Acceptance profile: ${job.config.verification}. AC labels: ${job.acLabels.join(", ")}.`,
     job.deployment ? `Expected serving binding: ${JSON.stringify(job.deployment)}.` : "All acceptance must be proven locally; deployment evidence is unnecessary.",
-    `Read the current issue and repository instructions. Write the complete JSON VerificationReport to ${run.reportPath}.`,
+    `Read the issue and repository instructions. Write the complete JSON VerificationReport to ${run.reportPath}.`,
     `Use reviewer: {runID: "${run.id}", independent: true}, jobID, issueURL, acHash, ${investigation(job) ? "sourceSha" : "mergeSha"}, checkedAt and one criterion with actual evidence per current AC.`,
-    "Each criterion needs label, status and evidence entries with kind, reference and observed. Deployed journeys also need the actual environment, target, sourceSha and version on the report and evidence.",
-    "Report fail/blocked for anything unproven. Do not fabricate journeys, deployment provenance or human acceptance.",
-    "This is a bounded verification run. Do not implement changes, replay the implementation task, create native goals, schedule work, launch other agents, merge, deploy, send external messages, edit issue ACs/checklists or mark the issue Done.",
-    "Do not start paid/provider journeys or perform human acceptance. Only use already authorized local fixtures and read-only probes. Report blocked when further authority or external provenance is required.",
+    "Each criterion needs label, status and evidence (kind, reference, observed). Deployed journeys also need environment, target, sourceSha and version in the report and evidence.",
+    "Report fail/blocked for unproven criteria; never fabricate evidence or human acceptance. Use only authorized local fixtures and read-only probes.",
+    "Verification only: do not implement, create native goals, schedule work, launch agents, merge, deploy, send messages, edit or close issues, start paid/provider journeys, or perform human acceptance.",
   ].join("\n");
   // Node supplies a portable process timeout; no new scheduler or live config writes.
   const runner = `const {spawn}=require('node:child_process');const fs=require('node:fs');

@@ -5,7 +5,7 @@ import { assertTracker, TrackerHoldError } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateProgressReport, reportComplete, validateReport,
+import { DEFAULT_INTERVAL_SECONDS, SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateProgressReport, reportComplete, validateReport,
   type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
@@ -68,7 +68,7 @@ export function correctAcceptance(store: JobStore, id: string, input: {
 export async function refreshHeldFacts(store: JobStore, adapter: LifecycleAdapter, expected: Job, now: Date): Promise<Job> {
   if (!expected.pr || (expected.facts && Date.parse(expected.facts.nextCheckAt) > now.getTime())) return expected;
   let facts: NonNullable<Job["facts"]> = { observedAt: now.toISOString(),
-    nextCheckAt: new Date(now.getTime() + (expected.config.intervalSeconds ?? 60) * 1000).toISOString() };
+    nextCheckAt: new Date(now.getTime() + (expected.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString() };
   try {
     facts.pr = await adapter.pr(expected);
     if (facts.pr.merged && !sha(facts.pr.mergeSha)) throw new Error("Missing merge source");
@@ -193,7 +193,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
     save(current => {
       current.blocker = { reason, owner, nextAction, recheckTrigger: trigger, observedAt: now.toISOString(),
         dependency: reason === "source-provenance" ? dependencyIdentity(current, "provenance") : undefined };
-      current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+      current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
     });
     return result;
   };
@@ -285,6 +285,10 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   if (!plan.enabled) {
     wait("missing-verifier", "verifier", "Dispatch is disabled; submit an independent report with job verify or explicitly opt in in trusted configuration", "independent-report-or-config-change", "verifier-disabled");
     // Preserve the existing post-merge/deployment handoff when dispatch is off.
+    save(current => {
+      const binding = verifierBinding(current);
+      if (current.manualVerificationHandoff?.binding !== binding) current.manualVerificationHandoff = { binding };
+    });
     return undefined;
   }
   if (!plan.command || !plan.agent || !adapter.launchVerifier) return wait("missing-verifier", "system", "Configure an available review-tagged agent in the trusted registry, or submit an independent report manually", "registry-repaired", "verifier-unavailable");

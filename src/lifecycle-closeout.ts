@@ -2,7 +2,7 @@ import { assertVerificationSource, assertVerificationDeployment } from "./verifi
 import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import type { TrackerIssue } from "./issue.js";
-import { JobStore, checklistChanges, issueFinished, processIdentity, processIsAlive, provenChecklist, reportComplete,
+import { DEFAULT_INTERVAL_SECONDS, JobStore, checklistChanges, issueFinished, processIdentity, processIsAlive, provenChecklist, reportComplete,
   synchronizeChecklist, validateProgressReport, validateReport,
   type Job, type LifecycleAdapter } from "./lifecycle.js";
 
@@ -116,7 +116,7 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
         if (synchronizeChecklist(issue.body, changes) !== issue.body) throw new Error("Checklist progress changed; retry job closeout");
         save(current => {
           current.detail = `AC progress synchronized (${changes.filter(item => item.checked).length} pass, ${changes.filter(item => !item.checked).length} fail); complete independent passing evidence is still required`;
-          current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+          current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
           delete current.claim;
         });
         return job;
@@ -155,7 +155,7 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
     try {
       save(current => {
         current.detail = `${error instanceof Error ? error.message : "Closeout failed"}. Retry: job closeout ${id} (or job verify --report PATH for fresh evidence)`;
-        current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+        current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
         delete current.claim;
       });
     } catch { /* A concurrent pause/checkpoint remains authoritative. */ }

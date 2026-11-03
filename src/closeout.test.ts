@@ -37,7 +37,7 @@ function fixture(t: { after: (fn: () => void) => void }, profile: "local" | "dep
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const store = new JobStore(directory);
   const job = createJob({ issue, repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture-implementer",
-    acceptance: profile, config: { verification: "deployed", deploymentProbe: ["fixture-probe"] }, now: at });
+    acceptance: profile, config: { verification: "deployed", intervalSeconds: 60, deploymentProbe: ["fixture-probe"] }, now: at });
   job.pr = "https://github.com/example/project/pull/42"; job.mergeSha = mergeSha; job.stage = "verifying";
   if (profile === "deployed") job.deployment = deployment;
   store.insert(job);
@@ -484,6 +484,7 @@ test("valid failed independent observations return to the original worker and re
   assert.match(overview([store.get(job.id)]).jobs[0].nextAction, /retained independent report/);
   assert.equal(adapter.wakes.length, 1); assert.match(prompts[0], /cli=fail/); assert.ok(prompts[0].includes(verifier.reportPath));
   await run(new Date(at.getTime() + 180_000)); assert.equal(adapter.launches.length, 1);
+  assert.equal(adapter.wakes.length, 1);
   checkpoint(store, job.id, { stage: "waiting-ci", detail: "Follow-up fix ready", pr: "https://github.com/example/project/pull/43" }, new Date(at.getTime() + 200_000));
   assert.equal(store.get(job.id).verifier, undefined); assert.equal(store.get(job.id).verification, undefined);
   assert.equal(store.get(job.id).verifierHistory?.at(-1)?.id, verifier.id);

@@ -86,7 +86,7 @@ test("real CLI/adapters drive deployment wait, version invalidation and evidence
     title: "Widget", body, labels: [], url: "https://github.com/example/project/issues/7" };
   const created = new Date(Date.now() - 120_000);
   const job = createJob({ issue, repoRoot: directory, worktree: directory, githubRepo: "example/project",
-    agent: "codex", config: { deploymentProbe: [join(directory, "probe")] }, now: created });
+    agent: "codex", config: { intervalSeconds: 60, deploymentProbe: [join(directory, "probe")] }, now: created });
   const store = new JobStore();
   store.insert(job);
   const mergeSha = "a".repeat(40);
@@ -194,7 +194,7 @@ test("a deployment-blocked local issue can correct its own mode and complete wit
     title: "Local CLI", body: "## Acceptance Criteria\n- [ ] `[test:local]` Local tests pass.\n- [ ] `[code:layout]` Output uses the new layout.",
     labels: [], url: "https://github.com/example/project/issues/7" };
   const job = createJob({ issue, repoRoot: directory, worktree: directory, githubRepo: "example/project",
-    agent: "codex", config: { deploymentProbe: [join(directory, "must-not-run")] } });
+    agent: "codex", config: { intervalSeconds: 60, deploymentProbe: [join(directory, "must-not-run")] } });
   const store = new JobStore();
   store.insert(job);
   const mergeSha = "a".repeat(40);
@@ -261,6 +261,9 @@ test("real adapter refusals survive restart, appear in status and heartbeat logs
       config: { verification: "local", intervalSeconds: 17, maxWakeups: 1, maxErrors: 2 },
       now: new Date(Date.now() - 60_000) });
     store.insert(job);
+    store.update(job.id, current => {
+      current.coordinatorNotes = [{ id: `retry-${index}`, text: "Retry the current issue work", at: new Date().toISOString() }];
+    });
     writeFileSync(file, JSON.stringify({ session: { id: job.sessionID, cwd: directory, status: "idle" },
       refusal: { operation, code, message }, attempts: [], wakes: [] }));
     await lifecycleCLI(["tick", "--job", job.id]);
@@ -356,7 +359,7 @@ async function linearFixture(t: import("node:test").TestContext, human = false) 
   t.mock.method(console, "log", () => {});
   const job = createJob({ issue: { backend: "linear", identifier: linear.identifier, title: linear.title,
     body, url: linear.url, labels: [] }, repoRoot: directory, worktree: directory, githubRepo: "example/project",
-    agent: "codex", config: { verification: "local", deploymentProbe: [join(directory, "probe")] }, now: new Date(Date.now() - 60_000) });
+    agent: "codex", config: { verification: "local", intervalSeconds: 60, deploymentProbe: [join(directory, "probe")] }, now: new Date(Date.now() - 60_000) });
   jobID = job.id; store.insert(job);
   const mergeSha = "a".repeat(40);
   checkpoint(store, job.id, { stage: "verifying", detail: "Independent acceptance", pr: "https://github.com/example/project/pull/8", mergeSha });
@@ -569,10 +572,10 @@ test("generated managed instructions describe automatic closeout, recovery, race
   const instructions = managedInstructions(f.job).join("\n");
   assert.match(instructions, /automatically synchronizes proven Linear AC/);
   assert.match(instructions, /Submit independent partial progress/);
-  assert.match(instructions, /Only evidenced pass\/fail checkbox states/);
+  assert.match(instructions, /proven Linear AC checkboxes/);
   assert.match(instructions, /job closeout/);
   assert.match(instructions, /race/);
-  assert.match(instructions, /owner holds and real human acceptance/);
+  assert.match(instructions, /Owner holds and real human acceptance/);
   assert.match(instructions, /does not authorize a deployment/);
   assert.doesNotMatch(instructions, /before submitting the report|leave Linear in.*In Review|Never set Done/);
 });

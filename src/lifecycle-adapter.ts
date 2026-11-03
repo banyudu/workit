@@ -8,7 +8,7 @@ import { agentDefinitionsByTag, resolveConfig } from "./config.js";
 import { chooseAgent } from "./agents.js";
 import { launchIndependentVerifier } from "./launch.js";
 import { originRemote } from "./git.js";
-import { WorkflowRefusedError, SourceProvenanceError, digest, validateReport, sanitizedDetail, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun } from "./lifecycle.js";
+import { WorkflowRefusedError, SourceProvenanceError, digest, validateReport, sanitizedDetail, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRCheck, type PRReviewScore, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun } from "./lifecycle.js";
 
 const exec = promisify(execFile);
 // Session inventories include retained history and can exceed 4 MiB even when
@@ -54,6 +54,67 @@ export function githubRepository(remote?: string): string {
   const value = remote?.match(/(?:github\.com[/:])([^/]+\/[^/]+?)(?:\.git)?$/)?.[1];
   if (!value) throw new Error("Managed jobs require a GitHub origin remote");
   return value;
+}
+
+function reviewChecks(value: unknown): PRCheck[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    if (!item || typeof item !== "object") return [];
+    const check = item as Record<string, unknown>;
+    const name = typeof check.name === "string" ? check.name.trim() : "";
+    if (!name) return [];
+    return [{ name, ...(typeof check.required === "boolean" ? { required: check.required } : {}),
+      ...(typeof check.url === "string" && check.url ? { url: check.url } : {}) }];
+  });
+}
+
+function reviewScore(value: unknown, headSha?: string): PRReviewScore | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const root = value as Record<string, unknown>;
+  const summaries = Array.isArray(root.summaries) ? root.summaries : [];
+  const candidates = summaries.flatMap(item => {
+    if (!item || typeof item !== "object") return [];
+    const summary = item as Record<string, unknown>;
+    const head = typeof summary.head === "string" && sha(summary.head) ? summary.head : undefined;
+    if (!head) return [];
+    const match = typeof summary.score === "string" ? summary.score.match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+)\s*$/) : undefined;
+    const score = match ? Number(match[1]) : typeof summary.score === "number" ? summary.score : undefined;
+    const outOf = match ? Number(match[2]) : 5;
+    if (!Number.isFinite(score) || !Number.isFinite(outOf) || outOf <= 0) return [];
+    return [{ provider: "review", headSha: head, score: score!, outOf,
+      stale: summary.stale === true, ...(typeof summary.url === "string" && summary.url ? { url: summary.url } : {}) }];
+  });
+  return candidates.find(item => item.headSha === headSha && !item.stale) ?? candidates[0];
+}
+
+function reviewProbeSnapshot(value: unknown, headSha?: string): Pick<PRSnapshot, "pendingChecks" | "failingChecks" | "reviewDecision" | "unresolvedReviews" | "reviewScore"> {
+  if (!value || typeof value !== "object") throw new Error("Review probe must return a JSON object");
+  const root = value as Record<string, unknown>;
+  const observedHead = root.head && typeof root.head === "object" ? (root.head as Record<string, unknown>).sha : undefined;
+  if (typeof observedHead === "string" && observedHead && sha(observedHead) && headSha && observedHead !== headSha) {
+    throw new Error("Review probe returned a different PR head; retry the preflight");
+  }
+  const checks = root.checks && typeof root.checks === "object" ? root.checks as Record<string, unknown> : {};
+  const threads = root.threads && typeof root.threads === "object" ? root.threads as Record<string, unknown> : {};
+  const items = Array.isArray(threads.items) ? threads.items : [];
+  const unresolvedReviews = items.flatMap(item => {
+    if (!item || typeof item !== "object") return [];
+    const thread = item as Record<string, unknown>;
+    if (thread.resolved === true) return [];
+    const body = typeof thread.lastBody === "string" && thread.lastBody.trim() ? thread.lastBody
+      : typeof thread.firstBody === "string" ? thread.firstBody : undefined;
+    return [{ ...(typeof thread.id === "string" ? { id: thread.id } : {}),
+      ...(typeof thread.path === "string" ? { path: thread.path } : {}),
+      ...(typeof thread.line === "number" ? { line: thread.line } : {}),
+      ...(body ? { body } : {}), ...(typeof thread.url === "string" && thread.url ? { url: thread.url } : {}) }];
+  });
+  return {
+    pendingChecks: reviewChecks(checks.pending), failingChecks: reviewChecks(checks.failing),
+    ...(typeof root.reviewDecision === "string" ? { reviewDecision: root.reviewDecision }
+      : root.reviewDecision === null ? { reviewDecision: "REVIEW_REQUIRED" } : {}),
+    unresolvedReviews,
+    ...(reviewScore(root.superdog, headSha) ? { reviewScore: reviewScore(root.superdog, headSha)! } : {}),
+  };
 }
 
 export class BanyanLifecycleAdapter implements LifecycleAdapter {
@@ -139,20 +200,51 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
     const value = await commandJSON(["gh", "pr", "view", job.pr, "--repo", job.githubRepo,
       "--json", "state,headRefOid,mergeCommit,updatedAt,reviewDecision,mergeStateStatus,statusCheckRollup"], job.repoRoot) as {
       state: string; headRefOid: string; mergeCommit?: { oid: string }; updatedAt: string;
-      reviewDecision: string; mergeStateStatus: string;
-      statusCheckRollup?: Array<{ status?: string; conclusion?: string; state?: string }>;
+      reviewDecision: string | null; mergeStateStatus: string;
+      statusCheckRollup?: Array<{ name?: string; context?: string; status?: string; conclusion?: string; state?: string; detailsUrl?: string; targetUrl?: string }>;
     };
     const checks = value.statusCheckRollup ?? [];
-    const pending = checks.some(check => (check.status && check.status !== "COMPLETED") ||
-      ["PENDING", "EXPECTED"].includes(check.state ?? ""));
-    const failed = checks.some(check => (check.conclusion && !["SUCCESS", "NEUTRAL", "SKIPPED"].includes(check.conclusion)) || ["FAILURE", "ERROR"].includes(check.state ?? ""));
+    let pendingChecks: PRCheck[] = []; let failingChecks: PRCheck[] = [];
+    for (const check of checks) {
+      const name = check.name?.trim() || check.context?.trim();
+      if (!name) continue;
+      const fact = { name, ...(check.detailsUrl || check.targetUrl ? { url: check.detailsUrl ?? check.targetUrl } : {}) };
+      if ((check.status && check.status !== "COMPLETED") || ["PENDING", "EXPECTED"].includes(check.state ?? "")) pendingChecks.push(fact);
+      else if ((check.conclusion && !["SUCCESS", "NEUTRAL", "SKIPPED"].includes(check.conclusion)) || ["FAILURE", "ERROR"].includes(check.state ?? "")) failingChecks.push(fact);
+    }
+    let review: Pick<PRSnapshot, "pendingChecks" | "failingChecks" | "reviewDecision" | "unresolvedReviews" | "reviewScore"> | undefined;
+    const prNumber = job.pr.match(/\/pull\/([1-9][0-9]*)(?:$|[/?#])/)?.[1];
+    if (!pendingChecks.length && value.state === "OPEN" && job.config.reviewProbe?.length) {
+      if (!prNumber) throw new Error("PR checkpoint has no numeric pull request number for review preflight");
+      const observed = await commandJSON([...job.config.reviewProbe, prNumber], job.repoRoot, {
+        WORKIT_PR_NUMBER: prNumber, WORKIT_PR_URL: job.pr, WORKIT_GITHUB_REPO: job.githubRepo,
+        WORKIT_PR_HEAD_SHA: value.headRefOid,
+      });
+      review = reviewProbeSnapshot(observed, value.headRefOid);
+      // review-map deduplicates canceled attempts and is authoritative when configured.
+      pendingChecks = review.pendingChecks ?? [];
+      failingChecks = review.failingChecks ?? [];
+    }
+    const pending = pendingChecks.length > 0;
+    const failed = failingChecks.length > 0;
+    const reviewDecision = review?.reviewDecision ?? value.reviewDecision ?? undefined;
+    const headSha = sha(value.headRefOid) ? value.headRefOid : undefined;
+    const score = review?.reviewScore;
+    const currentScore = score && score.headSha === headSha && !score.stale ? score : undefined;
+    const reviewSatisfied = !job.config.reviewScoreRequired || (!!currentScore && currentScore.score >= currentScore.outOf);
+    const reviewClear = !review?.unresolvedReviews?.length && reviewDecision !== "CHANGES_REQUESTED";
+    const mergeState = ["CLEAN", "DIRTY", "BLOCKED", "BEHIND", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"].includes(value.mergeStateStatus) ? value.mergeStateStatus : "UNKNOWN";
+    const state = { state: value.state, headSha, mergeSha: value.mergeCommit?.oid, mergeState, reviewDecision,
+      pendingChecks: pendingChecks.map(check => check.name).sort(), failingChecks: failingChecks.map(check => check.name).sort(),
+      unresolvedReviews: (review?.unresolvedReviews ?? []).map(item => [item.id, item.path, item.line, item.body]),
+      score: currentScore ? [currentScore.headSha, currentScore.score, currentScore.outOf] : null };
     // Readiness wakes the agent to assess policy; it never authorizes merging.
-    return { fingerprint: digest(JSON.stringify(value)), merged: value.state === "MERGED",
+    return { fingerprint: digest(JSON.stringify(state)), merged: value.state === "MERGED",
       mergeSha: value.mergeCommit?.oid, closed: value.state === "CLOSED",
-      headSha: sha(value.headRefOid) ? value.headRefOid : undefined,
-      mergeState: ["CLEAN", "DIRTY", "BLOCKED", "BEHIND", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"].includes(value.mergeStateStatus) ? value.mergeStateStatus : "UNKNOWN",
+      headSha, mergeState, reviewDecision, ...review,
       checks: pending ? "pending" : failed ? "fail" : "pass",
-      ready: value.state === "OPEN" && !pending && !failed && value.mergeStateStatus === "CLEAN" && value.reviewDecision !== "CHANGES_REQUESTED" };
+      pendingChecks, failingChecks,
+      ready: value.state === "OPEN" && !pending && !failed && mergeState === "CLEAN" && reviewClear && reviewSatisfied };
   }
   async observedSource(job: Pick<Job, "worktree">): Promise<string> {
     await exec("git", ["diff", "--quiet", "HEAD", "--"], { cwd: job.worktree, timeout: 10_000 });

@@ -25,7 +25,7 @@ export function heartbeatPlist(input: { node: string; cli: string; path: string;
 export function heartbeatCLI(args: string[]): void {
   if (process.platform !== "darwin") throw new Error("Automatic heartbeat installation requires macOS launchd; run workit tick from your host scheduler elsewhere");
   const action = args[0];
-  if (!["install", "uninstall", "status"].includes(action)) throw new Error("Usage: workit heartbeat install [--interval 60] | uninstall | status");
+  if (!["install", "uninstall", "status"].includes(action)) throw new Error("Usage: workit heartbeat install [--interval 600] | uninstall | status");
   if (args.slice(1).length && !(action === "install" && args.length === 3 && args[1] === "--interval")) throw new Error("Unknown heartbeat options");
   const path = join(homedir(), "Library", "LaunchAgents", label + ".plist");
   const service = `gui/${process.getuid!()}/${label}`;
@@ -41,7 +41,7 @@ export function heartbeatCLI(args: string[]): void {
   const state = resolve(process.env.WORKIT_STATE_DIR ?? join(homedir(), ".local", "state", "workit"));
   const logs = join(state, "logs");
   const content = heartbeatPlist({ node: process.execPath, cli, path: process.env.PATH ?? "/usr/bin:/bin",
-    logs, state, interval: Number(args[2] ?? 60) });
+    logs, state, interval: Number(args[2] ?? 600) });
   mkdirSync(dirname(path), { recursive: true });
   mkdirSync(logs, { recursive: true, mode: 0o700 });
   writeFileSync(path, content, { mode: 0o600 });

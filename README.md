@@ -258,12 +258,12 @@ in `src/config.ts`) asks the agent to:
 
 - Implement, test, commit, push, and open a ready-for-review PR, or reuse the
   branch's existing PR.
-- Wait for Superdog's review, address actionable review and CI feedback, test,
-  and push fixes. Repeat until Superdog scores the **current PR head commit
-  5/5**, actionable feedback is addressed, and required checks pass.
-- Verify the reviewed commit SHA using review/check metadata. Older scores and
-  missing or pending reviews do not satisfy completion. Report unavailable
-  reviewers or other external blockers with evidence.
+- Inspect the current PR head, checks, review findings and score before acting;
+  repair only failures or actionable findings and do not rerun unchanged review
+  work.
+- Stop polling while checks or review are pending so the scheduler can continue
+  the same conversation later. Report unavailable reviewers or other external
+  blockers with evidence.
 - Hand a merged Linear issue over: attach the PR and set the issue state to
   **In Review**. After independent acceptance verification and evidence/checklist
   reconciliation, move it to **Done**. Managed jobs do this automatically when

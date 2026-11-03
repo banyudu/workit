@@ -33,7 +33,7 @@ async function fixture(t: { after: (fn: () => void) => void }, extra = {}) {
     launchVerifier: async (_job, run) => { verifiers.push(run.id); },
   };
   const attach = (q: WorkQueue, item: QueueItem) => queues.attach(q.id, item.launchID!, createJob({ issue: issue(item.issue), repoRoot: item.repo, worktree: item.repo,
-    githubRepo: "example/project", agent: "fixture", config: { verification: "local", delivery: "implementation" }, now }), now);
+    githubRepo: "example/project", agent: "fixture", config: { verification: "local", delivery: "implementation", intervalSeconds: 60 }, now }), now);
   const launcher = { launch: async (q: WorkQueue, item: QueueItem) => { attach(q, item); launches.push(item.key); queues.confirm(q.id, item.jobID, item.launchID!); } };
   const control = (state: WorkQueue["state"]) => queues.control(queue.id, state, queues.get(queue.id).revision, now);
   const advance = () => advanceQueues(jobs, adapter, launcher, now);

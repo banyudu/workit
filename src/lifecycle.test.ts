@@ -20,7 +20,7 @@ function fixture(t: { after: (fn: () => void) => void }, config = {}) {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const store = new JobStore(directory);
   const job = createJob({ issue, repoRoot: directory, worktree: join(directory, "tree"),
-    githubRepo: "example/project", agent: "codex", config: { deploymentProbe: ["probe"], ...config }, now });
+    githubRepo: "example/project", agent: "codex", config: { intervalSeconds: 60, deploymentProbe: ["probe"], ...config }, now });
   store.insert(job);
   const adapter = new FakeAdapter(job);
   const run = (at = new Date(now.getTime() + 60_000)) => tick(store, adapter, { now: at, process: "test:owner", alive: () => true });
@@ -52,6 +52,12 @@ class FakeAdapter implements LifecycleAdapter {
   async markDone() { return true; }
 }
 
+function queueCoordinatorNote(store: JobStore, job: Job, id = "coordinator-follow-up") {
+  store.update(job.id, current => {
+    (current.coordinatorNotes ??= []).push({ id, text: "Continue the current issue work", at: now.toISOString() });
+  }, now);
+}
+
 test("lifecycle state larger than Node's default output buffer stays readable and writable", t => {
   const { store, job } = fixture(t);
   const detail = "x".repeat(1100 * 1024);
@@ -60,6 +66,30 @@ test("lifecycle state larger than Node's default output buffer stays readable an
   assert.equal(store.get(job.id).detail, detail);
   store.update(job.id, current => { current.detail += "updated"; }, now);
   assert.equal(store.get(job.id).detail, detail + "updated");
+});
+
+test("cost-safe defaults leave idle work parked and still deliver concrete coordinator actions", { timeout: 20_000 }, async t => {
+  for (const stage of ["implementing", "fixing", "investigating"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), "workit-idle-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const store = new JobStore(directory);
+    const job = createJob({ issue, repoRoot: directory, worktree: join(directory, "tree"), githubRepo: "example/project",
+      agent: "codex", config: { deploymentProbe: ["probe"] }, now });
+    assert.equal(job.config.intervalSeconds, 300);
+    assert.equal(job.config.maxWakeups, 6);
+    store.insert(job);
+    store.update(job.id, current => { current.stage = stage; }, now);
+    const adapter = new FakeAdapter(job);
+
+    const idle = await tick(store, adapter, { now: new Date(now.getTime() + 300_000), process: "owner", alive: () => true });
+    assert.deepEqual(idle, [{ id: job.id, result: "unchanged" }]);
+    assert.equal(adapter.wakes.length, 0, stage);
+
+    queueCoordinatorNote(store, job);
+    await tick(store, adapter, { now: new Date(store.get(job.id).nextWakeAt!), process: "owner", alive: () => true });
+    assert.equal(adapter.wakes.length, 1, stage);
+    assert.match(adapter.prompts[0], /coordinator follow-up is pending/);
+  }
 });
 
 test("job identity is repository-scoped, checkpoints persist across restart, and checked boxes preserve AC binding", t => {
@@ -75,15 +105,93 @@ test("job identity is repository-scoped, checkpoints persist across restart, and
     agent: "claude", now }), /deploymentProbe before launch/);
 });
 
-test("unchanged CI consumes no agent turn; a changed review wakes the original session", async t => {
+test("unchanged or still-pending CI consumes no agent turn; a failing check wakes with its name", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  const detail = `CI pending ${"previous checkpoint ".repeat(300)}`;
+  checkpoint(store, job.id, { stage: "waiting-ci", detail, pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { fingerprint: "pending-a", ready: false, merged: false, checks: "pending",
+    headSha: "a".repeat(40), pendingChecks: [{ name: "Lint checks" }] };
+  await run();
+  assert.equal(adapter.wakes.length, 0);
+  adapter.snapshot = { fingerprint: "pending-b", ready: false, merged: false, checks: "pending",
+    headSha: "a".repeat(40), pendingChecks: [{ name: "Lint checks" }, { name: "E2E Source Tests" }] };
+  await run(new Date(now.getTime() + 120_000));
+  assert.equal(adapter.wakes.length, 0);
+  adapter.snapshot = { fingerprint: "lint-failed", ready: false, merged: false, checks: "fail",
+    headSha: "a".repeat(40), failingChecks: [{ name: "Lint checks" }] };
+  await run(new Date(now.getTime() + 180_000));
+  assert.equal(adapter.wakes.length, 1);
+  assert.equal(store.get(job.id).sessionID, job.sessionID);
+  assert.match(adapter.prompts[0], /PR has failing checks/);
+  assert.match(adapter.prompts[0], /Fix failing checks: Lint checks/);
+  assert.doesNotMatch(adapter.prompts[0], /work until|5\/5/);
+  assert.match(adapter.prompts[0], new RegExp(`job status ${job.id}`));
+  assert.doesNotMatch(adapter.prompts[0], /Checkpoint:|Verification mode|Deployment authorization/);
+  assert.doesNotMatch(adapter.prompts[0], /previous checkpoint/);
+  assert.equal(store.get(job.id).detail, detail);
+  assert.ok(adapter.prompts[0].length < 1000);
+});
+
+test("a still-ready unchanged PR consumes no repeated agent turns", async t => {
   const { store, job, adapter, run } = fixture(t);
   checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
   await run();
-  assert.equal(adapter.wakes.length, 0);
-  adapter.snapshot.fingerprint = "review-added";
-  await run(new Date(now.getTime() + 120_000));
+  adapter.snapshot = { fingerprint: "checks-green", ready: true, merged: false };
+  await run(new Date(store.get(job.id).nextWakeAt!));
   assert.equal(adapter.wakes.length, 1);
-  assert.equal(store.get(job.id).sessionID, job.sessionID);
+  assert.equal(store.get(job.id).wakeups, 1);
+
+  const unchanged = await run(new Date(store.get(job.id).nextWakeAt!));
+  assert.deepEqual(unchanged, [{ id: job.id, result: "unchanged" }]);
+  assert.equal(adapter.wakes.length, 1);
+  assert.equal(store.get(job.id).wakeups, 1);
+});
+
+test("a stale review score never triggers repair work", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Review pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { fingerprint: "stale-score", merged: false, ready: false, headSha: "b".repeat(40),
+    checks: "pass", reviewScore: { provider: "review", headSha: "a".repeat(40), score: 3, outOf: 5 } };
+  const result = await run();
+  assert.deepEqual(result, [{ id: job.id, result: "unchanged" }]);
+  assert.equal(adapter.wakes.length, 0);
+  assert.equal(store.get(job.id).facts?.pr?.reviewScore?.headSha, "a".repeat(40));
+});
+
+test("a below-5 current-head score wakes once with bounded actionable findings", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Review pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { fingerprint: "score-4", merged: false, ready: false, headSha: "a".repeat(40), checks: "pass",
+    reviewScore: { provider: "review", headSha: "a".repeat(40), score: 4, outOf: 5 },
+    unresolvedReviews: [{ id: "thread-1", path: "src/widget.ts", line: 42, body: "Preserve the empty state." }] };
+  await run();
+  assert.equal(adapter.wakes.length, 1);
+  assert.match(adapter.prompts[0], /review 4\/5 on current head/);
+  assert.match(adapter.prompts[0], /Review score is 4\/5/);
+  assert.match(adapter.prompts[0], /src\/widget\.ts:42/);
+  assert.match(adapter.prompts[0], /Preserve the empty state/);
+
+  const unchanged = await run(new Date(store.get(job.id).nextWakeAt!));
+  assert.deepEqual(unchanged, [{ id: job.id, result: "unchanged" }]);
+  assert.equal(adapter.wakes.length, 1);
+});
+
+test("a current-head 5/5 becomes one explicit merge-readiness turn, not another repair loop", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Review pending", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.snapshot = { fingerprint: "score-5", merged: false, ready: true, headSha: "a".repeat(40), checks: "pass",
+    mergeState: "CLEAN", reviewScore: { provider: "review", headSha: "a".repeat(40), score: 5, outOf: 5 } };
+  await run();
+  assert.equal(adapter.wakes.length, 1);
+  assert.match(adapter.prompts[0], /PR is merge-ready for the current head/);
+  assert.match(adapter.prompts[0], /review 5\/5 on current head/);
+  assert.match(adapter.prompts[0], /if merge is authorized, merge the current head/);
+  assert.doesNotMatch(adapter.prompts[0], /address its actionable findings|work until/);
+
+  const unchanged = await run(new Date(store.get(job.id).nextWakeAt!));
+  assert.deepEqual(unchanged, [{ id: job.id, result: "unchanged" }]);
+  assert.equal(adapter.wakes.length, 1);
+  assert.equal(store.get(job.id).wakeups, 1);
 });
 
 test("merged source waits for an actual containing deployment before verification", async t => {
@@ -109,12 +217,11 @@ test("local jobs verify merged source directly and launch/heartbeat guidance res
   assert.equal(store.get(job.id).deployment, undefined);
   assert.equal(adapter.deploymentCalls, 0);
   assert.equal(adapter.wakes.length, 1);
-  for (const prompt of [managedInstructions(job).join("\n"), adapter.prompts[0]]) {
-    assert.match(prompt, /Verification mode for this issue: local/);
-    assert.match(prompt, /every AC against the merged source locally/);
-    assert.match(prompt, /complete independent AC evidence/);
-    assert.doesNotMatch(prompt, /await the scheduled deployment|actual serving source\/version/i);
-  }
+  const guidance = managedInstructions(job).join("\n");
+  assert.match(guidance, /Verification mode for this issue: local/);
+  assert.match(guidance, /every AC against the merged source locally/);
+  assert.match(guidance, /complete independent AC evidence/);
+  assert.doesNotMatch(adapter.prompts[0], /Verification mode|Review pending/);
   assert.throws(() => checkpoint(store, job.id, { stage: "waiting-deploy", detail: "Unnecessary wait" }, now), /directly to verifying/);
 });
 
@@ -225,6 +332,7 @@ test("Linear completion requires the completed workflow after evidence-backed cl
 
 test("competing ticks claim the same job only once", async t => {
   const { store, job, adapter } = fixture(t);
+  queueCoordinatorNote(store, job);
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   adapter.session = async () => { await gate; return adapter.current; };
@@ -238,6 +346,7 @@ test("competing ticks claim the same job only once", async t => {
 
 test("a lost delivery response reconciles the persisted receipt without replay", async t => {
   const { store, job, adapter, run } = fixture(t);
+  queueCoordinatorNote(store, job);
   adapter.loseResponse = true;
   await run();
   assert.ok(store.get(job.id).wake);
@@ -283,13 +392,14 @@ test("a proven pre-delivery refusal retries the same persisted wake", async t =>
   assert.notEqual(store.get(job.id).stage, "needs-you");
 });
 
-test("both refusal codes keep deterministic changed-review wakes runnable without spending either budget", async t => {
+test("both refusal codes keep deterministic changed-review wakes runnable without spending either budget", { timeout: 20_000 }, async t => {
   for (const code of ["workflow_refused", "workflow_wake_refused"] as const) {
     for (const operation of ["project", "wake"] as const) {
       const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 2, maxWakeups: 1 });
       checkpoint(store, job.id, { stage: "waiting-ci", detail: "CI pending", pr: "https://github.com/example/project/pull/9" }, now);
       await run();
-      adapter.snapshot.fingerprint = "review-added";
+      adapter.snapshot = { fingerprint: "lint-failed", ready: false, merged: false, checks: "fail",
+        headSha: "a".repeat(40), failingChecks: [{ name: "Lint checks" }] };
       const original = { project: adapter.project, wake: adapter.wake };
       const attempts: string[] = [];
       const message = operation === "project" ? "stale workflow revision" : "agent is busy, unobserved, or awaiting human input";
@@ -311,7 +421,7 @@ test("both refusal codes keep deterministic changed-review wakes runnable withou
         assert.ok(current.wake);
         wakeID ??= current.wake.id;
         assert.equal(current.wake.id, wakeID);
-        assert.equal(current.wake.reason, "PR checks or reviews changed");
+        assert.equal(current.wake.reason, "PR has failing checks");
         assert.deepEqual(result, [{ id: job.id, result: "workflow-refused", detail: `${code}: ${message}` }]);
       }
       assert.ok(attempts.every(id => id === wakeID));
@@ -321,7 +431,7 @@ test("both refusal codes keep deterministic changed-review wakes runnable withou
       assert.deepEqual(adapter.wakes, [wakeID]);
       assert.equal(store.get(job.id).wakeups, 1);
       assert.equal(store.get(job.id).wake, undefined);
-      adapter.snapshot.ready = true;
+      adapter.snapshot = { fingerprint: "checks-green", ready: true, merged: false };
       await run(new Date(store.get(job.id).nextWakeAt!));
       assert.equal(store.get(job.id).stage, "needs-you");
       assert.equal(adapter.wakes.length, 1);
@@ -331,6 +441,7 @@ test("both refusal codes keep deterministic changed-review wakes runnable withou
 
 test("a lost delivery response charges the wakeup budget exactly once when reconciled", async t => {
   const { store, job, adapter, run } = fixture(t, { maxWakeups: 1 });
+  queueCoordinatorNote(store, job);
   adapter.loseResponse = true;
   await run();
   assert.equal(store.get(job.id).wakeups, 0);
@@ -393,6 +504,7 @@ test("transient errors back off and become visible after a bounded number of ret
 test("real wake failures still back off and park at maxErrors", async t => {
   for (const message of ["timed out", "did not return JSON", "server unavailable", "server returned HTTP 503"]) {
     const { store, job, adapter, run } = fixture(t, { intervalSeconds: 17, maxErrors: 3, maxWakeups: 1 });
+    queueCoordinatorNote(store, job);
     const ids: string[] = [];
     adapter.wake = async (_job, id) => { ids.push(id); throw new Error(message); };
     for (let attempt = 1; attempt <= 3; attempt++) {

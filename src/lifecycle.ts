@@ -14,6 +14,8 @@ export const stages = ["investigating", "implementing", "preverifying", "reviewi
 export type Stage = typeof stages[number];
 export type DeliveryKind = "implementation" | "investigation";
 export type VerificationMode = "deployed" | "local";
+export const DEFAULT_INTERVAL_SECONDS = 300;
+export const DEFAULT_MAX_WAKEUPS = 6;
 export interface Deployment {
   environment: string; target: string; sourceSha: string; version: string;
 }
@@ -31,6 +33,10 @@ export interface LifecycleConfig {
   verification?: VerificationMode;
   /** Trusted, read-only argv; stdout: {ready, environment, target, sourceSha, version}. */
   deploymentProbe?: string[];
+  /** Trusted, read-only argv; the PR number is appended. Stdout is normalized below. */
+  reviewProbe?: string[];
+  /** Require a current-head passing review score before a PR is merge-ready. */
+  reviewScoreRequired?: boolean;
   /** Trusted grouping key. Attention views expose only its digest. */
   deploymentDependency?: string;
   verifier?: { enabled?: boolean; agent?: string; concurrency?: number; maxAttempts?: number; timeoutSeconds?: number };
@@ -44,6 +50,7 @@ export interface VerifierRun {
   id: string; sessionID: string; agent: string; binding: string; reportPath: string; outcomePath: string;
   state: "reserved" | "running" | "uncertain" | "failed" | "report-ready" | "accepted" | "invalidated";
   handoff?: "repair" | "tracker";
+  handoffDeliveredAt?: string;
   reservedAt: string; startedAt?: string; timeoutSeconds: number;
   delivery?: "delivered" | "not-delivered"; recovery?: { reason: string; at: string };
 }
@@ -79,6 +86,7 @@ export interface Job {
   blocker?: Blocker;
   facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
   verifier?: VerifierRun; verifierHistory?: VerifierRun[]; verifierAttempts?: number;
+  manualVerificationHandoff?: { binding: string; deliveredAt?: string };
 }
 export interface VerificationReport {
   jobID: string; issueURL: string; acHash: string; mergeSha?: string; sourceSha?: string; checkedAt: string;
@@ -240,23 +248,29 @@ export function createJob(input: {
 }): Job {
   const now = (input.now ?? new Date()).toISOString();
   const id = digest(input.repoRoot + "\n" + input.issue.url).slice(0, 24);
-  const config = selectDeploymentTarget({ verification: "deployed" as const, intervalSeconds: 60, maxWakeups: 40, maxErrors: 5, ...input.config,
+  const config = selectDeploymentTarget({ verification: "deployed" as const, intervalSeconds: DEFAULT_INTERVAL_SECONDS,
+    maxWakeups: DEFAULT_MAX_WAKEUPS, maxErrors: 5, ...input.config,
     ...(input.acceptance ? { verification: input.acceptance } : {}) }, input.config?.deploymentTarget);
   if (config.delivery === "investigation" && !sha(input.observedSourceSha)) throw new Error("Investigation requires a pinned observed source SHA");
   for (const key of ["intervalSeconds", "maxWakeups", "maxErrors"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key]! < 1) throw new Error(`lifecycle.${key} must be a positive integer`);
   }
-  if (config.deploymentProbe && (!Array.isArray(config.deploymentProbe) || !config.deploymentProbe.length ||
-      config.deploymentProbe.some(arg => typeof arg !== "string" || !arg || arg.includes("\0")))) {
-    throw new Error("lifecycle.deploymentProbe must be non-empty argv");
+  for (const key of ["deploymentProbe", "reviewProbe"] as const) {
+    const probe = config[key];
+    if (probe && (!Array.isArray(probe) || !probe.length ||
+        probe.some(arg => typeof arg !== "string" || !arg || arg.includes("\0")))) {
+      throw new Error(`lifecycle.${key} must be non-empty argv`);
+    }
   }
+  if (config.reviewScoreRequired !== undefined && typeof config.reviewScoreRequired !== "boolean") throw new Error("lifecycle.reviewScoreRequired must be a boolean");
+  if (config.reviewScoreRequired && !config.reviewProbe?.length) throw new Error("lifecycle.reviewScoreRequired needs a trusted reviewProbe");
   validateVerificationMode(config, input.issue.body);
   return { schema: 1, id, revision: 0, issue: input.issue, ...acceptance(input.issue.body),
     repoRoot: input.repoRoot, worktree: input.worktree, githubRepo: input.githubRepo,
     sessionID: "workit-" + id, agent: input.agent, stage: config.delivery === "investigation" ? "investigating" : "implementing", detail: "",
     ...(config.delivery === "investigation" ? { observedSourceSha: input.observedSourceSha } : {}),
     config, createdAt: now, updatedAt: now, lastProgressAt: now,
-    nextWakeAt: new Date(Date.parse(now) + (config.intervalSeconds ?? 60) * 1000).toISOString(), errors: 0, wakeups: 0 };
+    nextWakeAt: new Date(Date.parse(now) + (config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString(), errors: 0, wakeups: 0 };
 }
 
 // Python's standard-library SQLite keeps Node 20 support, avoids a native npm
@@ -412,7 +426,7 @@ export function checkpoint(store: JobStore, id: string, patch: {
     // A checkpoint is not proof that a concurrent coordinator note arrived.
     // Retain its identity until the original Banyan receipt is inspected.
     if (runnableStage(job.stage) && !job.wake?.coordinatorNoteIDs?.length) delete job.wake;
-    if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? 60) * 1000).toISOString();
+    if (runnableStage(job.stage)) job.nextWakeAt = new Date(now.getTime() + (patch.after ?? job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
     else delete job.nextWakeAt;
   }, now);
 }
@@ -500,7 +514,84 @@ export interface Session {
   needsRecovery?: boolean;
   workflow?: { owner: string; jobID: string; revision: number; state: string; wake?: { id: string; status: string } };
 }
-export interface PRSnapshot { fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean; headSha?: string; mergeState?: string; checks?: "pending" | "pass" | "fail" }
+export interface PRCheck { name: string; required?: boolean; url?: string }
+export interface PRReviewFinding { id?: string; path?: string; line?: number; body?: string; url?: string }
+export interface PRReviewScore { provider: string; headSha: string; score: number; outOf: number; stale?: boolean; url?: string }
+export interface PRSnapshot {
+  fingerprint: string; merged: boolean; mergeSha?: string; ready: boolean; closed?: boolean;
+  headSha?: string; mergeState?: string; checks?: "pending" | "pass" | "fail";
+  pendingChecks?: PRCheck[]; failingChecks?: PRCheck[];
+  reviewDecision?: string; unresolvedReviews?: PRReviewFinding[]; reviewScore?: PRReviewScore;
+}
+export interface PRDecision {
+  actionable: boolean; mergeReady: boolean; reason: string; next: string[];
+}
+
+function boundedNames(checks: PRCheck[], limit = 4): string {
+  const names = [...new Set(checks.map(check => check.name).filter(Boolean))];
+  if (!names.length) return "unnamed check";
+  return names.slice(0, limit).join(", ") + (names.length > limit ? ` (+${names.length - limit} more)` : "");
+}
+
+function boundedFinding(finding: PRReviewFinding): string {
+  const where = [finding.path, finding.line].filter(value => value !== undefined && value !== "").join(":");
+  const body = (finding.body ?? "Review finding").replace(/\s+/g, " ").trim().slice(0, 180);
+  return JSON.stringify(`${where ? where + ": " : ""}${body}`);
+}
+
+/** Pure downstream policy: complete prechecks before spending an agent turn. */
+export function prDecision(pr: PRSnapshot, scoreRequired = false): PRDecision {
+  if (pr.merged) return { actionable: false, mergeReady: false, reason: "PR is merged", next: [] };
+  const next: string[] = [];
+  if (pr.mergeState === "DIRTY") next.push("Resolve merge conflicts, test, and push the updated head.");
+  if (pr.mergeState === "BEHIND") next.push("Update the branch from its base, test, and push the updated head.");
+  if (pr.mergeState === "DRAFT") next.push("Mark the PR ready for review.");
+  if (pr.checks === "fail" || pr.failingChecks?.length) {
+    next.push(`Fix failing checks: ${boundedNames(pr.failingChecks ?? [])}.`);
+  }
+  const unresolved = pr.unresolvedReviews ?? [];
+  if (pr.reviewDecision === "CHANGES_REQUESTED" || unresolved.length) {
+    next.push(`Address unresolved review findings${unresolved.length ? `: ${unresolved.slice(0, 3).map(boundedFinding).join("; ")}` : "."}`);
+  }
+
+  // CI is a batching barrier: when nothing is already broken, wait for a
+  // terminal result before asking the agent to act on review feedback.
+  if (!next.length && pr.checks === "pending") {
+    return { actionable: false, mergeReady: false,
+      reason: `waiting for ${pr.pendingChecks?.length ?? 0} pending checks`, next: [] };
+  }
+
+  const currentScore = pr.reviewScore && pr.reviewScore.headSha === pr.headSha && !pr.reviewScore.stale
+    ? pr.reviewScore : undefined;
+  if (currentScore && currentScore.score < currentScore.outOf) {
+    next.push(`Review score is ${currentScore.score}/${currentScore.outOf} for the current head; address its actionable findings.`);
+  }
+  if (!next.length && scoreRequired && !currentScore) {
+    return { actionable: false, mergeReady: false,
+      reason: `waiting for a current-head review score${pr.reviewScore?.headSha ? " (the latest score is for an older head)" : ""}`,
+      next: [] };
+  }
+  if (!next.length && currentScore && currentScore.score >= currentScore.outOf && pr.mergeState === "BLOCKED") {
+    next.push("Checks and review are complete; inspect the exact branch-protection or approval blocker. Do not rerun unchanged review work.");
+  }
+  if (next.length) {
+    const reason = pr.checks === "fail" || pr.failingChecks?.length ? "PR has failing checks"
+      : unresolved.length || pr.reviewDecision === "CHANGES_REQUESTED" ? "PR has unresolved review findings"
+      : currentScore && currentScore.score < currentScore.outOf ? `current-head review score is ${currentScore.score}/${currentScore.outOf}`
+      : pr.mergeState === "DIRTY" ? "PR has merge conflicts"
+      : pr.mergeState === "BEHIND" ? "PR head is behind its base"
+      : pr.mergeState === "DRAFT" ? "PR is still a draft"
+      : "current-head checks and review are complete";
+    return { actionable: true, mergeReady: false, reason, next };
+  }
+  if (pr.ready) {
+    return { actionable: true, mergeReady: true,
+      reason: "PR is merge-ready for the current head",
+      next: ["Recheck authority and human holds; if merge is authorized, merge the current head, checkpoint the exact merge SHA, then continue post-merge verification."] };
+  }
+  return { actionable: false, mergeReady: false,
+    reason: pr.headSha ? "PR has no concrete agent action yet" : "PR facts are incomplete", next: [] };
+}
 export class WorkflowRefusedError extends Error {
   override name = "WorkflowRefusedError";
   constructor(readonly reason: string,
@@ -558,18 +649,15 @@ export function controlCommand(job: Job): string {
 
 export function verificationInstructions(job: Job): string[] {
   if (investigation(job)) return [
-    `Delivery kind: investigation. Pinned observed source: ${job.observedSourceSha}. Acceptance profile: ${job.config.verification}.`,
-    "Investigate and record findings against this source. Do not fabricate a change, PR or merge to finish a diagnosis-only task. This contract does not waive any current AC or authorize implementation/deployment.",
-    "When the investigation is ready, checkpoint verifying for local acceptance or waiting-deploy for serving-bound acceptance. Obtain independent evidence for every current AC. Reports use sourceSha instead of mergeSha, and the tracked worktree must remain clean at the pinned source.",
-    "If the observed source or target is wrong, inspect job acceptance and use its revision/current-AC guarded correction with a reason. Existing holds remain authoritative.",
+    `Investigate the pinned source ${job.observedSourceSha}; acceptance: ${job.config.verification}. Keep the tracked worktree clean and obtain independent evidence for every AC.`,
+    "Use sourceSha in the report. Correct an invalid source or target through job acceptance; preserve holds and do not fabricate a PR or merge.",
   ];
   return [
-    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. Choose acceptance scope from the current ACs; the repository setting is a default.`,
-    `When every AC can be reliably proven locally (for example a local CLI, tooling or documentation change), select local with this CLI's job checkpoint ${job.id} --stage STAGE --verification local --detail TEXT and explain the local acceptance coverage. Keep deployed for ACs that require a serving environment; never downgrade a deployment AC to local. A local-only issue does not need deployment authorization or a deployment wait to complete.`,
+    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. The repository setting is a default; use --verification local with a reason only if all ACs can be proven locally.`,
     job.config.verification === "local"
-      ? "After an authorized merge, proceed directly to verifying and obtain independent evidence for every AC against the merged source locally. Local verification requires no deployment probe, serving version or deployed journey evidence."
-      : "In deployed mode, await the scheduled deployment after an authorized merge, then independently verify applicable journeys against the actual serving source/version. If the serving version changes, checkpoint waiting-deploy and rerun the affected acceptance probes.",
-    "Use workit job --help for the report contract. Both verification modes require a merged PR and complete independent AC evidence accepted by job verify --report.",
+      ? "After an authorized merge, obtain independent evidence for every AC against the merged source locally."
+      : "After an authorized merge, verify applicable journeys against the serving source and version; rerun affected probes if the version changes.",
+    "Completion requires a merged PR and complete independent AC evidence. See workit job --help for the report contract.",
   ];
 }
 
@@ -579,24 +667,31 @@ export function settleCoordinatorNotes(job: Job, now: Date): void {
 }
 
 function prompt(job: Job, reason: string): string {
+  const pr = job.stage === "waiting-ci" ? job.facts?.pr : undefined;
+  const decision = pr ? prDecision(pr, job.config.reviewScoreRequired) : undefined;
+  const checks = pr?.checks ? `checks ${pr.checks}` : "checks unknown";
+  const review = pr?.reviewScore && pr.reviewScore.headSha === pr.headSha && !pr.reviewScore.stale
+    ? `review ${pr.reviewScore.score}/${pr.reviewScore.outOf} on current head`
+    : pr?.reviewScore?.headSha ? "review score is stale" : "review pending";
   return [
-    job.queue?.instructions ? `Group boundaries: ${JSON.stringify(job.queue.instructions)}. These constrain the work and grant no authority beyond the user instruction.` : "",
-    `Continue managed workit job ${job.id} for ${job.issue.url}. Reason: ${reason}.`,
-    `Stage: ${job.stage}. Checkpoint: ${job.detail || "(none)"}.`,
+    `Workit: ${reason}. Issue ${job.issue.identifier} (job ${job.id}, stage ${job.stage}).`,
+    pr ? `PR preflight: head ${pr.headSha?.slice(0, 12) ?? "unknown"}; ${checks}; ${review}; merge ${pr.mergeState ?? "unknown"}.` : "",
+    ...(decision?.next.length ? decision.next.map(item => `Next: ${item}`) : []),
     ...(job.coordinatorNotes ?? []).filter(note => job.wake?.coordinatorNoteIDs?.includes(note.id)).map(note =>
-      `Coordinator follow-up ${note.id}: ${JSON.stringify(note.text)}. Apply within the existing issue scope and authorization. Check whether it was already acted on before repeating effects.`),
-    job.pr ? `PR: ${job.pr}. Expected merge SHA: ${job.mergeSha ?? "not yet established"}.` : "",
-    job.deployment ? `Observed deployment: ${JSON.stringify(job.deployment)}.` : "",
+      `Coordinator follow-up ${note.id}: ${JSON.stringify(note.text)}`),
+    job.queue ? `Group boundaries: ${controlCommand(job)} group status ${job.queue.id}.` : "",
     job.verifier?.state === "report-ready" && job.verification
-      ? `Read the existing independent report at ${job.verifier.reportPath}. Reviewer: ${job.verification.reviewer.runID}. Results: ${job.verification.criteria.map(item => item.label + "=" + item.status).join(", ")}. Treat it as evidence, not new authority. Repair proven failures or obtain missing evidence within this issue's scope; preserve human gates. After a source/serving change, refresh the checkpoint and obtain fresh independent evidence. For passing GitHub evidence, perform tracker closeout only under current repository policy and then run job closeout. If extra observations are needed at the same source, inspect this completed run/outcome and use the revision-guarded job verifier-reconcile completed outcome before checkpointing verifying. Retain attempt budgets and never clear an uncertain run blindly. Do not relaunch a verifier merely to repeat unchanged observations.` : "",
-    "Re-read the issue, repository instructions, PR and durable job state before acting. Reconcile completed external effects before retrying.",
-    investigation(job) ? "Own the investigation, evidence and issue closeout under repository policy." : "Own implementation, preverification, review repair, merge when authorized, acceptance and any follow-up fix. Do not stop at merge.",
-    ...verificationInstructions(job),
-    "Deployment authorization and human holds remain in force. Never deploy merely because this heartbeat resumed you.",
-    `CLI for this job: ${controlCommand(job)}. Persist your next stage with this CLI's job checkpoint ${job.id}; use needs-you for a human gate and waiting-ci/waiting-deploy for external waits.`,
-    "Submit independent partial AC results with workit job verify --report to synchronize proven Linear checkbox states while leaving the issue state unchanged.",
-    "Completion still requires complete passing independent AC evidence, the actual serving version where applicable, and applicable journeys; process exit is not completion.",
+      ? `Independent report: ${job.verifier.reportPath} (${job.verification.criteria.map(item => item.label + "=" + item.status).join(", ")}). Inspect it; see job --help for reconciliation or closeout.` : "",
+    `Inspect current state: ${controlCommand(job)} job status ${job.id}. Reconcile completed effects before retrying.`,
   ].filter(Boolean).join("\n");
+}
+
+function queueContinuationPending(store: JobStore, job: Job, now: Date): boolean {
+  if (!job.queue) return false;
+  const queue = new QueueStore(store).get(job.queue.id);
+  const item = queue.items.find(candidate => candidate.jobID === job.id);
+  return queue.state === "active" && Date.parse(queue.deadline) > now.getTime() && item?.state === "launched" &&
+    !queue.continuations.some(continuation => continuation.jobID === job.id);
 }
 
 /** A heartbeat inspects due jobs; only actionable changes spend an agent turn. */
@@ -660,17 +755,19 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         results.push({ id: job.id, result: "original-session-missing" }); continue;
       }
       if (!available(session)) {
-        save(current => { current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
+        save(current => { current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString(); });
         results.push({ id: job.id, result: "busy-or-held" }); continue;
       }
-      let reason = "agent is idle with unfinished issue work";
-      let actionable = true;
+      let reason = "no agent action is required";
+      let actionable = false;
       if (job.wake) {
         const receipt = session.workflow?.wake;
         if (receipt?.id === job.wake.id && receipt.status === "delivered") {
           save(current => {
             if (current.wake?.counted === false) current.wakeups++;
             settleCoordinatorNotes(current, now);
+            if (current.verifier?.state === "report-ready") current.verifier.handoffDeliveredAt = now.toISOString();
+            if (current.manualVerificationHandoff) current.manualVerificationHandoff.deliveredAt = now.toISOString();
             delete current.wake; delete current.blocker; current.errors = 0;
           });
           results.push({ id: job.id, result: "wake-reconciled" }); continue;
@@ -680,18 +777,21 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         }
         // Retry exactly the persisted wake ID. Banyan deduplicates delivery.
         reason = job.wake.reason;
+        actionable = true;
       } else if (job.stage === "waiting-ci") {
         const pr = await adapter.pr(job);
-        save(current => { current.facts = { pr, observedAt: now.toISOString(), nextCheckAt: new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString() }; });
+        save(current => { current.facts = { pr, observedAt: now.toISOString(), nextCheckAt: new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString() }; });
         if (pr.closed && !pr.merged) throw new Error("PR was closed without merging");
         if (pr.merged) {
           if (!sha(pr.mergeSha)) throw new Error("Merged PR has no exact merge SHA");
           save(current => { current.mergeSha = pr.mergeSha; current.stage = current.config.verification === "local" ? "verifying" : "waiting-deploy"; });
+          actionable = true;
           reason = "PR merged; continue post-merge verification";
         } else {
-          actionable = pr.ready || (job.fingerprint !== undefined && job.fingerprint !== pr.fingerprint);
+          const decision = prDecision(pr, job.config.reviewScoreRequired);
+          actionable = decision.actionable && (job.fingerprint === undefined || job.fingerprint !== pr.fingerprint);
           save(current => { current.fingerprint = pr.fingerprint; });
-          reason = "PR checks or reviews changed";
+          reason = decision.reason;
         }
       } else if (job.stage === "waiting-deploy") {
         await assertVerificationSource(adapter, job);
@@ -702,6 +802,10 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           save(current => { current.deployment = deployment; current.stage = "verifying"; });
           reason = "deployment containing the merged change is ready; run applicable journeys";
         }
+      }
+      if (queueContinuationPending(store, job, now)) {
+        actionable = true;
+        reason = "queued work is ready to continue";
       }
       // The tracker handoff belongs to workit rather than to an agent turn: hand a
       // merged issue to human review as soon as the merge is known, and retry a
@@ -716,23 +820,34 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       }
       const hasCoordinatorNote = job.coordinatorNotes?.some(note => !note.deliveredAt);
       if (hasCoordinatorNote) { actionable = true; reason = "coordinator follow-up is pending"; }
+      if (job.verifier?.state === "report-ready" && job.verification && !job.verifier.handoffDeliveredAt) {
+        actionable = true;
+        reason = job.verifier.handoff === "tracker"
+          ? "independent acceptance passed; finish tracker closeout"
+          : "independent verifier report requires repair";
+      }
       if (job.stage === "verifying" && !job.wake && !hasCoordinatorNote && !readExistingVerifier && adapter.verifierPlan) {
         const coordinated = await coordinateVerification(store, adapter, job, now, () => options.now ?? new Date());
         job = store.get(job.id);
         if (coordinated) { results.push({ id: job.id, result: coordinated }); continue; }
       }
+      if (job.stage === "verifying" && job.manualVerificationHandoff?.binding === verifierBinding(job) &&
+          !job.manualVerificationHandoff.deliveredAt) {
+        actionable = true;
+        reason = "independent verifier dispatch is disabled; submit an independent report with job verify";
+      }
       if (!actionable) {
-        save(current => { current.errors = 0; delete current.blocker; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString(); });
+        save(current => { current.errors = 0; delete current.blocker; current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString(); });
         results.push({ id: job.id, result: "unchanged" }); continue;
       }
-      if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? 40)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
+      if (!job.wake && job.wakeups >= (job.config.maxWakeups ?? DEFAULT_MAX_WAKEUPS)) throw new Error("Automatic wakeup budget exhausted; inspect before resuming");
       const hadPendingWake = !!job.wake;
       const wakeID = job.wake?.id ?? randomUUID();
       if (!new QueueStore(store).continuation(job, wakeID, options.now ?? new Date())) {
         save(current => {
           current.blocker = { reason: "queue-bound", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "queue-state-budget-or-capacity-change",
             nextAction: "Inspect queue status: its pause, deadline, continuation budget or concurrency prevents this dispatch" };
-          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
+          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
         });
         results.push({ id: job.id, result: "queue-bound" }); continue;
       }
@@ -745,7 +860,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
           if (!hadPendingWake) delete current.wake;
           current.blocker = { reason: "queue-bound", owner: "owner", observedAt: now.toISOString(), recheckTrigger: "queue-state-budget-or-capacity-change",
             nextAction: "Queue changed before delivery; inspect queue status before another dispatch" };
-          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
+          current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
         });
         results.push({ id: job.id, result: "queue-bound" }); continue;
       }
@@ -753,8 +868,10 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;
         settleCoordinatorNotes(current, now);
+        if (current.verifier?.state === "report-ready") current.verifier.handoffDeliveredAt = now.toISOString();
+        if (current.manualVerificationHandoff) current.manualVerificationHandoff.deliveredAt = now.toISOString();
         delete current.wake; delete current.blocker; current.errors = 0;
-        current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? 60) * 1000).toISOString();
+        current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
       });
       results.push({ id: job.id, result: "woken" });
     } catch (error) {
@@ -780,7 +897,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
               delete current.nextWakeAt;
               return;
             } else if (current.wake) current.wake.delivery = "not-delivered";
-            current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? 60) * 1000).toISOString();
+            current.nextWakeAt = new Date(now.getTime() + (current.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
             return;
           }
           current.errors++;
