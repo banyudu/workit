@@ -173,7 +173,7 @@ test("coordinator follow-ups use original worker receipts and preserve holds", a
   f.jobs.update(f.job.id, job => { job.stage = "implementing"; job.nextWakeAt = now.toISOString(); }, now);
   await tick(f.jobs, worker, { now, process: "worker", alive: () => false });
   assert.equal(prompts.length, 1); assert.match(prompts[0], /Inspect the retry race/);
-  assert.match(prompts[0], /group status/);
+  assert.match(prompts[0], /Group: Fixture; item first/);
   const note = f.jobs.get(f.job.id).coordinatorNotes![0]; assert(note.deliveredAt);
   assert.equal(f.queues.get(f.queue.id).continuations.length, 1);
   f.verify();
@@ -227,6 +227,8 @@ console.log(JSON.stringify(args[1]==='current'?{id:'parent-original'}:{ok:true,d
   const delivery = calls.find(args => args[1] === "deliver")!;
   const notification = delivery[delivery.indexOf("--text") + 1];
   assert.match(notification, /workit group inbox/);
+  assert.match(notification, /Workit group Fixture:/);
+  assert.doesNotMatch(notification, /update for|WORKIT_STATE_DIR|\/node|dist\/cli\.js/);
   assert.ok(notification.length < 500);
   assert(launch); assert.equal(launch[launch.indexOf("--parent") + 1], "parent-original");
   assert(!launch.includes("--no-parent"));

@@ -48,9 +48,21 @@ export class BanyanGroupAdapter implements GroupAdapter {
     return result.session;
   }
   async deliver(queue: WorkQueue, message: GroupMessage): Promise<void> {
+    const item = queue.items.find(item => item.jobID === message.jobID);
+    const subject = item ? `${item.key} (${item.issue})` : message.jobID;
+    const verified = message.snapshot.verification;
+    const passed = verified?.criteria.filter(criterion => criterion.status === "pass").length;
+    const total = verified?.criteria.length;
+    const intervention = message.intervention?.text.replace(/\s+/g, " ").trim().slice(0, 600);
+    const body = message.snapshot.observationError
+      ? `${subject} needs inspection: ${message.snapshot.observationError.replace(/[.\s]+$/, "")}.`
+      : message.kind === "result"
+        ? `${subject} is verified${verified ? ` with ${passed}/${total} ACs passing independently` : ""}.`
+        : message.kind === "intervention"
+          ? `${subject} received new user input${intervention ? `: ${intervention}` : "."} Review it before continuing.`
+          : `${subject} progress: ${message.snapshot.stage}.`;
     await this.control(queue, "deliver", ["--revision", String(message.sequence), "--wake-id", message.id,
-      "--text", `Workit group ${queue.id}: ${message.kind} update for ${message.jobID}. ` +
-      `Use coordinate-work; inspect workit group inbox ${queue.id} and status before acting.`]);
+      "--text", `Workit group ${queue.title}: ${body}\nInspect: workit group inbox ${queue.id}`]);
   }
   async retire(queue: WorkQueue, job: Job, message: GroupMessage): Promise<void> {
     for (const run of [...job.verifierHistory ?? [], ...job.verifier ? [job.verifier] : []]) {

@@ -666,23 +666,40 @@ export function settleCoordinatorNotes(job: Job, now: Date): void {
   for (const note of job.coordinatorNotes ?? []) if (ids.has(note.id)) note.deliveredAt = now.toISOString();
 }
 
+function prose(value: string): string {
+  const text = value.trim().replace(/[.;\s]+$/, "").replace(/;\s+/g, ". ")
+    .replace(/(^|[.!?]\s+)([a-z])/g, (_match, prefix: string, letter: string) => prefix + letter.toUpperCase());
+  return text ? text + "." : "";
+}
+
+function reviewSummary(pr: PRSnapshot): string {
+  if (!pr.reviewScore) return "review pending";
+  if (pr.reviewScore.stale || pr.reviewScore.headSha !== pr.headSha) return "review score stale";
+  return `review ${pr.reviewScore.score}/${pr.reviewScore.outOf} on current head`;
+}
+
 function prompt(job: Job, reason: string): string {
-  const pr = job.stage === "waiting-ci" ? job.facts?.pr : undefined;
+  const pr = job.facts?.pr;
   const decision = pr ? prDecision(pr, job.config.reviewScoreRequired) : undefined;
-  const checks = pr?.checks ? `checks ${pr.checks}` : "checks unknown";
-  const review = pr?.reviewScore && pr.reviewScore.headSha === pr.headSha && !pr.reviewScore.stale
-    ? `review ${pr.reviewScore.score}/${pr.reviewScore.outOf} on current head`
-    : pr?.reviewScore?.headSha ? "review score is stale" : "review pending";
+  const checks = pr?.checks === "pass" ? "checks passing" : pr?.checks === "fail" ? "checks failing" : pr?.checks ? "checks pending" : "";
+  const status = pr ? [pr.headSha?.slice(0, 12), checks, pr.reviewScore ? reviewSummary(pr) : "", pr.mergeState ? `merge ${pr.mergeState}` : ""]
+    .filter(Boolean).join(", ") : "";
+  const next = pr && !pr.merged ? decision?.next ?? [] : [];
+  const notes = (job.coordinatorNotes ?? []).filter(note => job.wake?.coordinatorNoteIDs?.includes(note.id));
+  const report = job.verifier?.state === "report-ready" && job.verification
+    ? (() => {
+        const criteria = job.verification!.criteria;
+        const passed = criteria.filter(item => item.status === "pass").length;
+        const incomplete = criteria.filter(item => item.status !== "pass").map(item => `${item.label}=${item.status}`);
+        return `Independent report: ${passed}/${criteria.length} ACs pass${incomplete.length ? `; ${incomplete.join(", ")}` : ""}. ${job.verifier!.reportPath}`;
+      })() : "";
   return [
-    `Workit: ${reason}. Issue ${job.issue.identifier} (job ${job.id}, stage ${job.stage}).`,
-    pr ? `PR preflight: head ${pr.headSha?.slice(0, 12) ?? "unknown"}; ${checks}; ${review}; merge ${pr.mergeState ?? "unknown"}.` : "",
-    ...(decision?.next.length ? decision.next.map(item => `Next: ${item}`) : []),
-    ...(job.coordinatorNotes ?? []).filter(note => job.wake?.coordinatorNoteIDs?.includes(note.id)).map(note =>
-      `Coordinator follow-up ${note.id}: ${JSON.stringify(note.text)}`),
-    job.queue ? `Group boundaries: ${controlCommand(job)} group status ${job.queue.id}.` : "",
-    job.verifier?.state === "report-ready" && job.verification
-      ? `Independent report: ${job.verifier.reportPath} (${job.verification.criteria.map(item => item.label + "=" + item.status).join(", ")}). Inspect it; see job --help for reconciliation or closeout.` : "",
-    `Inspect current state: ${controlCommand(job)} job status ${job.id}. Reconcile completed effects before retrying.`,
+    `Workit update for ${job.issue.identifier}: ${prose(reason)}`,
+    status ? `PR: ${status}.` : "",
+    next.length ? `Next:\n${next.map(item => `- ${item}`).join("\n")}` : "",
+    ...notes.map(note => `Coordinator follow-up: ${note.text.trim()}`),
+    job.queue ? `Group: ${job.queue.title ?? job.queue.id}; item ${job.queue.key}. Stay within its scope and do not change the coordinator.` : "",
+    report,
   ].filter(Boolean).join("\n");
 }
 

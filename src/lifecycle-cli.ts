@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, acceptance, assertLocalAcceptance, checkpoint, controlCommand, parseVerificationMode, parseDeliveryKind, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, parseVerificationMode, parseDeliveryKind, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
 import { assertVerificationSource, investigation } from "./verification-source.js";
@@ -224,17 +224,17 @@ Local acceptance skips deployment checks and still requires complete independent
 
 export function managedInstructions(job: Job): string[] {
   return [
-    `CLI for all checkpoint/status/verify commands in this job: ${controlCommand(job)}.`,
-    ...(job.queue?.instructions ? [`Group boundaries: ${JSON.stringify(job.queue.instructions)}`] : []),
-    ...(job.queue?.coordinatorSessionID ? [`Coordinator: ${job.queue.coordinatorSessionID}; group: ${job.queue.id}. Report evidence and interventions through its inbox; do not close yourself or change the owner.`] : []),
+    "Use the `workit` CLI for checkpoint, status and verify commands for this job.",
+    ...(job.queue?.instructions ? [`Group boundaries: ${job.queue.instructions}`] : []),
+    ...(job.queue?.coordinatorSessionID ? [`Coordinator: Banyan session ${job.queue.coordinatorSessionID}; group ${job.queue.id}. Report evidence and interventions through its inbox; do not close yourself or change the owner.`] : []),
     `Own managed job ${job.id} through verified issue completion. Read the issue, repository instructions and current ACs.`,
-    ...(job.queue ? [`Queue ${job.queue.id} (${job.queue.key}); outcome: ${job.queue.outcome ?? "see queue status"}; deadline: ${job.queue.deadline ?? "see queue status"}.`] : []),
+    ...(job.queue ? [`Group outcome: ${job.queue.outcome ?? "see group status"}; deadline: ${job.queue.deadline ?? "see group status"}.`] : []),
     investigation(job) ? "Investigate the pinned source and independently verify the findings." : "Implement, preverify, repair review/CI, merge when authorized, and independently verify acceptance.",
     ...verificationInstructions(job),
     "Workit owns continuation; do not create a native goal or scheduler. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
     "After opening or updating the PR, checkpoint waiting-ci and end the turn. Workit preflights the current head and wakes you only for a concrete check, review or score action.",
     `Read job status and checkpoint ${job.id} before ending a turn. Use waiting-ci/waiting-deploy for external waits and needs-you for human gates.`,
-    `Submit independent partial progress or complete evidence with job verify ${job.id} --report PATH. Workit automatically synchronizes proven Linear AC checkboxes; completion requires current independent evidence.`,
-    `Retry interrupted tracker effects with job closeout ${job.id}; inspect conflicts before retrying. Linear updates have a race with concurrent edits. Owner holds and real human acceptance remain in force.`,
+    `Submit independent partial progress or complete evidence with \`workit job verify ${job.id} --report PATH\`. Workit automatically synchronizes proven Linear AC checkboxes; completion requires current independent evidence.`,
+    `Retry interrupted tracker effects with \`workit job closeout ${job.id}\`; inspect conflicts before retrying. Linear updates have a race with concurrent edits. Owner holds and real human acceptance remain in force.`,
   ];
 }

@@ -48,8 +48,9 @@ Pending checks and missing/stale review scores stay parked. Failing checks,
 unresolved findings, a below-passing current-head score, conflicts, a behind
 head or a draft produce one bounded action prompt. A passing current-head score
 with terminal passing checks produces an explicit merge-readiness prompt; it
-does not ask the agent to repeat review work. Prompt text and any long findings
-remain in durable `job status` facts rather than being copied into every wake.
+does not ask the agent to repeat review work. Wake text leads with the event and
+concrete next action; long polled facts remain in durable `job status` output
+instead of being copied into every wake.
 
 The probe is an example repository-owned command, not a bundled script.
 It must be read-only, bounded, and emit one JSON object on stdout. It receives
@@ -196,8 +197,10 @@ the issue's authorization allows it.
 
 ## Checkpoints and recovery
 
-The prompt includes the exact initiating CLI/state-directory invocation; use it
-if the PATH wrapper is older. Before yielding, record a concrete next stage:
+Managed prompts use the `workit` command name and omit executable and state
+directory paths. If the PATH wrapper is older, read the stored control command
+from `workit job status` and use that exact invocation. Before yielding, record
+a concrete next stage:
 
 ```bash
 workit job checkpoint JOB_ID --stage waiting-ci --detail "Waiting for review" --pr https://github.com/example/project/pull/42

@@ -88,7 +88,7 @@ test("cost-safe defaults leave idle work parked and still deliver concrete coord
     queueCoordinatorNote(store, job);
     await tick(store, adapter, { now: new Date(store.get(job.id).nextWakeAt!), process: "owner", alive: () => true });
     assert.equal(adapter.wakes.length, 1, stage);
-    assert.match(adapter.prompts[0], /coordinator follow-up is pending/);
+    assert.match(adapter.prompts[0], /Coordinator follow-up is pending/);
   }
 });
 
@@ -109,6 +109,7 @@ test("unchanged or still-pending CI consumes no agent turn; a failing check wake
   const { store, job, adapter, run } = fixture(t);
   const detail = `CI pending ${"previous checkpoint ".repeat(300)}`;
   checkpoint(store, job.id, { stage: "waiting-ci", detail, pr: "https://github.com/example/project/pull/9" }, now);
+  store.update(job.id, current => { current.controlCommand = ["/private/node", "/private/dist/cli.js"]; current.stateDirectory = "/private/state"; }, now);
   adapter.snapshot = { fingerprint: "pending-a", ready: false, merged: false, checks: "pending",
     headSha: "a".repeat(40), pendingChecks: [{ name: "Lint checks" }] };
   await run();
@@ -125,7 +126,8 @@ test("unchanged or still-pending CI consumes no agent turn; a failing check wake
   assert.match(adapter.prompts[0], /PR has failing checks/);
   assert.match(adapter.prompts[0], /Fix failing checks: Lint checks/);
   assert.doesNotMatch(adapter.prompts[0], /work until|5\/5/);
-  assert.match(adapter.prompts[0], new RegExp(`job status ${job.id}`));
+  assert.match(adapter.prompts[0], /^Workit update for 7:/);
+  assert.doesNotMatch(adapter.prompts[0], /WORKIT_STATE_DIR|\/private\/node|dist\/cli\.js|Inspect current state|PR preflight/);
   assert.doesNotMatch(adapter.prompts[0], /Checkpoint:|Verification mode|Deployment authorization/);
   assert.doesNotMatch(adapter.prompts[0], /previous checkpoint/);
   assert.equal(store.get(job.id).detail, detail);
@@ -167,7 +169,7 @@ test("a below-5 current-head score wakes once with bounded actionable findings",
   await run();
   assert.equal(adapter.wakes.length, 1);
   assert.match(adapter.prompts[0], /review 4\/5 on current head/);
-  assert.match(adapter.prompts[0], /Review score is 4\/5/);
+  assert.match(adapter.prompts[0], /Review score is 4\/5 for the current head/);
   assert.match(adapter.prompts[0], /src\/widget\.ts:42/);
   assert.match(adapter.prompts[0], /Preserve the empty state/);
 
@@ -183,7 +185,7 @@ test("a current-head 5/5 becomes one explicit merge-readiness turn, not another 
     mergeState: "CLEAN", reviewScore: { provider: "review", headSha: "a".repeat(40), score: 5, outOf: 5 } };
   await run();
   assert.equal(adapter.wakes.length, 1);
-  assert.match(adapter.prompts[0], /PR is merge-ready for the current head/);
+  assert.match(adapter.prompts[0], /PR is merge-ready for the current head\./);
   assert.match(adapter.prompts[0], /review 5\/5 on current head/);
   assert.match(adapter.prompts[0], /if merge is authorized, merge the current head/);
   assert.doesNotMatch(adapter.prompts[0], /address its actionable findings|work until/);
@@ -217,7 +219,13 @@ test("local jobs verify merged source directly and launch/heartbeat guidance res
   assert.equal(store.get(job.id).deployment, undefined);
   assert.equal(adapter.deploymentCalls, 0);
   assert.equal(adapter.wakes.length, 1);
+  assert.match(adapter.prompts[0], /^Workit update for 7: PR merged\. Continue post-merge verification\./);
+  assert.doesNotMatch(adapter.prompts[0], new RegExp(`${job.id}|WORKIT_STATE_DIR|Inspect current state`));
   const guidance = managedInstructions(job).join("\n");
+  job.controlCommand = ["/private/node", "/private/dist/cli.js"];
+  job.stateDirectory = "/private/state";
+  const sanitizedGuidance = managedInstructions(job).join("\n");
+  assert.doesNotMatch(sanitizedGuidance, /WORKIT_STATE_DIR|\/private\/node|dist\/cli\.js|private\/state/);
   assert.match(guidance, /Verification mode for this issue: local/);
   assert.match(guidance, /every AC against the merged source locally/);
   assert.match(guidance, /complete independent AC evidence/);
