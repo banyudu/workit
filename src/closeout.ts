@@ -5,19 +5,18 @@ import { assertTracker, TrackerHoldError } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DEFAULT_INTERVAL_SECONDS, SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateProgressReport, reportComplete, validateReport,
+import { DEFAULT_INTERVAL_SECONDS, SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateVerificationMode, validateProgressReport, reportComplete, validateReport,
   type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
 export function correctAcceptance(store: JobStore, id: string, input: {
   profile: "local" | "deployed"; reason: string; expectedRevision: number; expectedAcHash: string;
-  delivery?: DeliveryKind; target?: string; observedSourceSha?: string;
+  delivery?: DeliveryKind; target?: string; observedSourceSha?: string; historicalSources?: string[] | null;
 }, issue: IssueDetails, now = new Date(), trustedConfig?: LifecycleConfig): Job {
   if (!["local", "deployed"].includes(input.profile) || !input.reason?.trim() ||
       !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) throw new Error("Acceptance correction requires a profile, reason and expected revision");
   const binding = acceptance(issue.body);
   if (binding.acHash !== input.expectedAcHash) throw new Error("Current AC binding is stale; reread the issue before correcting acceptance");
-  if (input.profile === "local") assertLocalAcceptance(issue.body);
   return store.update(id, current => {
     if (current.revision !== input.expectedRevision) throw new Error("Job revision mismatch; reread before correcting acceptance");
     if (terminalStage(current.stage) || current.issue.url !== issue.url) throw new Error("Acceptance correction needs the current unfinished issue");
@@ -28,12 +27,16 @@ export function correctAcceptance(store: JobStore, id: string, input: {
     const target = input.target ? selectDeploymentTarget(trustedConfig ?? {}, input.target) : undefined;
     const nextConfig = { ...current.config, ...(target ? { deploymentTarget: target.deploymentTarget,
       deploymentProbe: target.deploymentProbe, deploymentBinding: target.deploymentBinding,
-      deploymentDependency: target.deploymentDependency } : {}), delivery, verification: input.profile };
+      deploymentDependency: target.deploymentDependency } : {}), delivery, verification: input.profile,
+      ...(input.historicalSources !== undefined ? { historicalSources: input.historicalSources ?? undefined } : {}) };
     if (input.profile === "deployed" && !nextConfig.deploymentProbe?.length) throw new Error("Deployed acceptance requires a trusted deployment probe");
+    if (input.profile === "local") assertLocalAcceptance(issue.body, nextConfig);
+    validateVerificationMode(nextConfig, issue.body);
     (current.acceptanceHistory ??= []).push({ from: current.config.verification ?? "deployed", to: input.profile,
       reason: input.reason.trim(), at: now.toISOString(), revision: current.revision + 1,
       oldAcHash: current.acHash, acHash: binding.acHash, fromDelivery, toDelivery: delivery,
       fromTarget: current.config.deploymentTarget, toTarget: nextConfig.deploymentTarget,
+      fromHistoricalSources: current.config.historicalSources, toHistoricalSources: nextConfig.historicalSources,
       priorPR: current.pr, priorSourceSha: verificationSource(current) });
     current.config = nextConfig;
     if (delivery === "investigation") {
@@ -173,7 +176,10 @@ export function completeVerification(store: JobStore, expected: Job, report: Ver
 }
 
 export function verifierBinding(job: Job): string {
-  return digest(JSON.stringify([job.acHash, verificationSource(job), job.config.delivery, job.config.deploymentTarget, job.config.verification, job.acceptanceChangedAt, job.deployment]));
+  const binding: unknown[] = [job.acHash, verificationSource(job), job.config.delivery, job.config.deploymentTarget, job.config.verification, job.acceptanceChangedAt, job.deployment];
+  // Keep existing jobs' identities stable; only the new explicit contract adds a binding.
+  if (job.config.historicalSources !== undefined) binding.push(job.config.historicalSources);
+  return digest(JSON.stringify(binding));
 }
 function readArtifact(path: string): unknown {
   if (statSync(path).size > 4 * 1024 * 1024) throw new Error("Verifier artifact exceeds the bounded report size");
@@ -298,7 +304,7 @@ export async function coordinateVerification(store: JobStore, adapter: Lifecycle
   const issue = await adapter.currentIssue(job);
   if (issue.url !== job.issue.url || acceptance(issue.body).acHash !== job.acHash) return wait("acceptance-decision", "owner", "Current ACs changed; review and correct the acceptance plan against the current binding", "audited-acceptance-correction", "acceptance-stale");
   try { assertTracker(job, issue); } catch (error) { if (error instanceof TrackerHoldError) return ownerHold(); throw error; }
-  if (job.config.verification === "local") assertLocalAcceptance(issue.body);
+  if (job.config.verification === "local") assertLocalAcceptance(issue.body, job.config);
   if (acceptanceCriteria(issue.body).some(requiresHuman)) return wait("acceptance-decision", "owner", "Obtain the explicit human acceptance required by the current ACs, then submit independent complete evidence", "human-acceptance-evidence", "owner-acceptance-required");
   try { await assertVerificationSource(adapter, job); }
   catch (error) {

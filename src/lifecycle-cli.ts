@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, acceptance, assertLocalAcceptance, checkpoint, parseVerificationMode, parseDeliveryKind, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, parseVerificationMode, parseDeliveryKind, parseHistoricalSources, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
 import { assertVerificationSource, investigation } from "./verification-source.js";
@@ -40,7 +40,7 @@ workit job status ID
 workit job overview [--format json] [--limit 1..1000]
 workit job attention [--format json|text]
 workit job acceptance ID
-workit job acceptance ID [--profile local|deployed] [--delivery implementation|investigation] [--target NAME] --reason TEXT --expected-revision N --expected-ac-hash HASH
+workit job acceptance ID [--profile local|deployed] [--delivery implementation|investigation] [--historical-sources PATH] [--target NAME] --reason TEXT --expected-revision N --expected-ac-hash HASH
 workit job verifier-reconcile ID --run-id ID --outcome delivered|not-delivered|completed --reason TEXT --expected-revision N
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS] [--verification local|deployed] [--tracker-completion human|automatic]
 workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
@@ -67,6 +67,11 @@ Human ACs require human evidence with confirmedBy and a reference to actual conf
 Validated Linear closeout automatically checks proven ACs and completes the actual team workflow.
 Retry/reconcile one job with job closeout ID; stored evidence is revalidated against current AC/source/version.
 Local acceptance skips deployment checks and still requires complete independent AC evidence.
+Historical investigations: --delivery investigation --acceptance local --historical-sources PATH (JSON array of fixed original source references).
+Query evidence must use kind historical and reference an enrolled original source; no estimates or fabricated journeys.
+Acceptance correction can remove the contract with --historical-sources none before selecting deployed scope.
+Explicit deploy/current runtime and human ACs cannot be narrowed. Correction requires current revision/hash and preserves holds.
+Inspect and correct acceptance before verifying historical reports; never probe unauthorized runtime to submit evidence.
 --verification overrides this job only; include local acceptance coverage in --detail when correcting a job.`);
     return;
   }
@@ -102,14 +107,14 @@ Local acceptance skips deployment checks and still requires complete independent
     case "status":
       only(values, []); job = store.get(id); break;
     case "acceptance": {
-      only(values, ["--profile", "--delivery", "--target", "--reason", "--expected-revision", "--expected-ac-hash"]);
+      only(values, ["--profile", "--delivery", "--historical-sources", "--target", "--reason", "--expected-revision", "--expected-ac-hash"]);
       if (!Object.keys(values).length) {
         const current = store.get(id);
         const issue = await adapter.currentIssue(current);
         let localEligible = true;
-        try { assertLocalAcceptance(issue.body); } catch { localEligible = false; }
+        try { assertLocalAcceptance(issue.body, current.config); } catch { localEligible = false; }
         console.log(JSON.stringify({ jobID: id, revision: current.revision, profile: current.config.verification, delivery: current.config.delivery ?? "implementation", target: current.config.deploymentTarget, observedSourceSha: current.observedSourceSha,
-          boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
+          historicalSources: current.config.historicalSources, boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
       }
       if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("acceptance requires --expected-revision N");
       const expected = store.get(id);
@@ -119,6 +124,7 @@ Local acceptance skips deployment checks and still requires complete independent
       const trusted = values["--target"] ? adapter.trustedTarget(expected, values["--target"]) : undefined;
       const observedSourceSha = delivery === "investigation" ? await adapter.observedSource(expected) : undefined;
       job = correctAcceptance(store, id, { delivery, observedSourceSha, target: values["--target"],
+        historicalSources: values["--historical-sources"] === "none" ? null : values["--historical-sources"] ? parseHistoricalSources(JSON.parse(readFileSync(resolve(values["--historical-sources"]), "utf8"))) : undefined,
         profile: values["--profile"] ? parseVerificationMode(values["--profile"]) : expected.config.verification ?? "deployed", reason: values["--reason"],
         expectedRevision: Number(values["--expected-revision"]), expectedAcHash: values["--expected-ac-hash"] }, issue, new Date(), trusted);
       await project(store, adapter, job); break;

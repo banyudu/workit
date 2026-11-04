@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SourceProvenanceError, acceptance, checkpoint, createJob, JobStore, validateReport, type LifecycleAdapter, type VerificationReport } from "./lifecycle.js";
+import { SourceProvenanceError, acceptance, checkpoint, createJob, digest, JobStore, validateReport, type LifecycleAdapter, type VerificationReport } from "./lifecycle.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
-import { coordinateVerification, correctAcceptance } from "./closeout.js";
+import { coordinateVerification, correctAcceptance, verifierBinding } from "./closeout.js";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
 
 const source = "a".repeat(40);
@@ -109,4 +109,22 @@ test("verifier coordination preserves named-target provenance errors for the att
   assert.equal(result, "serving-binding-stale");
   assert.equal(store.get(job.id).blocker?.reason, "source-provenance");
   assert.equal(store.get(job.id).blocker?.owner, "external");
+});
+
+test("historical correction retains uncertain verifier/wake identities and leaves legacy bindings unchanged", t => {
+  const { store, job } = fixture(t);
+  assert.equal(verifierBinding(job), digest(JSON.stringify([job.acHash, job.observedSourceSha, job.config.delivery,
+    job.config.deploymentTarget, job.config.verification, job.acceptanceChangedAt, job.deployment])));
+  store.update(job.id, current => {
+    current.stage = "verifying";
+    current.wake = { id: "pending-wake", reason: "Uncertain delivery", revision: current.revision };
+    current.verifier = { id: "pending-verifier", sessionID: "pending-verifier", agent: "fixture", binding: verifierBinding(current),
+      reportPath: "/fixture/report.json", outcomePath: "/fixture/outcome.json", state: "uncertain", reservedAt: new Date().toISOString(), timeoutSeconds: 60 };
+  });
+  const pending = store.get(job.id);
+  const changed = correctAcceptance(store, job.id, { profile: "local", historicalSources: ["artifact://published-record"], observedSourceSha: source,
+    expectedRevision: pending.revision, expectedAcHash: pending.acHash, reason: "Only published historical facts" }, issue);
+  assert.equal(changed.stage, "needs-you"); assert.equal(changed.nextWakeAt, undefined);
+  assert.deepEqual(changed.wake, pending.wake); assert.equal(changed.verifier?.id, "pending-verifier");
+  assert.equal(changed.verifier?.state, "invalidated"); assert.notEqual(verifierBinding(changed), pending.verifier!.binding);
 });

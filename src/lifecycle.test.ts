@@ -227,7 +227,8 @@ test("local jobs verify merged source directly and launch/heartbeat guidance res
   const sanitizedGuidance = managedInstructions(job).join("\n");
   assert.doesNotMatch(sanitizedGuidance, /WORKIT_STATE_DIR|\/private\/node|dist\/cli\.js|private\/state/);
   assert.match(guidance, /Verification mode for this issue: local/);
-  assert.match(guidance, /every AC against the merged source locally/);
+  assert.match(guidance, /every AC against the merged source, including required CI runs/);
+  assert.match(guidance, /no serving deployment is required/);
   assert.match(guidance, /complete independent AC evidence/);
   assert.doesNotMatch(adapter.prompts[0], /Verification mode|Review pending/);
   assert.throws(() => checkpoint(store, job.id, { stage: "waiting-deploy", detail: "Unnecessary wait" }, now), /directly to verifying/);
