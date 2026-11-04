@@ -23,6 +23,8 @@ export interface LifecycleConfig {
   /** Preserve an issue's explicit human-only closeout authorization. */
   trackerCompletion?: "human" | "automatic";
   delivery?: DeliveryKind;
+  /** Explicit fixed-source investigation contract; never inferred from AC prose. */
+  historicalSources?: string[];
   deploymentTarget?: string;
   deploymentTargets?: Record<string, DeploymentTarget>;
   deploymentBinding?: { environment: string; target: string };
@@ -81,7 +83,7 @@ export interface Job {
   };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
   acceptanceChangedAt?: string;
-  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string }>;
+  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string; fromHistoricalSources?: string[]; toHistoricalSources?: string[] }>;
   holdDetail?: string;
   blocker?: Blocker;
   facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
@@ -189,15 +191,42 @@ export function parseDeliveryKind(value: unknown): DeliveryKind {
   return value;
 }
 
-function validateVerificationMode(config: LifecycleConfig, body: string): void {
+export function validateVerificationMode(config: LifecycleConfig, body: string): void {
   parseDeliveryKind(config.delivery ?? "implementation");
   const mode = parseVerificationMode(config.verification);
+  if (config.historicalSources !== undefined) {
+    parseHistoricalSources(config.historicalSources);
+    if (config.delivery !== "investigation" || mode !== "local") throw new Error("Historical sources require investigation delivery and local acceptance");
+    if (!acceptanceCriteria(body).some(isQuery)) throw new Error("Historical sources require query ACs");
+    assertLocalAcceptance(body, config);
+  }
   if (mode === "deployed" && !config.deploymentProbe?.length) {
     throw new Error("Managed deployed verification requires a read-only lifecycle.deploymentProbe before launch");
   }
-  if (mode === "local" && acceptanceCriteria(body).some(requiresDeployed)) {
+  if (mode === "local" && acceptanceCriteria(body).some(line => requiresServing(line, config))) {
     throw new Error("Local verification cannot satisfy a deployment Acceptance Criterion");
   }
+}
+
+/** Snapshot references, not a filename whose contents could change after launch. */
+export function parseHistoricalSources(value: unknown): string[] {
+  if (!Array.isArray(value) || !value.length || value.some(ref => typeof ref !== "string" || !ref.trim() || ref !== ref.trim()) ||
+      new Set(value).size !== value.length) throw new Error("Historical sources must be a non-empty JSON array of unique original source references");
+  return [...value];
+}
+
+const isQuery = (criterion: string): boolean =>
+  criterion.match(/\[(test|code|ci|query|deploy|mobile|human)(?::|\])/i)?.[1].toLowerCase() === "query";
+
+function requiresServing(criterion: string, config: LifecycleConfig): boolean {
+  if (!config.historicalSources || !isQuery(criterion)) return requiresDeployed(criterion);
+  // The explicit contract disambiguates historical version facts only. It cannot
+  // convert current observations or runtime execution into documentary evidence.
+  if (/\[deploy(?::|\])|\b(?:current(?:ly)?|latest|live)\s+(?:(?:the|actual|production|staging)\s+){0,2}(?:production|staging|deployed|serving|runtime|environment|deployment|version|journey)\b|\b(?:production|staging|deployed|serving|runtime|deployment)\b[^.;\n]{0,60}\b(?:now|today|currently)\b|(?:当前|实时|现网|现在|最新)(?:的)?\s*(?:生产|部署|服务|环境|版本|production|staging|runtime|serving)/i.test(criterion)) return true;
+  if (/\b(?:run|execute|exercise|invoke|call|access|probe)\b[^.\n]{0,100}\b(?:production|staging|deployed|runtime|environment|serving|journey)\b|(?:运行|执行|调用|访问|探测|实测)[^。\n]{0,60}(?:环境|服务|生产|runtime)/i.test(criterion)) return true;
+  if (/\b(?:verify|test|check)\b[^.\n]{0,100}\b(?:runtime|behavior|endpoint|latency|availability|smoke)\b|\b(?:against|on|in) the (?:production|staging|deployed)\b|验证[^。\n]{0,60}(?:运行行为|接口|延迟|可用性)/i.test(criterion)) return true;
+  if (/\b(?:deployed|production|staging|serving[ -](?:version|bound|source|runtime))\b[^.\n]{0,100}\b(?:must|shall|required|passes?|succeeds?|completes?)\b|\b(?:must|shall|required)\b[^.\n]{0,100}\b(?:deployed|production|staging|serving)\b/i.test(criterion)) return true;
+  return /(?:--?(?:e|env|environment|target|stage)|\b[A-Z_]*ENV(?:IRONMENT)?)\s*(?:=\s*|\s+)(?:production|prod|staging|stage|dev|development|live)\b/i.test(criterion.replace(/[`'"]/g, ""));
 }
 
 /** Issue-scoped correction; repository defaults and human holds stay intact. */
@@ -214,8 +243,35 @@ function localContractDescription(criterion: string): boolean {
   const description = criterion.replace(/`?\[(?:test|code):[a-z0-9-]+\]`?/g, "").trim();
   return /^(?:tests? (?:cover|reject|reconcile|group|establish|enforce|preserve)|a fixture\b|documentation (?:describes|documents|explains|lists)|document\b|describe\b)/i.test(description);
 }
+/** Remove artifact tokens, not code spans: a command can still target production. */
+function deploymentRequirementText(criterion: string): string {
+  return criterion
+    // These Node test selectors name tests, not target environments. Parse only
+    // their value; never discard the containing command or adjacent arguments.
+    .replace(/--test-(?:name|skip)-pattern(?:=|\s+)(?:"[^"\n]*"|'[^'\n]*'|[^\s`;&|]+)/g, " ")
+    .replace(/[`'"“”‘’]/g, "")
+    .replace(/[^\s<>()\[\]{},;]+/g, token => {
+      // A path may also be an option value. Keep URLs and ambiguous prose
+      // such as production/staging; only mask filenames or explicit paths.
+      const equals = token.indexOf("=");
+      const value = token.slice(equals + 1);
+      if (value.startsWith("-") || value.includes("://")) return token;
+      const path = value.replace(/[.:!?]+$/, "");
+      if (!/^[a-z0-9_~@*?.:/\\-]+$/i.test(path)) return token;
+      // Bare hosts (production.example.com) are runtime references, not files.
+      // Unknown extensions stay visible rather than narrowing acceptance.
+      const artifact = /^(?:[.~][^/\\]*[/\\]|[/\\]|[a-z]:[/\\])/i.test(path) ||
+        /\.(?:[cm]?[jt]sx?|jsonc?|ya?ml|toml|ini|conf|md|mdx|txt|sh|bash|zsh|py|go|rs|rb|java|c|cpp|h|hpp|css|scss|html|vue|svelte|svg|xml|sql|proto|lock|csv|log)(?::\d+)?$/i.test(path);
+      return artifact ? token.slice(0, equals + 1) + " " : token;
+    })
+    // This names the CI environment, not a serving runtime. Keep any adjacent
+    // deployment requirement visible (including a later production instruction).
+    .replace(/\bnon[ -]production\s+CI\b/gi, "CI");
+}
 export function requiresDeployed(criterion: string): boolean {
   if (/\[deploy(?::|\])/i.test(criterion)) return true;
+  if (/(?:--?(?:e|env|environment|target|stage)|\b[A-Z_]*ENV(?:IRONMENT)?)\s*(?:=\s*|\s+)(?:production|prod|staging|stage|dev|development|live)\b/i.test(criterion.replace(/[`'"]/g, ""))) return true;
+  criterion = deploymentRequirementText(criterion);
   // A fixture/documentation contract can describe deployed behavior without
   // requiring runtime execution. Direct runtime instructions still take priority.
   const directRuntime = /\b(?:run|runs|execute|executed|exercise|verify|verified|probe)\b[^.\n]{0,80}\b(?:deployed|production|staging|live runtime)\b/i.test(criterion);
@@ -228,9 +284,9 @@ export function requiresHuman(criterion: string): boolean {
   if (localContractDescription(criterion) && !/\b(?:obtain|requires?|required|record|recorded|must|shall)\b[^.\n]{0,80}\b(?:human|owner|user) (?:acceptance|approval)\b|\b(?:human|owner|user) (?:acceptance|approval)\b[^.\n]{0,80}\b(?:must|shall|required)\b|\b(?:owner|human|operator|user) (?:approves|accepts|signs off)\b/i.test(criterion)) return false;
   return /\[human(?::|\])|\b(?:human|manual|user) acceptance\b|\b(?:owner|human|operator|user) (?:approval|acceptance|approves|accepts|sign.off)\b/i.test(criterion);
 }
-export function assertLocalAcceptance(body: string): void {
+export function assertLocalAcceptance(body: string, config: LifecycleConfig = {}): void {
   acceptance(body);
-  if (acceptanceCriteria(body).some(line => requiresDeployed(line) || requiresHuman(line))) {
+  if (acceptanceCriteria(body).some(line => requiresServing(line, config) || requiresHuman(line))) {
     throw new Error("Local acceptance cannot bypass a current deployed or human AC; preserve its scope");
   }
 }
@@ -453,6 +509,10 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
       report.criteria.some(item => !item || !job.acLabels.includes(item.label) || !["pass", "fail", "blocked"].includes(item.status) || !Array.isArray(item.evidence))) {
     throw new Error("Verification entries must have unique current AC labels, a valid status and an evidence array");
   }
+  if (job.config.historicalSources && (report.deployment || report.criteria.some(item =>
+      item.evidence.some(entry => entry.kind === "journey" || entry.deployment)))) {
+    throw new Error("Historical reports require original source evidence, not current deployment or journey bindings");
+  }
   for (const item of report.criteria) {
     const label = item.label;
     if (item.status === "blocked" || (item.status === "fail" && !item.evidence.length)) continue;
@@ -463,6 +523,14 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
     if (checklistCriteria(currentBody).find(criterion => criterion.label === label)?.human &&
         !item.evidence.some(entry => entry.kind === "human" && typeof entry.confirmedBy === "string" && entry.confirmedBy.trim())) {
       throw new Error(`AC '${label}' needs real human confirmation (human evidence with confirmedBy and a confirmation reference)`);
+    }
+    const criterion = checklistCriteria(currentBody).find(criterion => criterion.label === label)!.text;
+    if (item.status === "pass" && /\[ci(?::|\])/i.test(criterion) && !item.evidence.some(entry => entry.kind === "ci")) {
+      throw new Error(`AC '${label}' needs actual CI evidence; local tests or estimates cannot replace the required run`);
+    }
+    if (job.config.historicalSources && isQuery(criterion) &&
+        !item.evidence.some(entry => entry.kind === "historical" && job.config.historicalSources!.includes(entry.reference))) {
+      throw new Error(`AC '${label}' needs historical evidence referencing an original source in the acceptance contract; local estimates cannot replace it`);
     }
   }
   if (job.config.verification !== "local") {
@@ -651,11 +719,14 @@ export function verificationInstructions(job: Job): string[] {
   if (investigation(job)) return [
     `Investigate the pinned source ${job.observedSourceSha}; acceptance: ${job.config.verification}. Keep the tracked worktree clean and obtain independent evidence for every AC.`,
     "Use sourceSha in the report. Correct an invalid source or target through job acceptance; preserve holds and do not fabricate a PR or merge.",
+    job.config.historicalSources
+      ? `Historical sources: ${JSON.stringify(job.config.historicalSources)}. For query evidence, read only these published sources; use historical evidence referencing originals. Local means no current serving deployment is required, not permission to replace source evidence with estimates. Checkpoint verifying when ready; never access runtime to submit a report.`
+      : "Checkpoint verifying for local acceptance or waiting-deploy for serving-bound acceptance when observations are ready.",
   ];
   return [
-    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. The repository setting is a default; use --verification local with a reason only if all ACs can be proven locally.`,
+    `Verification mode for this issue: ${job.config.verification ?? "deployed"}. The repository setting is a default; select --verification local when no serving deployment is required. Required CI runs still need actual CI evidence, not local tests or estimates. Correct scope through job acceptance with its revision/current-AC guards; preserve human requirements and holds.`,
     job.config.verification === "local"
-      ? "After an authorized merge, obtain independent evidence for every AC against the merged source locally."
+      ? "After an authorized merge, obtain independent evidence for every AC against the merged source, including required CI runs. No deployment probe or serving-bound journey is required."
       : "After an authorized merge, verify applicable journeys against the serving source and version; rerun affected probes if the version changes.",
     "Completion requires a merged PR and complete independent AC evidence. See workit job --help for the report contract.",
   ];

@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { groupCLI } from "./group-cli.js";
 import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
-import { JobStore, createJob, parseVerificationMode, parseDeliveryKind } from "./lifecycle.js";
+import { JobStore, createJob, parseVerificationMode, parseDeliveryKind, parseHistoricalSources } from "./lifecycle.js";
 import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
 import { chooseAgent, describeEffectiveWeights } from "./agents.js";
 import { DEFAULT_LAUNCH_INSTRUCTIONS, MANAGED_OWNED_INSTRUCTION_PREFIXES, allLaunchableRegistryAgents, agentDefinitionsByTag, resolveConfig, resolveHomePath } from "./config.js";
@@ -122,6 +122,7 @@ Options:
   --no-agent                           Create/prepare worktree only
   --managed / --unmanaged               Enable/disable durable issue follow-through (Banyan)
   --delivery implementation|investigation  Managed delivery contract (default implementation)
+  --historical-sources PATH             Fixed original source references (JSON array; investigation + local only)
   --deployment-target NAME             Select a named trusted probe/environment
   --acceptance local|deployed           Explicit per-job acceptance profile (managed only)
   --verification local|deployed         Override managed verification for these issues
@@ -186,6 +187,8 @@ function parseArgs(argv: string[]): CliOptions {
         options.delivery = parseDeliveryKind(next()); break;
       case "--deployment-target":
         options.deploymentTarget = next(); break;
+      case "--historical-sources":
+        options.historicalSources = parseHistoricalSources(JSON.parse(readFileSync(resolve(next()), "utf8"))); break;
       case "--acceptance":
         options.acceptance = next() as "local" | "deployed";
         if (!["local", "deployed"].includes(options.acceptance)) throw new Error("--acceptance requires local or deployed");
@@ -784,7 +787,7 @@ async function main(): Promise<void> {
       throw new Error("Managed jobs require a prompted agent in Banyan");
     }
     if (options.acceptance && options.verification && options.acceptance !== options.verification) throw new Error("--acceptance and --verification must agree");
-    if ((options.acceptance || options.verification || options.delivery || options.deploymentTarget) && !managed) throw new Error("--verification requires a managed launch");
+    if ((options.acceptance || options.verification || options.delivery || options.deploymentTarget || options.historicalSources) && !managed) throw new Error("--verification requires a managed launch");
 
     if (options.verbose && resolved.configFiles.length) {
       console.log(`Config: ${resolved.configFiles.join(", ")}`);
@@ -859,6 +862,7 @@ async function main(): Promise<void> {
       jobStore = new JobStore();
       const lifecycle = { ...config.lifecycle, ...(options.verification ? { verification: options.verification } : {}),
         ...(options.delivery ? { delivery: options.delivery } : {}),
+        ...(options.historicalSources ? { historicalSources: options.historicalSources } : {}),
         ...(options.deploymentTarget ? { deploymentTarget: options.deploymentTarget } : {}) };
       job = createJob({ issue, repoRoot: root, worktree: worktree.path,
         observedSourceSha: lifecycle.delivery === "investigation" ? await new BanyanLifecycleAdapter().observedSource({ worktree: worktree.path }) : undefined,

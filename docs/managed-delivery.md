@@ -93,7 +93,11 @@ incompatible options.
 
 `--acceptance local|deployed` overrides the configured profile for one managed
 launch. Select local only after reviewing **all current ACs** and establishing
-local acceptance probes for each. Workit rejects local scope when an AC requires
+evidence for each. Local means no current serving deployment is required;
+it does not require all evidence to originate locally. Required CI runs still
+need actual `kind: "ci"` evidence, and original historical sources cannot be
+replaced by local tests or estimates. CI workflow filenames and test selectors
+containing production/staging do not imply a serving requirement. Workit rejects local scope when an AC requires
 deployment. Human ACs still require actual attributed confirmation; profile
 correction refuses to narrow an outstanding human requirement. Scope is never inferred from changed filenames.
 Local implementation reports still need a merged source, an independent reviewer and complete
@@ -125,6 +129,75 @@ inspected reconciliation. Pending wakes also remain held for inspection.
 Existing pauses and human holds stay held; use `job resume` separately after
 resolving them. Correction is never permission to merge, deploy or close an issue.
 No SQLite edits or automatic migration of existing jobs are needed.
+
+### Fixed historical sources
+
+An investigation can reconcile facts from already-published records, including
+past production attribution, installation/serving version alignment and downstream
+settlement, without proving the current deployment or runtime. Declare that
+contract explicitly; mentioning history in prose does not select it:
+
+```bash
+# JSON array of fixed original references, such as commit URLs, message permalinks
+# or dated archived records. Use references without credentials or customer data.
+workit --managed --delivery investigation --acceptance local --historical-sources /absolute/path/sources.json TASK-123
+```
+
+Workit snapshots the array into the job. This contract applies only to query ACs
+on `investigation + local`. Historical production/serving version facts alone
+do not require a deployment probe. Explicit deploy tags, current version/runtime
+requirements, runtime execution/journeys and real human acceptance retain their
+gates. Other AC types keep their ordinary classification, including actual CI
+evidence requirements. This declaration never changes an AC's meaning: review
+ambiguous criteria with the owner, and keep serving-bound acceptance for genuine
+runtime requirements. A fixed-source investigation grants no new runtime access.
+
+For every evidenced historical query result, include `kind: "historical"`, a
+`reference` exactly matching an enrolled original source, and `observed` describing
+what the independent reviewer read and how it supports that AC. A report/summary
+link alone or an estimate cannot replace the originals. Record unsupported facts
+as fail/blocked unless the original AC expressly permits a documented unproven
+conclusion. All current ACs, clean `observedSourceSha`, `sourceSha` report binding,
+independent reviewer and post-correction observation time remain required. Do not
+invent deployment or journey bindings for a historical report.
+
+When findings are ready, checkpoint `verifying`, then submit the independent
+report with `job verify --report PATH`. Launch, correction, verifier preflight,
+verify and closeout retry use the saved local scope without a deployment probe.
+Do not first run `refresh-deployment`, a runtime doctor or an incident probe to
+submit a historical report. Partial Linear reports synchronize only proven
+checkbox results and keep the issue unfinished; complete passing evidence is
+required for Done.
+
+To recover an incorrectly scoped investigation, the original control session
+first inspects `job status` and `job acceptance`, including current issue ACs,
+pending wake/verifier identities and owner holds. Use the supported correction:
+
+```bash
+workit job acceptance JOB_ID --delivery investigation --profile local --historical-sources /absolute/path/sources.json --reason "Current query ACs require only these published records; no current runtime observation" --expected-revision N --expected-ac-hash CURRENT_AC_HASH
+```
+
+The correction freshly observes the clean source and audits old/new source
+references, delivery/profile and AC hash. It invalidates old evidence without
+releasing `needs-you`, a pause, pending delivery or an uncertain verifier. The
+original control session must inspect/reconcile those effects and explicitly
+release any hold with `job resume` before checkpointing `verifying` and obtaining
+fresh independent observations. Use `--historical-sources none` on a guarded
+correction to remove this contract before selecting serving-bound acceptance.
+After an interrupted tracker write, inspect conflicts and use `job closeout`;
+readback resolves uncertain applied writes before any retry. No existing job is
+automatically migrated, resumed or replayed.
+
+The isolated regression is `bunx tsx --test src/historical-investigation.test.ts`:
+temporary Git/workit/tracker/CLI fixtures install a probe that fails if called,
+and assert zero calls across launch/correction, heartbeat and report/retry paths.
+It executes this checkout's TypeScript through tsx. `npm run build` creates this
+checkout's ignored `dist/cli.js`; an installed wrapper or heartbeat may still pin
+a different artifact. Record the tested source SHA, command and artifact path in
+delivery evidence, and inspect the saved `controlCommand` before using a new
+option. Source tests/builds do not update an installed runtime. This fix does not
+resume or close the motivating real investigation; recovery remains with its
+original control session and owner hold.
 
 ## Heartbeat
 
