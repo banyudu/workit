@@ -7,6 +7,7 @@ export interface QueueItem {
   key: string; repo: string; issue: string; provider: Backend; issueURL: string; acHash: string; jobID: string;
   dependsOn: string[]; agent?: string; delivery: "implementation" | "investigation";
   verification: "local" | "deployed"; deploymentTarget?: string;
+  deploymentSourceBinding?: import("./lifecycle.js").DeploymentSourceBinding;
   state: "pending" | "reserved" | "launching" | "launched" | "uncertain" | "abandoned";
   launchID?: string; slot?: boolean; reservedAt?: string; recovery?: { reason: string; at: string };
 }
@@ -74,6 +75,7 @@ with sqlite3.connect(db, timeout=10) as c:
             if j["id"]!=i["jobID"] or j["repoRoot"]!=i["repo"] or j["issue"]["url"]!=i["issueURL"] or j["acHash"]!=i["acHash"]: raise ValueError("Launch issue/source plan changed; inspect the reservation")
             cfg=j["config"]
             if cfg.get("delivery","implementation")!=i["delivery"] or cfg["verification"]!=i["verification"] or cfg.get("deploymentTarget")!=i.get("deploymentTarget"): raise ValueError("Launch acceptance differs from queue plan")
+            if cfg.get("deploymentSourceBinding","contains-source")!=i.get("deploymentSourceBinding","contains-source"): raise ValueError("Launch source binding differs from queue plan")
             if i.get("agent") and j["agent"]!=i["agent"]: raise ValueError("Launch agent differs from queue plan")
             j["queue"]={"id":q["id"],"key":i["key"],"launchID":r["token"],"title":q["title"],"outcome":q["outcome"],"deadline":q["deadline"]}
             if q.get("coordinator"): j["queue"]["coordinatorSessionID"]=q["coordinator"]["sessionID"]

@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentDefinition, CliOptions, IssueDetails, ResolvedConfig, WorktreeResult } from "./types.js";
 import type { Job, VerifierPlan, VerifierRun } from "./lifecycle.js";
+import { observesExistingDeployment } from "./lifecycle.js";
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -187,6 +188,7 @@ function runBanyan(
 export function launchIndependentVerifier(job: Job, run: VerifierRun, plan: VerifierPlan, banyanctl = findBanyanctl()): void {
   if (!plan.command) throw new Error("No verifier command available");
   const prompt = [
+    ...(observesExistingDeployment(job) ? ["Read-only deployment observation: sourceSha pins the observer; the deployment source may differ. Independently prove each runtime AC with kind observation or an actual journey, bound to the exact observed environment/target/sourceSha/version. Do not claim the observer is installed."] : []),
     `Independently verify managed job ${job.id}. Reviewer run ID: ${run.id}.`,
     `Issue: ${job.issue.url}. ${investigation(job) ? "Observed source" : "Merged source"}: ${verificationSource(job)}. Current AC hash: ${job.acHash}.`,
     `Acceptance profile: ${job.config.verification}. AC labels: ${job.acLabels.join(", ")}.`,

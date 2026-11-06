@@ -1,4 +1,4 @@
-import { SourceProvenanceError, sha, type Job, type LifecycleAdapter } from "./lifecycle.js";
+import { SourceProvenanceError, sha, observesExistingDeployment, type Deployment, type Job, type LifecycleAdapter } from "./lifecycle.js";
 
 export const investigation = (job: Job): boolean => job.config.delivery === "investigation";
 export const verificationSource = (job: Job): string | undefined => investigation(job) ? job.observedSourceSha : job.mergeSha;
@@ -24,11 +24,23 @@ export async function assertVerificationSource(adapter: LifecycleAdapter, job: J
 }
 
 export async function assertVerificationDeployment(adapter: LifecycleAdapter, job: Job): Promise<void> {
+  observesExistingDeployment(job);
   if (job.config.verification === "local") return;
   const deployment = await observe(() => adapter.deployment(job));
   if (!deployment || !job.deployment ||
-      !(["environment", "target", "sourceSha", "version"] as const).every(key => deployment[key] === job.deployment![key]) ||
-      !await observe(() => adapter.containsMerge(job, deployment.sourceSha))) {
+      !(["environment", "target", "sourceSha", "version"] as const).every(key => deployment[key] === job.deployment![key])) {
     throw new Error("Serving deployment changed; rerun applicable verification");
   }
+  await assertDeploymentSourceRelation(adapter, job, deployment);
+}
+
+/** The observer stays pinned independently; only explicit observations omit ancestry. */
+export async function assertDeploymentSourceRelation(adapter: LifecycleAdapter, job: Job, deployment: Deployment): Promise<void> {
+  if (!sha(deployment.sourceSha) || !deployment.environment?.trim() || !deployment.target?.trim() || !deployment.version?.trim())
+    throw new SourceProvenanceError("Deployment observation needs environment, target, full source SHA and version");
+  if (job.config.deploymentBinding && (deployment.environment !== job.config.deploymentBinding.environment ||
+      deployment.target !== job.config.deploymentBinding.target))
+    throw new SourceProvenanceError("Deployment observation differs from the named target");
+  if (!observesExistingDeployment(job) && !await observe(() => adapter.containsMerge(job, deployment.sourceSha)))
+    throw new Error("Serving deployment does not contain the expected source");
 }

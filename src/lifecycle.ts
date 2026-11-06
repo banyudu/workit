@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IssueDetails } from "./types.js";
 import { selectDeploymentTarget, type DeploymentTarget } from "./deployment-target.js";
-import { assertVerificationSource, investigation, verificationSource } from "./verification-source.js";
+import { assertVerificationSource, assertDeploymentSourceRelation, investigation, verificationSource } from "./verification-source.js";
 import { coordinateVerification, refreshHeldFacts, verifierBinding } from "./closeout.js";
 import { heldRefreshBudget, scheduleTick } from "./lifecycle-schedule.js";
 
@@ -15,6 +15,7 @@ export const stages = ["investigating", "implementing", "preverifying", "reviewi
 export type Stage = typeof stages[number];
 export type DeliveryKind = "implementation" | "investigation";
 export type VerificationMode = "deployed" | "local";
+export type DeploymentSourceBinding = "contains-source" | "observe-existing";
 export const DEFAULT_INTERVAL_SECONDS = 300;
 export const DEFAULT_MAX_WAKEUPS = 6;
 export interface Deployment {
@@ -26,6 +27,8 @@ export interface LifecycleConfig {
   delivery?: DeliveryKind;
   /** Explicit fixed-source investigation contract; never inferred from AC prose. */
   historicalSources?: string[];
+  /** Explicit read-only observation; does not establish installation of the observer. */
+  deploymentSourceBinding?: DeploymentSourceBinding;
   deploymentTarget?: string;
   deploymentTargets?: Record<string, DeploymentTarget>;
   deploymentBinding?: { environment: string; target: string };
@@ -84,7 +87,7 @@ export interface Job {
   };
   lastRecovery?: { wakeID: string; outcome: string; detail: string; at: string };
   acceptanceChangedAt?: string;
-  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string; fromHistoricalSources?: string[]; toHistoricalSources?: string[] }>;
+  acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string; fromHistoricalSources?: string[]; toHistoricalSources?: string[]; fromDeploymentSourceBinding?: DeploymentSourceBinding; toDeploymentSourceBinding?: DeploymentSourceBinding }>;
   holdDetail?: string;
   blocker?: Blocker;
   facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
@@ -192,9 +195,28 @@ export function parseDeliveryKind(value: unknown): DeliveryKind {
   return value;
 }
 
+export function parseDeploymentSourceBinding(value: unknown): DeploymentSourceBinding {
+  if (value !== "contains-source" && value !== "observe-existing") throw new Error("Deployment source binding must be contains-source or observe-existing");
+  return value;
+}
+
+export function observesExistingDeployment(job: Pick<Job, "config">): boolean {
+  const config = job.config;
+  const binding = config.deploymentSourceBinding === undefined ? "contains-source" : parseDeploymentSourceBinding(config.deploymentSourceBinding);
+  if (binding !== "observe-existing") return false;
+  if (config.delivery !== "investigation" || config.verification !== "deployed" || config.historicalSources !== undefined)
+    throw new Error("Observing an existing deployment requires investigation delivery and deployed acceptance without historical sources");
+  return true;
+}
+
+function servingEvidence(job: Job, kind: string): boolean {
+  return kind === "journey" || (observesExistingDeployment(job) && kind === "observation");
+}
+
 export function validateVerificationMode(config: LifecycleConfig, body: string): void {
   parseDeliveryKind(config.delivery ?? "implementation");
   const mode = parseVerificationMode(config.verification);
+  observesExistingDeployment({ config });
   if (config.historicalSources !== undefined) {
     parseHistoricalSources(config.historicalSources);
     if (config.delivery !== "investigation" || mode !== "local") throw new Error("Historical sources require investigation delivery and local acceptance");
@@ -539,14 +561,14 @@ export function validateProgressReport(job: Job, value: unknown, currentBody: st
     for (const item of report.criteria.filter(item => item.status !== "blocked")) {
       for (const entry of item.evidence) {
         if ((entry.deployment && !matchesDeployment(job, entry.deployment)) ||
-            (entry.kind === "journey" && (!matchesDeployment(job, report.deployment) || !matchesDeployment(job, entry.deployment)))) {
+            (servingEvidence(job, entry.kind) && (!matchesDeployment(job, report.deployment) || !matchesDeployment(job, entry.deployment)))) {
           throw new Error("Verification needs journey evidence for the observed deployment");
         }
       }
     }
     acceptanceCriteria(currentBody).forEach((criterion, index) => {
       const item = report.criteria.find(item => item.label === job.acLabels[index]);
-      if (requiresDeployed(criterion) && item?.status === "pass" && !item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment))) {
+      if (requiresDeployed(criterion) && item?.status === "pass" && !item.evidence.some(entry => servingEvidence(job, entry.kind) && matchesDeployment(job, entry.deployment))) {
         throw new Error("Every deployed AC needs its own serving-bound journey evidence");
       }
     });
@@ -563,7 +585,7 @@ function matchesDeployment(job: Job, value?: Deployment): boolean {
 export function reportComplete(job: Job, report: VerificationReport): boolean {
   return report.criteria.length === job.acLabels.length && report.criteria.every(item => item.status === "pass") &&
     (job.config.verification === "local" || (matchesDeployment(job, report.deployment) &&
-      report.criteria.some(item => item.evidence.some(entry => entry.kind === "journey" && matchesDeployment(job, entry.deployment)))));
+      report.criteria.some(item => item.evidence.some(entry => servingEvidence(job, entry.kind) && matchesDeployment(job, entry.deployment)))));
 }
 
 export function validateReport(job: Job, value: unknown, currentBody: string, now = new Date()): VerificationReport {
@@ -718,6 +740,7 @@ export function controlCommand(job: Job): string {
 
 export function verificationInstructions(job: Job): string[] {
   if (investigation(job)) return [
+    ...(observesExistingDeployment(job) ? ["Observe the existing serving deployment without requiring observer-source ancestry. Keep the observer sourceSha pinned and record actual environment/target/sourceSha/version in the report and each serving-bound observation. This does not prove that the observer source was installed or that a fix was delivered."] : []),
     `Investigate the pinned source ${job.observedSourceSha}; acceptance: ${job.config.verification}. Keep the tracked worktree clean and obtain independent evidence for every AC.`,
     "Use sourceSha in the report. Correct an invalid source or target through job acceptance; preserve holds and do not fabricate a PR or merge.",
     job.config.historicalSources
@@ -890,9 +913,11 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         const deployment = await adapter.deployment(job);
         actionable = deployment !== undefined;
         if (deployment) {
-          if (!sha(deployment.sourceSha) || !await adapter.containsMerge(job, deployment.sourceSha)) throw new Error("Deployment source does not contain the merged change");
+          await assertDeploymentSourceRelation(adapter, job, deployment);
           save(current => { current.deployment = deployment; current.stage = "verifying"; });
-          reason = "deployment containing the merged change is ready; run applicable journeys";
+          reason = observesExistingDeployment(job)
+            ? "existing deployment observed; independent serving-bound observations are required"
+            : "deployment containing the merged change is ready; run applicable journeys";
         }
       }
       if (queueContinuationPending(store, job, now)) {
