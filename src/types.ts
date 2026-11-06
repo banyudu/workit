@@ -170,6 +170,7 @@ export interface CliOptions {
   managed?: boolean;
   delivery?: import("./lifecycle.js").DeliveryKind;
   historicalSources?: string[];
+  deploymentSourceBinding?: import("./lifecycle.js").DeploymentSourceBinding;
   deploymentTarget?: string;
   acceptance?: "local" | "deployed";
   verification?: import("./lifecycle.js").VerificationMode;

@@ -206,3 +206,31 @@ test("a refusal with unresolved delivery cannot release a queue slot", async t =
   assert.deepEqual(f.launches, ["first"]);
   assert.equal(f.queues.get(f.queue.id).items[0].slot, true);
 });
+
+test("queue snapshots deployment source binding and rejects launch-time drift", async t => {
+  const f = await fixture(t);
+  assert.equal(f.queue.items[0].deploymentSourceBinding, "contains-source");
+  f.control("active");
+  const item = f.queues.reserve(f.queue.id, now)!;
+  const drifted = createJob({ issue: issue("1"), repoRoot: item.repo, worktree: item.repo,
+    githubRepo: "example/project", agent: "fixture", config: { verification: "local" }, now });
+  drifted.config.deploymentSourceBinding = "observe-existing";
+  assert.throws(() => f.queues.attach(f.queue.id, item.launchID!, drifted, now), /source binding differs/);
+  assert.equal(f.jobs.list().length, 0);
+
+  const observation = f.queues.create(await prepareQueue({
+    ...f.manifest, items: [{ key: "observe", repo: f.directory, issue: "9", delivery: "investigation",
+      verification: "deployed", deploymentSourceBinding: "observe-existing" }],
+  }, async i => ({ repo: i.repo, issue: issue(i.issue), delivery: "investigation", verification: "deployed",
+    deploymentSourceBinding: "observe-existing" }), [process.execPath, "/tmp/fixture-cli.js"], now));
+  f.queues.control(observation.id, "active", observation.revision, now);
+  const reserved = f.queues.reserve(observation.id, now)!;
+  const make = (binding: "contains-source" | "observe-existing") => createJob({
+    issue: issue("9"), repoRoot: f.directory, worktree: f.directory, githubRepo: "example/project",
+    agent: "fixture", observedSourceSha: "b".repeat(40), config: { delivery: "investigation",
+      verification: "deployed", deploymentProbe: ["fixture"], deploymentSourceBinding: binding }, now,
+  });
+  assert.throws(() => f.queues.attach(observation.id, reserved.launchID!, make("contains-source"), now), /source binding differs/);
+  const attached = f.queues.attach(observation.id, reserved.launchID!, make("observe-existing"), now);
+  assert.equal(attached.config.deploymentSourceBinding, "observe-existing");
+});

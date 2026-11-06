@@ -5,10 +5,10 @@ import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { BanyanLifecycleAdapter } from "./lifecycle-adapter.js";
-import { JobStore, acceptance, assertLocalAcceptance, checkpoint, parseVerificationMode, parseDeliveryKind, parseHistoricalSources, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
+import { JobStore, acceptance, assertLocalAcceptance, checkpoint, parseVerificationMode, parseDeliveryKind, parseDeploymentSourceBinding, parseHistoricalSources, setVerificationMode, settleCoordinatorNotes, verificationInstructions, stages, tick, type Job, type Stage } from "./lifecycle.js";
 import { attention, checkVerification, completeVerification, correctAcceptance, readableAttention, reconcileVerifier } from "./closeout.js";
 import { closeoutJob } from "./lifecycle-closeout.js";
-import { assertVerificationSource, investigation } from "./verification-source.js";
+import { assertVerificationSource, assertDeploymentSourceRelation, investigation } from "./verification-source.js";
 import { overview } from "./overview.js";
 import { heartbeatCLI } from "./heartbeat.js";
 
@@ -40,7 +40,7 @@ workit job status ID
 workit job overview [--format json] [--limit 1..1000]
 workit job attention [--format json|text]
 workit job acceptance ID
-workit job acceptance ID [--profile local|deployed] [--delivery implementation|investigation] [--historical-sources PATH] [--target NAME] --reason TEXT --expected-revision N --expected-ac-hash HASH
+workit job acceptance ID [--profile local|deployed] [--delivery implementation|investigation] [--historical-sources PATH] [--source-binding contains-source|observe-existing] [--target NAME] --reason TEXT --expected-revision N --expected-ac-hash HASH
 workit job verifier-reconcile ID --run-id ID --outcome delivered|not-delivered|completed --reason TEXT --expected-revision N
 workit job checkpoint ID --stage STAGE --detail TEXT [--pr URL] [--merge-sha SHA] [--after SECONDS] [--verification local|deployed] [--tracker-completion human|automatic]
 workit job pause ID --detail TEXT [--expected-revision N] [--expected-session-id SESSION_ID]
@@ -70,6 +70,7 @@ Local acceptance skips deployment checks and still requires complete independent
 Historical investigations: --delivery investigation --acceptance local --historical-sources PATH (JSON array of fixed original source references).
 Query evidence must use kind historical and reference an enrolled original source; no estimates or fabricated journeys.
 Acceptance correction can remove the contract with --historical-sources none before selecting deployed scope.
+Read-only deployed investigations may explicitly use --source-binding observe-existing; actual serving-bound observation evidence is still required.
 Explicit deploy/current runtime and human ACs cannot be narrowed. Correction requires current revision/hash and preserves holds.
 Inspect and correct acceptance before verifying historical reports; never probe unauthorized runtime to submit evidence.
 --verification overrides this job only; include local acceptance coverage in --detail when correcting a job.`);
@@ -107,14 +108,15 @@ Inspect and correct acceptance before verifying historical reports; never probe 
     case "status":
       only(values, []); job = store.get(id); break;
     case "acceptance": {
-      only(values, ["--profile", "--delivery", "--historical-sources", "--target", "--reason", "--expected-revision", "--expected-ac-hash"]);
+      only(values, ["--profile", "--delivery", "--historical-sources", "--source-binding", "--target", "--reason", "--expected-revision", "--expected-ac-hash"]);
       if (!Object.keys(values).length) {
         const current = store.get(id);
         const issue = await adapter.currentIssue(current);
         let localEligible = true;
         try { assertLocalAcceptance(issue.body, current.config); } catch { localEligible = false; }
         console.log(JSON.stringify({ jobID: id, revision: current.revision, profile: current.config.verification, delivery: current.config.delivery ?? "implementation", target: current.config.deploymentTarget, observedSourceSha: current.observedSourceSha,
-          historicalSources: current.config.historicalSources, boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
+          historicalSources: current.config.historicalSources, deploymentSourceBinding: current.config.deploymentSourceBinding ?? "contains-source",
+          boundAcHash: current.acHash, current: acceptance(issue.body), localEligible }, null, 2)); return;
       }
       if (!/^\d+$/.test(values["--expected-revision"] ?? "")) throw new Error("acceptance requires --expected-revision N");
       const expected = store.get(id);
@@ -124,6 +126,7 @@ Inspect and correct acceptance before verifying historical reports; never probe 
       const trusted = values["--target"] ? adapter.trustedTarget(expected, values["--target"]) : undefined;
       const observedSourceSha = delivery === "investigation" ? await adapter.observedSource(expected) : undefined;
       job = correctAcceptance(store, id, { delivery, observedSourceSha, target: values["--target"],
+        deploymentSourceBinding: values["--source-binding"] === undefined ? undefined : parseDeploymentSourceBinding(values["--source-binding"]),
         historicalSources: values["--historical-sources"] === "none" ? null : values["--historical-sources"] ? parseHistoricalSources(JSON.parse(readFileSync(resolve(values["--historical-sources"]), "utf8"))) : undefined,
         profile: values["--profile"] ? parseVerificationMode(values["--profile"]) : expected.config.verification ?? "deployed", reason: values["--reason"],
         expectedRevision: Number(values["--expected-revision"]), expectedAcHash: values["--expected-ac-hash"] }, issue, new Date(), trusted);
@@ -194,8 +197,9 @@ Inspect and correct acceptance before verifying historical reports; never probe 
       if (expected.config.verification === "local") throw new Error("Local verification has no serving deployment");
       await assertVerificationSource(adapter, expected);
       const deployment = await adapter.deployment(expected);
-      if (!deployment || !await adapter.containsMerge(expected, deployment.sourceSha))
+      if (!deployment)
         throw new Error("Serving deployment does not establish the merged source");
+      await assertDeploymentSourceRelation(adapter, expected, deployment);
       job = store.update(id, current => {
         if (current.revision !== expected.revision || current.stage !== expected.stage ||
             current.pr !== expected.pr || current.mergeSha !== expected.mergeSha || current.wake || current.claim)
