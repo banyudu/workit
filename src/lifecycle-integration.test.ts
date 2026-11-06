@@ -266,7 +266,7 @@ test("real adapter refusals survive restart, appear in status and heartbeat logs
     });
     writeFileSync(file, JSON.stringify({ session: { id: job.sessionID, cwd: directory, status: "idle" },
       refusal: { operation, code, message }, attempts: [], wakes: [] }));
-    await lifecycleCLI(["tick", "--job", job.id]);
+    await lifecycleCLI(["tick", "--job", job.id], async () => {});
     assert.deepEqual(JSON.parse(logs.at(-1)!), [{ id: job.id, result: "workflow-refused", detail: `${code}: ${message}` }]);
     await lifecycleCLI(["job", "status", job.id]);
     assert.equal(JSON.parse(logs.at(-1)!).detail, `${code}: ${message}`);
