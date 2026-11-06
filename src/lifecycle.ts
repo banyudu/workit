@@ -8,6 +8,7 @@ import type { IssueDetails } from "./types.js";
 import { selectDeploymentTarget, type DeploymentTarget } from "./deployment-target.js";
 import { assertVerificationSource, investigation, verificationSource } from "./verification-source.js";
 import { coordinateVerification, refreshHeldFacts, verifierBinding } from "./closeout.js";
+import { heldRefreshBudget, scheduleTick } from "./lifecycle-schedule.js";
 
 export const stages = ["investigating", "implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
@@ -790,14 +791,17 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
   const owner = options.process ?? processIdentity();
   const alive = options.alive ?? processIsAlive;
   const results: Array<{ id: string; result: string; detail?: string }> = [];
-  for (let candidate of store.list()) {
+  const refreshHeld = heldRefreshBudget();
+  for (let candidate of scheduleTick(store.list(), now)) {
     if (options.jobID && candidate.id !== options.jobID) continue;
     // Project pause/cancel/completion too; it must survive an app outage.
     const pendingCloseout = candidate.stage === "verifying" && candidate.closeout && candidate.verification &&
       reportComplete(candidate, candidate.verification) &&
       (!candidate.nextWakeAt || Date.parse(candidate.nextWakeAt) <= now.getTime());
     if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you" || pendingCloseout) {
-      if (["paused", "needs-you"].includes(candidate.stage)) candidate = await refreshHeldFacts(store, adapter, candidate, now);
+      if (["paused", "needs-you"].includes(candidate.stage) && refreshHeld(candidate, now)) {
+        candidate = await refreshHeldFacts(store, adapter, candidate, now);
+      }
       candidate = await syncVerifiedIssue(store, adapter, candidate);
       if (candidate.projectedRevision !== candidate.revision) {
         try { await adapter.project(candidate); store.acknowledgeProjection(candidate); } catch { /* durable job remains authoritative */ }

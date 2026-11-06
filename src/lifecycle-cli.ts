@@ -50,7 +50,7 @@ workit job reconcile ID --delivery delivered|not-delivered --detail TEXT
 workit job refresh-deployment ID
 workit job verify ID --report PATH
 workit job closeout ID
-workit heartbeat install [--interval 600] | uninstall | status
+workit heartbeat install [--interval 60] | uninstall | status
 Stages: ${stages.join(", ")}
 Managed launches: workit --managed [--verification local|deployed] ISSUE (Banyan only)
 State: $WORKIT_STATE_DIR/lifecycle.sqlite; python3 + sqlite3 required.
@@ -79,8 +79,8 @@ Inspect and correct acceptance before verifying historical reports; never probe 
   const adapter = new BanyanLifecycleAdapter();
   if (args[0] === "tick") {
     const values = options(args.slice(1)); only(values, ["--job"]);
-    const launches = values["--job"] ? [] : await advanceQueues(store, adapter, new CommandQueueLauncher(dirname(store.path)));
     const jobs = await tick(store, adapter, { jobID: values["--job"] });
+    const launches = values["--job"] ? [] : await advanceQueues(store, adapter, new CommandQueueLauncher(dirname(store.path)));
     const groups = values["--job"] ? [] : await advanceGroups(store, new BanyanGroupAdapter());
     console.log(JSON.stringify(launches.length || groups.length ? { queues: launches, jobs, groups } : jobs));
     return;
@@ -239,6 +239,7 @@ export function managedInstructions(job: Job): string[] {
     ...verificationInstructions(job),
     "Workit owns continuation; do not create a native goal or scheduler. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
     "After opening or updating the PR, checkpoint waiting-ci and end the turn. Workit preflights the current head and wakes you only for a concrete check, review or score action.",
+    "Confirm the saved checkpoint with job status. Report that this turn has ended and Workit owns the next check; nextWakeAt is the earliest check time, not a guaranteed wake. Do not describe a handed-off wait as active monitoring.",
     `Read job status and checkpoint ${job.id} before ending a turn. Use waiting-ci/waiting-deploy for external waits and needs-you for human gates.`,
     `Submit independent partial progress or complete evidence with \`workit job verify ${job.id} --report PATH\`. Workit automatically synchronizes proven Linear AC checkboxes; completion requires current independent evidence.`,
     `Retry interrupted tracker effects with \`workit job closeout ${job.id}\`; inspect conflicts before retrying. Linear updates have a race with concurrent edits. Owner holds and real human acceptance remain in force.`,

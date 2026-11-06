@@ -204,7 +204,7 @@ original control session and owner hold.
 Build/install the compiled CLI, then explicitly install its per-user LaunchAgent:
 
 ```bash
-workit heartbeat install --interval 600
+workit heartbeat install --interval 60
 workit heartbeat status
 workit tick
 workit heartbeat uninstall
@@ -221,7 +221,16 @@ The Mac must be awake and Banyan running for session control. Timers coalesce
 after sleep; they cannot run while asleep. Checkpoints survive app/process
 restarts. Use an always-on host for unattended operation.
 
-Ticks cheaply inspect due jobs, skip busy/parked/frozen/human-blocked sessions,
+The default heartbeat runs every 60 seconds; individual jobs retain their own
+check interval (normally five minutes). Existing installations keep their saved
+interval until `workit heartbeat install` is run again. `nextWakeAt` is the
+earliest time a job can be checked, not a promise that an agent will wake then.
+
+Ticks inspect due active jobs first, oldest due time first, before queue launches
+and held-job maintenance. Paused/human-blocked PR fact refreshes run oldest
+observation first, with at most ten refreshes per tick and no new refresh after
+30 seconds of maintenance (an in-flight probe may finish after that budget).
+Unrefreshed facts retain their original observation time. Ticks skip busy/parked/frozen/human-blocked sessions,
 and continue the same conversation only when actionable. PR checks and review
 scores are read before the wake decision: unchanged/pending CI, missing evidence
 and stale scores consume no agent turn. Readiness wakes an agent to assess
@@ -681,7 +690,7 @@ workit queue cancel QUEUE_ID --expected-revision CURRENT_REVISION
 
 Creation always saves a **paused** plan and prints its preview. Use the current
 revision from status for start/pause/cancel. A global `workit tick` advances active
-queues before ordinary jobs; `tick --job ID` does not start other issues. The host
+queues after existing jobs; `tick --job ID` does not start other issues. The host
 must remain awake with the existing heartbeat, Banyan, CLI runtime, repository
 paths and authentication available. This does not install another scheduler.
 
