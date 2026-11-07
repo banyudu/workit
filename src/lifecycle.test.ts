@@ -29,11 +29,12 @@ function fixture(t: { after: (fn: () => void) => void }, config = {}) {
 class FakeAdapter implements LifecycleAdapter {
   current: Session; wakes: string[] = []; projections = 0; deploy?: Deployment;
   snapshot: PRSnapshot = { fingerprint: "pending", ready: false, merged: false };
-  contains = true; failSession = false; loseResponse = false;
+  contains = true; failSession = false; missingSession = false; loseResponse = false;
   reviews = 0; failReview = false;
   prompts: string[] = []; deploymentCalls = 0;
+  notices: string[] = []; noticeAttempts = 0; failNotice = false;
   constructor(job: Job) { this.current = { id: job.sessionID, status: "idle" }; }
-  async session() { if (this.failSession) throw new Error("offline"); return this.current; }
+  async session() { if (this.failSession) throw new Error("offline"); return this.missingSession ? undefined : this.current; }
   async project(job: Job) {
     this.projections++;
     this.current.workflow = { owner: "workit", jobID: job.id, revision: job.revision,
@@ -46,11 +47,57 @@ class FakeAdapter implements LifecycleAdapter {
     if (this.loseResponse) throw new Error("lost response");
   }
   async pr() { return this.snapshot; }
+  async notifyAttention(job: Job) {
+    this.noticeAttempts++;
+    if (this.failNotice) throw new Error("desktop offline");
+    this.notices.push(job.attentionNotice!.id);
+  }
   async deployment() { this.deploymentCalls++; return this.deploy; }
   async containsMerge() { return this.contains; }
   async markInReview() { this.reviews++; if (this.failReview) throw new Error("tracker offline"); }
   async markDone() { return true; }
 }
+
+test("a transient missing original session retries and resumes without a sticky human hold", async t => {
+  const { store, job, adapter, run } = fixture(t);
+  checkpoint(store, job.id, { stage: "waiting-ci", detail: "Waiting for CI", pr: "https://github.com/example/project/pull/9" }, now);
+  adapter.missingSession = true;
+  const first = await run();
+  assert.equal(first[0].result, "retry");
+  assert.equal(store.get(job.id).stage, "waiting-ci");
+  assert.equal(store.get(job.id).errors, 1);
+  assert.ok(store.get(job.id).nextWakeAt);
+  assert.equal(adapter.wakes.length, 0);
+  adapter.missingSession = false;
+  adapter.snapshot = { fingerprint: "ready", ready: true, merged: false, mergeState: "CLEAN" };
+  await run(new Date(store.get(job.id).nextWakeAt!));
+  assert.equal(adapter.wakes.length, 1);
+  assert.equal(store.get(job.id).errors, 0);
+  assert.equal(store.get(job.id).holdDetail, undefined);
+});
+
+test("persistent missing sessions alert once independently of Banyan; failed notices survive restart", async t => {
+  const { store, job, adapter, run, directory } = fixture(t, { maxErrors: 2 });
+  adapter.missingSession = true;
+  await run();
+  assert.equal(adapter.noticeAttempts, 0);
+  adapter.failNotice = true;
+  await run(new Date(store.get(job.id).nextWakeAt!));
+  const held = store.get(job.id);
+  assert.equal(held.stage, "needs-you");
+  assert.equal(held.nextWakeAt, undefined);
+  assert.equal(adapter.noticeAttempts, 1);
+  assert.ok(held.attentionNotice?.error);
+  const restarted = new JobStore(directory);
+  adapter.failNotice = false;
+  await tick(restarted, adapter, { now: new Date(Date.parse(held.attentionNotice!.lastAttemptAt!) + 60_000) });
+  assert.equal(adapter.notices.length, 1);
+  assert.ok(restarted.get(job.id).attentionNotice?.deliveredAt);
+  await tick(restarted, adapter, { now: new Date(Date.parse(held.attentionNotice!.lastAttemptAt!) + 120_000) });
+  assert.equal(adapter.notices.length, 1);
+  assert.equal(restarted.get(job.id).stage, "needs-you");
+  assert.equal(adapter.wakes.length, 0);
+});
 
 function queueCoordinatorNote(store: JobStore, job: Job, id = "coordinator-follow-up") {
   store.update(job.id, current => {

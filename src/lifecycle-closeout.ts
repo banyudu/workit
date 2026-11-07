@@ -2,6 +2,7 @@ import { assertVerificationSource, assertVerificationDeployment } from "./verifi
 import { assertTracker } from "./tracker-policy.js";
 import { randomUUID } from "node:crypto";
 import type { TrackerIssue } from "./issue.js";
+import { verifierBinding } from "./closeout.js";
 import { DEFAULT_INTERVAL_SECONDS, JobStore, checklistChanges, issueFinished, processIdentity, processIsAlive, provenChecklist, reportComplete,
   synchronizeChecklist, validateProgressReport, validateReport,
   type Job, type LifecycleAdapter } from "./lifecycle.js";
@@ -116,6 +117,10 @@ export async function closeoutJob(store: JobStore, adapter: CloseoutAdapter, id:
         if (synchronizeChecklist(issue.body, changes) !== issue.body) throw new Error("Checklist progress changed; retry job closeout");
         save(current => {
           current.detail = `AC progress synchronized (${changes.filter(item => item.checked).length} pass, ${changes.filter(item => !item.checked).length} fail); complete independent passing evidence is still required`;
+          // Successful manual submission fulfils this binding's report request,
+          // including a partial/blocked result. It grants no completion or hold
+          // release; a later AC/source/deployment binding requests a new report.
+          current.manualVerificationHandoff = { binding: verifierBinding(current), deliveredAt: new Date().toISOString() };
           current.nextWakeAt = new Date(Date.now() + (current.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString();
           delete current.claim;
         });

@@ -118,7 +118,8 @@ function reviewProbeSnapshot(value: unknown, headSha?: string): Pick<PRSnapshot,
 }
 
 export class BanyanLifecycleAdapter implements LifecycleAdapter {
-  constructor(readonly banyanctl = process.env.WORKIT_BANYANCTL ?? "banyanctl") {}
+  constructor(readonly banyanctl = process.env.WORKIT_BANYANCTL ?? "banyanctl",
+    readonly notifyAttention?: (job: Job) => Promise<void>) {}
 
   async requireWorkflowSupport(cwd: string): Promise<void> {
     const value = await commandJSON([this.banyanctl, "session", "list"], cwd) as { workflowProtocol?: number };
@@ -126,8 +127,13 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
   }
 
   async session(job: Job): Promise<Session | undefined> {
-    const value = await commandJSON([this.banyanctl, "session", "list", "--id", job.sessionID], job.repoRoot) as { sessions?: Session[] };
-    const session = value.sessions?.find(item => item.id === job.sessionID);
+    const value = await commandJSON([this.banyanctl, "session", "list", "--id", job.sessionID], job.repoRoot) as { workflowProtocol?: number; sessions?: Session[] } | null;
+    if (value?.workflowProtocol !== 1 || !Array.isArray(value.sessions) || value.sessions.length > 1 ||
+        value.sessions.some(item => !item || item.id !== job.sessionID || typeof item.status !== "string" ||
+          !item.status.trim() || typeof item.cwd !== "string" || !item.cwd)) {
+      throw new Error("Invalid Banyan session inventory; original session availability is unknown");
+    }
+    const session = value.sessions[0];
     if (session?.cwd && session.cwd !== job.worktree) throw new Error("Banyan session worktree does not match its job");
     return session;
   }

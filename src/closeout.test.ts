@@ -517,9 +517,19 @@ test("completed outcomes survive a missing original worker without recreating it
       wake: adapter.wake.bind(adapter), pr: adapter.pr.bind(adapter), deployment: adapter.deployment.bind(adapter), containsMerge: adapter.containsMerge.bind(adapter),
       currentIssue: adapter.currentIssue.bind(adapter), markInReview: adapter.markInReview.bind(adapter), markDone: adapter.markDone.bind(adapter) };
     await tick(store, missing, { now: new Date(at.getTime() + 120_000), process: "fixture:owner", alive: () => true });
-    assert.equal(store.get(job.id).stage, fail ? "needs-you" : "verified");
+    assert.equal(store.get(job.id).stage, fail ? "fixing" : "verified");
     assert.deepEqual(store.get(job.id).verification, value);
     assert.equal(adapter.wakes.length, 0); assert.equal(adapter.launches.length, 1);
+    if (fail) {
+      // Retained failed evidence survives the same bounded original-session
+      // lookup recovery as ordinary work; exhaustion still requires inspection.
+      for (let attempt = 1; attempt < (job.config.maxErrors ?? 5); attempt++) {
+        await tick(store, missing, { now: new Date(store.get(job.id).nextWakeAt!), process: "fixture:owner", alive: () => true });
+      }
+      assert.equal(store.get(job.id).stage, "needs-you");
+      assert.deepEqual(store.get(job.id).verification, value);
+      assert.equal(adapter.wakes.length, 0); assert.equal(adapter.launches.length, 1);
+    }
   }
   const { store, job, adapter, run } = fixture(t); await run();
   const verifier = store.get(job.id).verifier!; handoff(verifier, report(job, verifier.id));

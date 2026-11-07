@@ -9,6 +9,7 @@ import { selectDeploymentTarget, type DeploymentTarget } from "./deployment-targ
 import { assertVerificationSource, investigation, verificationSource } from "./verification-source.js";
 import { coordinateVerification, refreshHeldFacts, verifierBinding } from "./closeout.js";
 import { heldRefreshBudget, scheduleTick } from "./lifecycle-schedule.js";
+import { deliverJobAttention } from "./job-attention.js";
 
 export const stages = ["investigating", "implementing", "preverifying", "reviewing", "waiting-ci", "waiting-deploy",
   "verifying", "fixing", "needs-you", "paused", "cancelled", "verified"] as const;
@@ -86,6 +87,9 @@ export interface Job {
   acceptanceChangedAt?: string;
   acceptanceHistory?: Array<{ from: string; to: string; reason: string; at: string; revision: number; oldAcHash: string; acHash: string; fromDelivery?: string; toDelivery?: string; fromTarget?: string; toTarget?: string; priorPR?: string; priorSourceSha?: string; fromHistoricalSources?: string[]; toHistoricalSources?: string[] }>;
   holdDetail?: string;
+  /** One durable desktop notice per automatic transition to needs-you. This is
+   * delivery acknowledgement, not proof that a person has read the alert. */
+  attentionNotice?: { id: string; createdAt: string; lastAttemptAt?: string; deliveredAt?: string; error?: string };
   blocker?: Blocker;
   facts?: { pr?: PRSnapshot; observedAt: string; nextCheckAt: string; error?: string };
   verifier?: VerifierRun; verifierHistory?: VerifierRun[]; verifierAttempts?: number;
@@ -674,6 +678,7 @@ export interface LifecycleAdapter {
   session(job: Job): Promise<Session | undefined>;
   project(job: Job): Promise<void>;
   wake(job: Job, wakeID: string, text: string): Promise<void>;
+  notifyAttention?(job: Job): Promise<void>;
   pr(job: Job): Promise<PRSnapshot>;
   observedSource?(job: Job): Promise<string>;
   deployment(job: Job): Promise<Deployment | undefined>;
@@ -799,6 +804,8 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       reportComplete(candidate, candidate.verification) &&
       (!candidate.nextWakeAt || Date.parse(candidate.nextWakeAt) <= now.getTime());
     if (terminalStage(candidate.stage) || candidate.stage === "paused" || candidate.stage === "needs-you" || pendingCloseout) {
+      await deliverJobAttention(store, adapter, candidate, now);
+      candidate = store.get(candidate.id);
       if (["paused", "needs-you"].includes(candidate.stage) && refreshHeld(candidate, now)) {
         candidate = await refreshHeldFacts(store, adapter, candidate, now);
       }
@@ -839,12 +846,10 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         if (outcome) { results.push({ id: job.id, result: outcome }); continue; }
       }
       if (!session) {
-        save(current => {
-          current.stage = "needs-you"; current.holdDetail = "Original conversation is missing; restore it before continuing";
-          current.detail = "Saved progress and any completed verifier report are retained; inspect the original session identity before recovery";
-          delete current.nextWakeAt;
-        });
-        results.push({ id: job.id, result: "original-session-missing" }); continue;
+        // A transient empty inventory must not become an unrecoverable human
+        // hold. Use the existing bounded tool retry budget; never recreate or
+        // send to another session while this exact original is unavailable.
+        throw new Error("Original conversation is missing; recheck its identity before recovery");
       }
       if (!available(session)) {
         save(current => { current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString(); });
@@ -1004,8 +1009,14 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
     } finally {
       try {
         const latest = store.get(job.id);
-        if (latest.claim?.token === token) save(current => { delete current.claim; });
+        if (latest.claim?.token === token) save(current => {
+          delete current.claim;
+          if (current.stage === "needs-you" && candidate.stage !== "needs-you")
+            current.attentionNotice = { id: randomUUID(), createdAt: now.toISOString() };
+        });
         else job = latest;
+        await deliverJobAttention(store, adapter, job, now);
+        job = store.get(job.id);
         await adapter.project(job); store.acknowledgeProjection(job);
       } catch { /* next tick reconciles projection */ }
     }

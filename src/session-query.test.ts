@@ -29,3 +29,23 @@ console.log(${JSON.stringify(JSON.stringify({ workflowProtocol: 1, sessions: [se
     ["session", "list", "--id", job.sessionID],
   ]);
 });
+
+test("malformed session inventories are unavailable evidence, not a missing original session", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "workit-session-unavailable-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const job = createJob({ issue: { backend: "github", identifier: "1", title: "Fixture", labels: [],
+    url: "https://github.com/example/project/issues/1",
+    body: "## Acceptance Criteria\n- [ ] `[test:lookup]` Lookup passes.\n- [ ] `[code:recovery]` Recovery works." },
+    repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture", config: { verification: "local" } });
+  const cli = join(directory, "banyanctl");
+  const adapter = new BanyanLifecycleAdapter(cli);
+  for (const response of [{}, { workflowProtocol: 1 }, { workflowProtocol: 1, sessions: null },
+    { workflowProtocol: 2, sessions: [] }, { workflowProtocol: 1, sessions: [{ id: "other" }] },
+    { workflowProtocol: 1, sessions: [{ id: job.sessionID }] },
+    { workflowProtocol: 1, sessions: [{ id: job.sessionID }, { id: job.sessionID }] }]) {
+    writeFileSync(cli, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify(response))});\n`, { mode: 0o700 });
+    await assert.rejects(adapter.session(job), /Invalid Banyan session inventory/);
+  }
+  writeFileSync(cli, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ workflowProtocol: 1, sessions: [] }))});\n`, { mode: 0o700 });
+  assert.equal(await adapter.session(job), undefined);
+});

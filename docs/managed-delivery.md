@@ -414,6 +414,10 @@ full-description helpers or an invented compare-and-swap parameter.
 The job stores the latest accepted progress/completion report and each mutation
 intent before sending it. A subsequent report can update more ACs without
 repeating already-applied results.
+An accepted manual partial report also acknowledges the current manual-verifier
+handoff, including when it reports a blocked AC. It does not complete the job or
+release a hold. The same source/AC/deployment binding does not request that report
+again; a later binding still requires fresh independent evidence.
 After a failure or interruption, inspect status and retry only that job:
 
 ```bash
@@ -773,10 +777,25 @@ place.
 Already-running verifier outcomes can be consumed when the original conversation
 is missing or busy. A missing worker is never recreated automatically. Passing
 complete evidence can establish completion; unfinished work retains its evidence
-and becomes `needs-you` until the original session is recovered. Explicit job or
+and an empty original-session inventory uses the existing bounded tool-error
+backoff before becoming `needs-you`. A malformed inventory is unavailable evidence,
+not proof that the session was deleted. Recovery before that bound reuses the exact
+original session and its wake receipt. Explicit job or
 Banyan workflow holds take precedence. Every worker handoff still passes the
 ordinary liveness, delivery-receipt, wake-budget and queue pause/deadline/budget
 checks.
+
+Automatic transitions to `needs-you` queue a durable desktop notice. The macOS
+heartbeat delivers it through `osascript`, independently of the affected Banyan
+session, using only the issue/job identifiers. Failed delivery retries at the
+job's existing interval, including after restart; recorded successful delivery is
+not sent again for that incident. It acknowledges OS acceptance, not that a person read it.
+The held job remains visible in `job attention` and requires inspected explicit
+recovery. Existing held history is not replayed as new desktop notifications.
+An unavailable desktop notifier retains pending delivery in `attentionNotice`;
+other hosts still need their own notification integration. Review this behavior
+when the session inventory protocol, notification transport or hold ownership
+changes.
 
 ## Coordinating from one main session
 

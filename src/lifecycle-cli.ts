@@ -11,6 +11,7 @@ import { closeoutJob } from "./lifecycle-closeout.js";
 import { assertVerificationSource, investigation } from "./verification-source.js";
 import { overview } from "./overview.js";
 import { heartbeatCLI } from "./heartbeat.js";
+import { notifyDesktopAttention } from "./job-attention.js";
 
 function options(args: string[]): Record<string, string> {
   const values: Record<string, string> = {};
@@ -31,7 +32,7 @@ async function project(store: JobStore, adapter: BanyanLifecycleAdapter, job: Jo
   } catch { /* durable change retained */ }
   console.error("workit: checkpoint saved; Banyan projection will be retried by the heartbeat"); return "pending";
 }
-export async function lifecycleCLI(args: string[]): Promise<void> {
+export async function lifecycleCLI(args: string[], notifyAttention = notifyDesktopAttention): Promise<void> {
   if (args[0] === "heartbeat") { heartbeatCLI(args.slice(1)); return; }
   if (args.includes("--help") || args.includes("-h")) {
     console.log(`workit tick [--job ID]
@@ -76,7 +77,7 @@ Inspect and correct acceptance before verifying historical reports; never probe 
     return;
   }
   const store = new JobStore();
-  const adapter = new BanyanLifecycleAdapter();
+  const adapter = new BanyanLifecycleAdapter(undefined, notifyAttention);
   if (args[0] === "tick") {
     const values = options(args.slice(1)); only(values, ["--job"]);
     const jobs = await tick(store, adapter, { jobID: values["--job"] });
