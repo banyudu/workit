@@ -414,6 +414,10 @@ full-description helpers or an invented compare-and-swap parameter.
 The job stores the latest accepted progress/completion report and each mutation
 intent before sending it. A subsequent report can update more ACs without
 repeating already-applied results.
+An accepted manual partial report also acknowledges the current manual-verifier
+handoff, including when it reports a blocked AC. It does not complete the job or
+release a hold. The same source/AC/deployment binding does not request that report
+again; a later binding still requires fresh independent evidence.
 After a failure or interruption, inspect status and retry only that job:
 
 ```bash

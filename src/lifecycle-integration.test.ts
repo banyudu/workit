@@ -8,6 +8,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { JobStore, acceptance, checkpoint, createJob, provenChecklist, tick, type VerificationReport } from "./lifecycle.js";
 import { BanyanLifecycleAdapter, githubRepository } from "./lifecycle-adapter.js";
 import { lifecycleCLI, managedInstructions } from "./lifecycle-cli.js";
+import { verifierBinding } from "./closeout.js";
 
 const fake = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
@@ -377,6 +378,45 @@ async function linearFixture(t: import("node:test").TestContext, human = false) 
   const retry = () => lifecycleCLI(["job", "closeout", job.id]);
   return { directory, linear, effects, store, job, report, reportPath, verify, retry, github, githubFile };
 }
+
+test("accepted manual partial evidence acknowledges the refreshed binding without completing or repeating its wake", async t => {
+  const f = await linearFixture(t);
+  const configPath = join(f.directory, ".workit.yml");
+  writeFileSync(configPath, readFileSync(configPath, "utf8") + "lifecycle:\n  verifier:\n    enabled: false\n");
+  f.store.update(f.job.id, current => {
+    current.config.verification = "deployed";
+    const { ready: _ready, ...deployment } = f.github.deployment;
+    current.deployment = deployment;
+    current.manualVerificationHandoff = { binding: "previous-deployment", deliveredAt: new Date().toISOString() };
+  });
+  f.report.criteria = [{ label: f.job.acLabels[0], status: "blocked", evidence: [
+    { kind: "query", reference: "artifact://prerequisite-status", observed: "Prerequisite repairs are still in progress" },
+  ] }];
+  const hash = f.report.acHash;
+  f.report.acHash = "stale-binding";
+  await assert.rejects(f.verify(), /binding is stale or mismatched/);
+  assert.equal(f.store.get(f.job.id).manualVerificationHandoff?.binding, "previous-deployment");
+  f.report.acHash = hash;
+  await f.verify();
+  const current = f.store.get(f.job.id);
+  assert.equal(current.stage, "verifying");
+  assert.equal(current.manualVerificationHandoff?.binding, verifierBinding(current));
+  assert.ok(current.manualVerificationHandoff?.deliveredAt);
+  assert.equal(f.effects.writes.length, 0, "blocked evidence never grants tracker completion");
+  const adapter = new BanyanLifecycleAdapter();
+  await tick(f.store, adapter, { jobID: f.job.id, now: new Date(Date.now() + 120_000) });
+  assert.equal(JSON.parse(readFileSync(f.githubFile, "utf8")).wakes.length, 0);
+  f.github.deployment.version = "next-serving-version";
+  writeFileSync(f.githubFile, JSON.stringify(f.github));
+  f.store.update(f.job.id, value => {
+    value.deployment!.version = f.github.deployment.version;
+    value.nextWakeAt = new Date(Date.now() - 1000).toISOString();
+  });
+  await tick(f.store, adapter, { jobID: f.job.id, now: new Date(Date.now() + 180_000) });
+  assert.equal(JSON.parse(readFileSync(f.githubFile, "utf8")).wakes.length, 1,
+    "a later source/version binding still requests fresh independent evidence");
+  assert.equal(f.store.get(f.job.id).stage, "verifying");
+});
 
 test("valid independent acceptance automatically checks Linear ACs and confirms team completion before verified", async t => {
   const f = await linearFixture(t);
