@@ -12,6 +12,7 @@ import { assertVerificationSource, investigation } from "./verification-source.j
 import { overview } from "./overview.js";
 import { heartbeatCLI } from "./heartbeat.js";
 import { notifyDesktopAttention } from "./job-attention.js";
+import { WAIT_STILL_WAITING_EXIT, waitForJob } from "./lifecycle-wait.js";
 
 function options(args: string[]): Record<string, string> {
   const values: Record<string, string> = {};
@@ -38,6 +39,7 @@ export async function lifecycleCLI(args: string[], notifyAttention = notifyDeskt
     console.log(`workit tick [--job ID]
 workit job list
 workit job status ID
+workit job wait ID [--timeout SECONDS] [--interval SECONDS]
 workit job overview [--format json] [--limit 1..1000]
 workit job attention [--format json|text]
 workit job acceptance ID
@@ -55,6 +57,8 @@ workit heartbeat install [--interval 60] | uninstall | status
 Stages: ${stages.join(", ")}
 Managed launches: workit --managed [--verification local|deployed] ISSUE (Banyan only)
 State: $WORKIT_STATE_DIR/lifecycle.sqlite; python3 + sqlite3 required.
+job wait blocks during waiting-ci/waiting-deploy until Workit has a concrete action (exit 0, printed) or the timeout
+passes (exit ${WAIT_STILL_WAITING_EXIT}; run it again). Defaults: --timeout 1500 --interval 60. The heartbeat skips the job meanwhile.
 The heartbeat never grants merge/deployment authority.`);
     console.log(`Verification report contract (see docs/managed-delivery.md):
 {jobID, issueURL, acHash, mergeSha (implementation) OR sourceSha (investigation), checkedAt, reviewer: {runID, independent: true},
@@ -102,6 +106,23 @@ Inspect and correct acceptance before verifying historical reports; never probe 
   }
   if (!id) throw new Error("workit job requires an action and job ID; see workit job --help");
   const values = options(rest);
+  if (action === "wait") {
+    only(values, ["--timeout", "--interval"]);
+    const seconds = (name: string) => {
+      const value = values[name];
+      if (value === undefined) return undefined;
+      if (!/^[1-9]\d*$/.test(value)) throw new Error(`${name} must be positive whole seconds`);
+      return Number(value);
+    };
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGTERM", stop); process.once("SIGINT", stop);
+    const result = await waitForJob(store, adapter, id, { timeoutSeconds: seconds("--timeout"),
+      intervalSeconds: seconds("--interval"), signal: controller.signal });
+    console.log(result.text);
+    if (result.outcome === "timeout") process.exitCode = WAIT_STILL_WAITING_EXIT;
+    return;
+  }
   let job: Job;
   let projection: "confirmed" | "pending" | undefined;
   switch (action) {
@@ -238,10 +259,9 @@ export function managedInstructions(job: Job): string[] {
     ...(job.queue ? [`Group outcome: ${job.queue.outcome ?? "see group status"}; deadline: ${job.queue.deadline ?? "see group status"}.`] : []),
     investigation(job) ? "Investigate the pinned source and independently verify the findings." : "Implement, preverify, repair review/CI, merge when authorized, and independently verify acceptance.",
     ...verificationInstructions(job),
-    "Workit owns continuation; do not create a native goal or scheduler. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
-    "After opening or updating the PR, checkpoint waiting-ci and end the turn. Workit preflights the current head and wakes you only for a concrete check, review or score action.",
-    "Confirm the saved checkpoint with job status. Report that this turn has ended and Workit owns the next check; nextWakeAt is the earliest check time, not a guaranteed wake. Do not describe a handed-off wait as active monitoring.",
-    `Read job status and checkpoint ${job.id} before ending a turn. Use waiting-ci/waiting-deploy for external waits and needs-you for human gates.`,
+    "Do not create a native goal or scheduler. Preserve human holds and deployment authorization; this launch does not authorize a deployment.",
+    `After opening or updating the PR, checkpoint waiting-ci, then run \`workit job wait ${job.id}\` and stay with it until it exits: in the background if your tool reports when a command finishes, otherwise keep polling its output. It prints the next concrete check, review, score or merge action; exit status ${WAIT_STILL_WAITING_EXIT} means still waiting, so run it again.`,
+    `Read job status and checkpoint ${job.id} before ending a turn. Wait for a deployment the same way after checkpointing waiting-deploy; use needs-you for human gates. If you end the turn without job wait, the heartbeat owns the next check; nextWakeAt is the earliest check time, not a guaranteed wake.`,
     `Submit independent partial progress or complete evidence with \`workit job verify ${job.id} --report PATH\`. Workit automatically synchronizes proven Linear AC checkboxes; completion requires current independent evidence.`,
     `Retry interrupted tracker effects with \`workit job closeout ${job.id}\`; inspect conflicts before retrying. Linear updates have a race with concurrent edits. Owner holds and real human acceptance remain in force.`,
   ];

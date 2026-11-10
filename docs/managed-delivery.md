@@ -242,6 +242,24 @@ Use one scheduler per issue. Managed guidance asks agents not to add native goal
 or schedules. Handle an already-active unrelated goal explicitly before
 onboarding that conversation. Workit does not pick additional backlog issues.
 
+### Agent-owned waits
+
+Managed agents wait for CI, review and deployment themselves:
+
+```bash
+workit job wait JOB_ID [--timeout 1500] [--interval 60]
+```
+
+It applies to `waiting-ci` and `waiting-deploy`. Each check runs the same
+preflight as the heartbeat and spends nothing until there is a concrete action.
+It then prints the same update a wake would deliver and exits 0. It also exits 0
+when the job leaves the wait (a hold, cancel or human gate). On timeout it prints
+a still-waiting summary and exits 2; run it again. While the command is alive it
+holds a lease on the job and the heartbeat reports `agent-waiting` instead of
+waking the session. A killed or expired wait releases the job back to the
+heartbeat. Nothing is typed into a terminal: an agent runs the command in the
+background when its tool reports completion, or keeps polling it.
+
 ## Tracker handoff
 
 Workit owns the Linear state handoffs rather than delegating them to the agent.

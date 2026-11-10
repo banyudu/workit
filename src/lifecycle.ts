@@ -76,6 +76,8 @@ export interface Job {
   trackerDone?: boolean;
   fingerprint?: string; errors: number; wakeups: number;
   claim?: { token: string; process: string };
+  /** An agent blocked in `job wait` owns the next check until `until`; the heartbeat leaves it alone. */
+  waiter?: { process: string; until: string };
   // Older pending wakes already charged wakeups when they were reserved.
   wake?: { id: string; reason: string; revision: number; counted?: boolean; coordinatorNoteIDs?: string[]; delivery?: "not-delivered" };
   verification?: VerificationReport;
@@ -791,6 +793,8 @@ function queueContinuationPending(store: JobStore, job: Job, now: Date): boolean
 /** A heartbeat inspects due jobs; only actionable changes spend an agent turn. */
 export async function tick(store: JobStore, adapter: LifecycleAdapter, options: {
   now?: Date; process?: string; alive?: (identity: string) => boolean; jobID?: string;
+  /** `job wait`: the agent itself is asking, so its session is busy by design and the update is returned, not injected. */
+  selfWait?: { deliver: (job: Job, wakeID: string, text: string) => Promise<void> };
 } = {}): Promise<Array<{ id: string; result: string; detail?: string }>> {
   const now = options.now ?? new Date();
   const owner = options.process ?? processIdentity();
@@ -815,7 +819,11 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
       }
       continue;
     }
-    if (candidate.nextWakeAt && Date.parse(candidate.nextWakeAt) > now.getTime()) continue;
+    if (!options.selfWait && candidate.waiter && Date.parse(candidate.waiter.until) > now.getTime() && alive(candidate.waiter.process)) {
+      results.push({ id: candidate.id, result: "agent-waiting" }); continue;
+    }
+    // A waiting agent sets its own cadence; error backoff still applies.
+    if (candidate.nextWakeAt && Date.parse(candidate.nextWakeAt) > now.getTime() && (!options.selfWait || candidate.errors > 0)) continue;
     if (candidate.claim && alive(candidate.claim.process)) continue;
     const token = randomUUID();
     let job: Job;
@@ -851,7 +859,7 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         // send to another session while this exact original is unavailable.
         throw new Error("Original conversation is missing; recheck its identity before recovery");
       }
-      if (!available(session)) {
+      if (!options.selfWait && !available(session)) {
         save(current => { current.nextWakeAt = new Date(now.getTime() + (job.config.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1000).toISOString(); });
         results.push({ id: job.id, result: "busy-or-held" }); continue;
       }
@@ -961,7 +969,8 @@ export async function tick(store: JobStore, adapter: LifecycleAdapter, options: 
         });
         results.push({ id: job.id, result: "queue-bound" }); continue;
       }
-      await adapter.wake(job, job.wake!.id, prompt(job, reason));
+      if (options.selfWait) await options.selfWait.deliver(job, job.wake!.id, prompt(job, reason));
+      else await adapter.wake(job, job.wake!.id, prompt(job, reason));
       save(current => {
         if (current.wake?.counted === false) current.wakeups++;
         settleCoordinatorNotes(current, now);
