@@ -6,12 +6,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DEFAULT_INTERVAL_SECONDS, SourceProvenanceError, acceptance, acceptanceCriteria, assertLocalAcceptance, dependencyIdentity, digest, issueFinished, provenChecklist, requiresHuman, runnableStage, sha, terminalStage, validateVerificationMode, validateProgressReport, reportComplete, validateReport,
-  type Blocker, type DeliveryKind, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
+  type Blocker, type DeliveryKind, type DeploymentSourceBinding, type LifecycleConfig, type Job, type JobStore, type LifecycleAdapter, type VerifierRun, type VerificationReport } from "./lifecycle.js";
 import type { IssueDetails } from "./types.js";
 
 export function correctAcceptance(store: JobStore, id: string, input: {
   profile: "local" | "deployed"; reason: string; expectedRevision: number; expectedAcHash: string;
-  delivery?: DeliveryKind; target?: string; observedSourceSha?: string; historicalSources?: string[] | null;
+  delivery?: DeliveryKind; target?: string; observedSourceSha?: string; historicalSources?: string[] | null; deploymentSourceBinding?: DeploymentSourceBinding;
 }, issue: IssueDetails, now = new Date(), trustedConfig?: LifecycleConfig): Job {
   if (!["local", "deployed"].includes(input.profile) || !input.reason?.trim() ||
       !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) throw new Error("Acceptance correction requires a profile, reason and expected revision");
@@ -28,7 +28,8 @@ export function correctAcceptance(store: JobStore, id: string, input: {
     const nextConfig = { ...current.config, ...(target ? { deploymentTarget: target.deploymentTarget,
       deploymentProbe: target.deploymentProbe, deploymentBinding: target.deploymentBinding,
       deploymentDependency: target.deploymentDependency } : {}), delivery, verification: input.profile,
-      ...(input.historicalSources !== undefined ? { historicalSources: input.historicalSources ?? undefined } : {}) };
+      ...(input.historicalSources !== undefined ? { historicalSources: input.historicalSources ?? undefined } : {}),
+      ...(input.deploymentSourceBinding !== undefined ? { deploymentSourceBinding: input.deploymentSourceBinding } : {}) };
     if (input.profile === "deployed" && !nextConfig.deploymentProbe?.length) throw new Error("Deployed acceptance requires a trusted deployment probe");
     if (input.profile === "local") assertLocalAcceptance(issue.body, nextConfig);
     validateVerificationMode(nextConfig, issue.body);
@@ -37,6 +38,7 @@ export function correctAcceptance(store: JobStore, id: string, input: {
       oldAcHash: current.acHash, acHash: binding.acHash, fromDelivery, toDelivery: delivery,
       fromTarget: current.config.deploymentTarget, toTarget: nextConfig.deploymentTarget,
       fromHistoricalSources: current.config.historicalSources, toHistoricalSources: nextConfig.historicalSources,
+      fromDeploymentSourceBinding: current.config.deploymentSourceBinding, toDeploymentSourceBinding: nextConfig.deploymentSourceBinding,
       priorPR: current.pr, priorSourceSha: verificationSource(current) });
     current.config = nextConfig;
     if (delivery === "investigation") {
@@ -179,6 +181,7 @@ export function verifierBinding(job: Job): string {
   const binding: unknown[] = [job.acHash, verificationSource(job), job.config.delivery, job.config.deploymentTarget, job.config.verification, job.acceptanceChangedAt, job.deployment];
   // Keep existing jobs' identities stable; only the new explicit contract adds a binding.
   if (job.config.historicalSources !== undefined) binding.push(job.config.historicalSources);
+  if (job.config.deploymentSourceBinding === "observe-existing") binding.push({ deploymentSourceBinding: "observe-existing" });
   return digest(JSON.stringify(binding));
 }
 function readArtifact(path: string): unknown {

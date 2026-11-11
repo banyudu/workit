@@ -38,13 +38,14 @@ Inspect uncertain launches before reconciliation. They never replay automaticall
       const delivery = item.delivery ?? resolved.config.lifecycle?.delivery ?? "implementation";
       const verification = item.verification ?? resolved.config.lifecycle?.verification ?? "deployed";
       const deploymentTarget = item.deploymentTarget ?? resolved.config.lifecycle?.deploymentTarget;
+      const deploymentSourceBinding = item.deploymentSourceBinding ?? resolved.config.lifecycle?.deploymentSourceBinding ?? "contains-source";
       // Validate acceptance and trusted target configuration without creating a
       // worktree or claiming the issue. A real investigation pin is read at launch.
       createJob({ issue, repoRoot: repo, worktree: repo, githubRepo: githubRepository(remote), agent: "preview",
         observedSourceSha: delivery === "investigation" ? "0".repeat(40) : undefined,
-        config: { ...resolved.config.lifecycle, delivery, verification, deploymentTarget } });
+        config: { ...resolved.config.lifecycle, delivery, verification, deploymentTarget, deploymentSourceBinding } });
       const agent = item.agent ? chooseAgent(resolved.config, item.agent, undefined, resolved.aliasIndex).name : undefined;
-      return { repo, issue, delivery, verification, deploymentTarget, agent };
+      return { repo, issue, delivery, verification, deploymentTarget, deploymentSourceBinding, agent };
     }, [process.execPath, ...process.execArgv, resolve(process.argv[1])]);
     if (queue.coordinator) await new BanyanGroupAdapter().requireOwner(queue);
     console.log(JSON.stringify(queueStatus(queues.create(queue), jobs), null, 2)); return;

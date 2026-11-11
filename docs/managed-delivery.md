@@ -892,3 +892,60 @@ that binding lets the main session own a later group; it does not close children
 or reactivate cancelled work. The Mac must remain awake with
 Banyan, authentication and the existing heartbeat available. This adds neither
 a scheduler nor a replacement sidebar.
+
+### Read-only observations of an existing deployment
+
+An audit may need to observe the service that is running, including an older
+release, without installing the audit checkout. Explicitly select:
+
+```sh
+workit --managed --delivery investigation --verification deployed --source-binding observe-existing TASK-123
+```
+
+The default `contains-source` contract is unchanged: deployed verification
+requires the running source to contain the merged implementation or pinned
+investigation source. `observe-existing` is valid only for deployed
+investigations, never for implementation or historical/local acceptance.
+
+The observer's clean checkout remains pinned by `observedSourceSha` and the
+report's `sourceSha`. The report and each required runtime observation separately
+bind the actual `deployment.environment`, `target`, `sourceSha` and `version`.
+A trusted probe is still executed and its binding is re-read before accepting
+evidence. Only the ancestry relationship between those two sources is omitted.
+This mode proves neither installation of the audit source nor delivery of a fix.
+
+Use evidence kind `observation` for actual serving-bound read-only probes.
+A genuine serving-bound `journey` is also accepted; generic code/query evidence,
+an unbound observation, or a ready probe alone cannot complete a deployed AC.
+Current AC hashes, independent reviewer, source cleanliness, human confirmation,
+complete/partial reports, holds and tracker readback keep their existing gates.
+Do not select this mode to evade an AC that requires a particular fix to be
+installed: the independent evidence must still prove that requirement.
+
+For an existing job, inspect `workit job acceptance JOB_ID`, then use the
+supported revision/AC-bound correction:
+
+```sh
+workit job acceptance JOB_ID --source-binding observe-existing --reason "Read-only inventory of the actual serving release; no audit installation required" --expected-revision N --expected-ac-hash HASH
+```
+
+Correction audits old/new bindings and invalidates prior deployment and verifier
+evidence. It does not repin the checkout to the service version, release a hold,
+resume a worker or complete an issue. New independent evidence must postdate the
+correction. Select `contains-source` explicitly to return to normal ancestry
+verification before changing delivery/profile.
+
+Queue manifests can set `items[].deploymentSourceBinding`; creation snapshots
+the setting, launch passes it explicitly, and atomic attachment rejects drift.
+Old queue entries retain `contains-source`. Verifier bindings include only the
+explicit new observation mode, preserving existing default verifier identities.
+
+Probe processes receive `WORKIT_DEPLOYMENT_SOURCE_BINDING` alongside truthful
+`WORKIT_SOURCE_SHA` and `WORKIT_MERGE_SHA`. A trusted probe that independently
+enforces ancestry must explicitly support the observation contract; unknown
+settings must never silently relax its own checks. This does not prove executable
+provenance for an absolute probe or grant deployment/credential authority.
+
+Recheck this distinction when investigation source semantics, trusted probes,
+report bindings, correction or queue attachment change. Validation uses isolated
+Git/CLI/SQLite fixtures; installing a new build never migrates real jobs.

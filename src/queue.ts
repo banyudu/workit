@@ -15,9 +15,9 @@ export interface QueueManifest {
   title: string; outcome: string; deadline: string;
   maxConcurrent: number; maxStarts: number; maxContinuations: number;
   items: Array<{ key: string; repo: string; issue: string; provider?: "github" | "linear"; dependsOn?: string[];
-    agent?: string; delivery?: "implementation" | "investigation"; verification?: "local" | "deployed"; deploymentTarget?: string }>;
+    agent?: string; delivery?: "implementation" | "investigation"; verification?: "local" | "deployed"; deploymentTarget?: string; deploymentSourceBinding?: QueueItem["deploymentSourceBinding"] }>;
 }
-type ResolvedItem = { repo: string; issue: IssueDetails; delivery: QueueItem["delivery"]; verification: QueueItem["verification"]; deploymentTarget?: string; agent?: string };
+type ResolvedItem = { repo: string; issue: IssueDetails; delivery: QueueItem["delivery"]; verification: QueueItem["verification"]; deploymentTarget?: string; deploymentSourceBinding?: QueueItem["deploymentSourceBinding"]; agent?: string };
 const text = (value: unknown, max = 2000): value is string => typeof value === "string" && !!value.trim() && value.length <= max && !value.includes("\0");
 
 export function assertQueueIssue(issue: TrackerIssue): void {
@@ -67,7 +67,7 @@ export async function prepareQueue(value: unknown, resolveItem: (item: QueueMani
     items.push({ key: item.key, repo: resolved.repo, issue: resolved.issue.identifier, provider: resolved.issue.backend,
       issueURL: resolved.issue.url, acHash: acceptance(resolved.issue.body).acHash, jobID,
       dependsOn: item.dependsOn ?? [], agent: resolved.agent, delivery: resolved.delivery, verification: resolved.verification,
-      deploymentTarget: resolved.deploymentTarget, state: "pending" });
+      deploymentTarget: resolved.deploymentTarget, deploymentSourceBinding: resolved.deploymentSourceBinding ?? "contains-source", state: "pending" });
   }
   return { schema: 1, id: "queue-" + randomUUID(), revision: 0, title: m.title.trim(), outcome: m.outcome.trim(),
     state: "paused", instructions: m.instructions, coordinator: m.coordinator ? { sessionID: m.coordinator.sessionID } : undefined, createdAt: now.toISOString(), deadline: new Date(m.deadline).toISOString(), maxConcurrent: m.maxConcurrent,
@@ -84,6 +84,7 @@ export class CommandQueueLauncher implements QueueLauncher {
     if (queue.coordinator) args.push("--no-parent-fallback");
     if (item.agent) args.push("--agent", item.agent);
     if (item.deploymentTarget) args.push("--deployment-target", item.deploymentTarget);
+    args.push("--source-binding", item.deploymentSourceBinding ?? "contains-source");
     args.push(item.issue);
     try {
       await promisify(execFile)(queue.command[0], args, { cwd: item.repo, timeout: 120_000, maxBuffer: 1024 * 1024,

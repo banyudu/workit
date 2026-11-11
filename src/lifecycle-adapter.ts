@@ -8,7 +8,7 @@ import { agentDefinitionsByTag, resolveConfig } from "./config.js";
 import { chooseAgent } from "./agents.js";
 import { launchIndependentVerifier } from "./launch.js";
 import { originRemote } from "./git.js";
-import { WorkflowRefusedError, SourceProvenanceError, digest, validateReport, sanitizedDetail, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRCheck, type PRReviewScore, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun } from "./lifecycle.js";
+import { WorkflowRefusedError, SourceProvenanceError, digest, validateReport, observesExistingDeployment, sanitizedDetail, sha, workflowState, type Deployment, type Job, type LifecycleAdapter, type PRCheck, type PRReviewScore, type PRSnapshot, type Session, type VerifierPlan, type VerifierRun } from "./lifecycle.js";
 
 const exec = promisify(execFile);
 // Session inventories include retained history and can exceed 4 MiB even when
@@ -262,10 +262,12 @@ export class BanyanLifecycleAdapter implements LifecycleAdapter {
     return selectDeploymentTarget(resolveConfig(job.repoRoot, { remote: originRemote(job.repoRoot) }).config.lifecycle ?? {}, name);
   }
   async deployment(job: Job): Promise<Deployment | undefined> {
+    observesExistingDeployment(job);
     const command = job.config.deploymentProbe;
     if (!command?.length) throw new Error("Configure a read-only lifecycle.deploymentProbe");
     const value = await commandJSON(command, job.repoRoot, {
       WORKIT_JOB_ID: job.id, WORKIT_ISSUE_URL: job.issue.url, WORKIT_MERGE_SHA: job.mergeSha ?? "", WORKIT_SOURCE_SHA: verificationSource(job) ?? "", WORKIT_DEPLOYMENT_TARGET: job.config.deploymentTarget ?? "",
+      WORKIT_DEPLOYMENT_SOURCE_BINDING: job.config.deploymentSourceBinding ?? "contains-source",
     }) as Partial<Deployment> & { ready?: boolean };
     if (value?.ready === false) return undefined;
     if (!value || value.ready !== true || !sha(value.sourceSha) ||

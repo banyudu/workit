@@ -96,3 +96,31 @@ test("refusal retains the raw reason while its display remains sanitized", async
     error instanceof WorkflowRefusedError && error.reason === reason && error.code === "workflow_wake_refused" &&
     !error.message.includes("fixture-secret") && !error.message.includes("/tmp/private"));
 });
+
+test("deployment probes receive explicit observation mode with truthful observer and merge identities", async t => {
+  const { directory } = fixture(t);
+  const { BanyanLifecycleAdapter } = await import("./lifecycle-adapter.js");
+  const { createJob } = await import("./lifecycle.js");
+  const { readFileSync, existsSync } = await import("node:fs");
+  const capture = join(directory, "deployment-input.json");
+  const probe = join(directory, "probe.cjs");
+  writeFileSync(probe, 'const fs=require("node:fs");fs.writeFileSync(process.argv[2],JSON.stringify({binding:process.env.WORKIT_DEPLOYMENT_SOURCE_BINDING,source:process.env.WORKIT_SOURCE_SHA,merge:process.env.WORKIT_MERGE_SHA}));console.log(JSON.stringify({ready:true,environment:"lab",target:"fixture-service",sourceSha:"a".repeat(40),version:"v1"}));');
+  const job = createJob({ issue: { identifier: "1", backend: "github", title: "Audit",
+    body: "## Acceptance Criteria\n- [ ] [query:version] Read serving version.\n- [ ] [code:report] Record the result.",
+    labels: [], state: "OPEN", url: "https://github.com/example/project/issues/1" },
+    repoRoot: directory, worktree: directory, githubRepo: "example/project", agent: "fixture",
+    observedSourceSha: "b".repeat(40), config: { delivery: "investigation", verification: "deployed",
+      deploymentProbe: [process.execPath, probe, capture], deploymentSourceBinding: "observe-existing" } });
+  const adapter = new BanyanLifecycleAdapter();
+  assert.equal((await adapter.deployment(job))?.sourceSha, "a".repeat(40));
+  assert.deepEqual(JSON.parse(readFileSync(capture, "utf8")),
+    { binding: "observe-existing", source: "b".repeat(40), merge: "" });
+  job.config.deploymentSourceBinding = undefined;
+  await adapter.deployment(job);
+  assert.equal(JSON.parse(readFileSync(capture, "utf8")).binding, "contains-source");
+  rmSync(capture);
+  job.config.delivery = "implementation";
+  job.config.deploymentSourceBinding = "observe-existing";
+  await assert.rejects(adapter.deployment(job), /requires investigation/);
+  assert.equal(existsSync(capture), false);
+});
