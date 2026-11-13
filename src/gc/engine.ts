@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { resolveConfig } from "../config.js";
 import { CACHE_NAMES, readJSON } from "./metadata.js";
-import { preserveLocalState, restoreLocalState, verifyLocalState } from "./local-state.js";
+import { preserveLocalState, restoreLocalState, retainedStateParent, verifyLocalState } from "./local-state.js";
+import { pruneRetainedState, type RetentionReport } from "./retention.js";
 import { python, Registry, SQLITE, type Role, type WorktreeRecord } from "./store.js";
 
 export interface GCConfig {
@@ -31,6 +32,10 @@ export interface GCConfig {
   /** Preserve only unique local files internally before retiring a clean checkout. */
   preserveLocalState?: boolean;
   maxLocalStateMB?: number;
+  /** Retained snapshots older than this are deleted on full sweeps; 0 keeps them. */
+  retainedStateDays?: number;
+  /** Total retained snapshot size; the oldest go first above it; 0 is unlimited. */
+  maxRetainedStateMB?: number;
   excessIdleHours?: number;
   archiveUnclassified?: boolean;
   archiveExternalWorktrees?: boolean;
@@ -55,7 +60,7 @@ export type Action = "protect" | "retain" | "trim" | "recycle";
 export interface Decision { path: string; role: Role; action: Action; reason: string; idleHours: number; archive?: string; result?: string; operation?: "delete" | "trim" | "retain" | "defer"; durationMs?: number; archiveBytes?: number; restoredBytes?: number; localState?: string[]; retainedStateDirectory?: string; retainedStateBytes?: number }
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const DEFAULTS = { reviewGraceHours: 1, mergedIdleHours: 24, cacheIdleDays: 14, archiveIdleDays: 30, poolIdleDays: 7, warmPoolSize: 2, minFreeGB: 100, maxActions: 4, maxRunMinutes: 2, excessIdleHours: 1, remnantIdleHours: 24 };
+const DEFAULTS = { reviewGraceHours: 1, mergedIdleHours: 24, cacheIdleDays: 14, archiveIdleDays: 30, poolIdleDays: 7, warmPoolSize: 2, minFreeGB: 100, maxActions: 4, maxRunMinutes: 2, excessIdleHours: 1, remnantIdleHours: 24, retainedStateDays: 14, maxRetainedStateMB: 2048 };
 export function expand(path: string): string { return resolve(path.startsWith("~/") ? join(homedir(), path.slice(2)) : path); }
 export function within(path: string, parent: string): boolean { return path === parent || path.startsWith(parent + sep); }
 export function git(path: string, args: string[]): string {
@@ -477,6 +482,7 @@ export function discover(registry: Registry, repositories: string[], apply: bool
 export interface GCReport {
   decisions: Decision[]; errors: string[]; actions: number;
   durationMs: number; archiveBytes: number; restoredBytes: number;
+  retainedState?: RetentionReport;
 }
 
 /** All destructive GC paths share one worker lock, including finish. */
@@ -523,7 +529,7 @@ export function runGC(options: Parameters<typeof runGCWorker>[0] = {}): GCReport
   try { return execute(); } finally { registry.unlock("sweep", token); }
 }
 
-function runGCWorker(options: { apply?: boolean; worktree?: string; repositories?: string[]; onlyRepositories?: string[]; remnantsOnly?: boolean; maxActions?: number; lockWaitMs?: number; completionOwner?: number; registry?: Registry; activity?: Activity; now?: number; includeLegacy?: boolean; policy?: GCConfig } = {}): { decisions: Decision[]; errors: string[]; actions: number } {
+function runGCWorker(options: { apply?: boolean; worktree?: string; repositories?: string[]; onlyRepositories?: string[]; remnantsOnly?: boolean; maxActions?: number; lockWaitMs?: number; completionOwner?: number; registry?: Registry; activity?: Activity; now?: number; includeLegacy?: boolean; policy?: GCConfig } = {}): { decisions: Decision[]; errors: string[]; actions: number; retainedState?: RetentionReport } {
   const started = Date.now();
   const registry = options.registry || new Registry();
   const userPolicy = resolveConfig(homedir()).config.gc || {};
@@ -714,7 +720,14 @@ function runGCWorker(options: { apply?: boolean; worktree?: string; repositories
       else decisions.push({ path: record.path, role: record.role, action: "protect", reason: message, idleHours: 0 });
     }
   }
-  return { decisions, errors, actions };
+  // Bound retained snapshots on full sweeps only, so per-checkout lifecycle
+  // calls stay fast. Pruning never touches checkouts or the registry.
+  let retainedState: RetentionReport | undefined;
+  if (options.apply && !target) {
+    retainedState = pruneRetainedState(retainedStateParent(registry.path), { ...config, ...options.policy }, options.now);
+    errors.push(...retainedState.errors);
+  }
+  return { decisions, errors, actions, retainedState };
 }
 
 /** Recreate committed source from its pinned ref, then restore only local data. */

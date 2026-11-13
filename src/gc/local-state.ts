@@ -98,8 +98,13 @@ else:
  print(json.dumps({'bytes':m['bytes']}))
 `;
 
+/** Where snapshots of retired checkouts' unique local files live. */
+export function retainedStateParent(registryPath: string): string {
+  return join(dirname(registryPath), "retained-state");
+}
+
 export function preserveLocalState(record: WorktreeRecord, roots: string[], registryPath: string, maxMB = 256): { directory: string; bytes: number } {
-  const parent = join(dirname(registryPath), "retained-state");
+  const parent = retainedStateParent(registryPath);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   if (realpathSync(parent) !== parent) throw new Error("Local-state destination must not be redirected");
   chmodSync(parent, 0o700);
