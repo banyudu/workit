@@ -382,6 +382,9 @@ gc:
   idleWorktrees: 2
   preserveLocalState: true
   maxLocalStateMB: 256
+  # Retained snapshots: expiry and total size cap (0 disables either).
+  retainedStateDays: 14
+  maxRetainedStateMB: 2048
   # Optional soft targets; protected or locally changed work can exceed them.
   # targetWorktrees: 5
   # excessIdleHours: 1
@@ -407,10 +410,14 @@ Local files do not prevent independent trimming of generated caches. With
 roots are copied and verified. Only these roots are hashed; committed source and
 dependencies are not backed up. Files exceeding `maxLocalStateMB`, special files,
 or changing data prevent retirement. Snapshots retain permissions and symlinks,
-contain `record.json` and restoration instructions, and are never auto-deleted.
+and contain `record.json` and restoration instructions. Each full sweep bounds
+them: byte-identical repeats of the same checkout keep only the newest copy, saves
+that never wrote a manifest are removed after six hours, snapshots older than
+`retainedStateDays` are removed, and the oldest are removed until the rest fit in
+`maxRetainedStateMB`. The pinned `refs/workit-gc/retired/*` revision stays.
 
-Known rebuildable caches (`node_modules`, `.build`, `.next`, `target`, and
-`.direnv/nix-sources`) may be removed from valid Git checkouts. Tracked files
+Known rebuildable caches (`node_modules`, `.build`, `.next`, `target`, `dist`
+and `.direnv/nix-sources`) may be removed from valid Git checkouts. Tracked files
 inside them remain protected. `disposablePaths` explicitly permits additional
 exact files/directories; unknown siblings stay protected. GC does not follow
 symlinks when deleting caches and only makes owned cache directories writable.

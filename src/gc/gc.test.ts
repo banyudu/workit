@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { archiveWorktree, assertArchiveDestination, verifyArchiveSource } from "./archive.js";
 import { cachePaths, collectActivity, decide, inspectCheckout, listWorktrees, mergedPR, processIdentity, registerWorktree, removeCache, restoreRetiredWorktree, runGC as engineGC, setLifecycle, withLock, type Activity } from "./engine.js";
-import { preserveLocalState, verifyLocalState } from "./local-state.js";
+import { preserveLocalState, retainedStateParent, verifyLocalState } from "./local-state.js";
+import { pruneRetainedState } from "./retention.js";
 import { resolveConfig } from "../config.js";
 import { Registry, type WorktreeRecord } from "./store.js";
 
@@ -638,4 +639,65 @@ test("retirement retries keep older snapshot revisions pinned independently", t 
   restoreRetiredWorktree(firstState.directory, restored, f.registry);
   assert.equal(readFileSync(join(restored, "source.txt"), "utf8"), "baseline\n");
   assert.equal(readFileSync(join(restored, ".env.local"), "utf8"), "first local state\n");
+});
+
+test("retained-state pruning drops repeats, failed saves, expired and over-cap snapshots", t => {
+  const f = fixture(t), path = f.add("retained-snapshots");
+  const record = registerWorktree(path, { role: "implementation" }, f.registry);
+  const parent = retainedStateParent(f.registry.path);
+  const snapshot = (content: string) => {
+    writeFileSync(join(path, ".env.local"), content);
+    return preserveLocalState(record, [".env.local"], f.registry.path).directory;
+  };
+  const repeats = [snapshot("alpha local state\n"), snapshot("alpha local state\n")];
+  const beta = snapshot("beta local state\n");
+  // A save that failed before writing its manifest leaves only record.json.
+  const failed = join(parent, `${record.id}-failed`);
+  mkdirSync(failed); writeFileSync(join(failed, "record.json"), JSON.stringify(record));
+  const HOUR = 3_600_000;
+  const left = () => readdirSync(parent).map(name => join(parent, name)).sort();
+
+  const first = pruneRetainedState(parent, { retainedStateDays: 14, maxRetainedStateMB: 1 }, Date.now() + 7 * HOUR);
+  assert.deepEqual(first.errors, []);
+  assert.equal(first.deleted, 2);
+  assert.equal(left().length, 2);
+  assert.ok(left().includes(beta));
+  assert.equal(repeats.filter(directory => existsSync(directory)).length, 1);
+  assert.equal(existsSync(failed), false);
+
+  // Only the newest snapshot fits a 20-byte cap; beta is 17 bytes.
+  const capped = pruneRetainedState(parent, { retainedStateDays: 14, maxRetainedStateMB: 20 / 1024 ** 2 }, Date.now() + 7 * HOUR);
+  assert.equal(capped.deleted, 1);
+  assert.deepEqual(left(), [beta]);
+  assert.equal(readFileSync(join(beta, "files", ".env.local"), "utf8"), "beta local state\n");
+
+  const unlimited = pruneRetainedState(parent, { retainedStateDays: 0, maxRetainedStateMB: 0 }, Date.now() + 365 * 24 * HOUR);
+  assert.equal(unlimited.deleted, 0);
+  const expired = pruneRetainedState(parent, { retainedStateDays: 14 }, Date.now() + 15 * 24 * HOUR);
+  assert.equal(expired.deleted, 1);
+  assert.deepEqual(left(), []);
+});
+
+test("full sweeps prune retained state; dist output is a cache, never retained state", t => {
+  const f = fixture(t), path = f.add("dist-output");
+  const record = registerWorktree(path, { role: "implementation" }, f.registry);
+  mkdirSync(join(path, "apps", "web", "dist"), { recursive: true });
+  writeFileSync(join(path, "apps", "web", "dist", "bundle.js"), "generated\n");
+  writeFileSync(join(path, ".env.local"), "unique\n");
+  const state = inspectCheckout(record, {});
+  assert.deepEqual(state.localState, [".env.local"]);
+  assert.deepEqual(state.caches, [join(path, "apps", "web", "dist")]);
+  // Tracked files keep a dist directory out of cache trimming.
+  mkdirSync(join(path, "vendor", "dist"), { recursive: true });
+  writeFileSync(join(path, "vendor", "dist", "keep.js"), "tracked\n");
+  const caches = cachePaths(path, ["vendor/dist/keep.js"]);
+  assert.ok(caches.includes(join(path, "apps", "web", "dist")));
+  assert.equal(caches.some(cache => cache.includes(join("vendor", "dist"))), false);
+
+  const parent = retainedStateParent(f.registry.path);
+  const stale = join(parent, `${record.id}-failed`);
+  mkdirSync(stale, { recursive: true }); writeFileSync(join(stale, "record.json"), JSON.stringify(record));
+  const report = runGC({ apply: true, registry: f.registry, activity: quiet, now: Date.now() + 7 * 3_600_000, policy: { idleWorktrees: 99 } });
+  assert.equal(report.retainedState?.deleted, 1);
+  assert.equal(existsSync(stale), false);
 });
